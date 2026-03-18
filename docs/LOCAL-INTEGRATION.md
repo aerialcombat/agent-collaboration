@@ -126,23 +126,7 @@ Keep that file data-only. Do not rely on shell execution in repo config.
 
 ## Manual Trigger Examples
 
-If no local helper exists, the local guide can start with direct commands.
-
-Claude leading:
-
-```bash
-review_file="$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX.md")"
-codex exec -C "$PWD" -s read-only -o "$review_file" \
-  "Read the repo-local collaboration guide and relevant scope docs. Reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests."
-```
-
-Codex leading:
-
-```bash
-prompt='Read the repo-local collaboration guide and relevant scope docs. Reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
-review_file="$(mktemp "${TMPDIR:-/tmp}/claude-review.XXXXXX.md")"
-printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text > "$review_file"
-```
+If no local helper exists, start from the canonical manual trigger patterns in [GLOBAL-PROTOCOL.md](GLOBAL-PROTOCOL.md#manual-trigger-patterns) and adapt only the repo-specific paths and prompt text.
 
 ## Adoption Checklist
 

@@ -93,21 +93,7 @@ That file is data-only. The command parses the supported keys and does not sourc
 
 Manual fallback:
 
-Claude leading:
-
-```bash
-review_file="$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX.md")"
-codex exec -C "$PWD" -s read-only -o "$review_file" \
-  "Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests."
-```
-
-Codex leading:
-
-```bash
-prompt='Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
-review_file="$(mktemp "${TMPDIR:-/tmp}/claude-review.XXXXXX.md")"
-printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text > "$review_file"
-```
+Use the canonical manual trigger patterns in [docs/GLOBAL-PROTOCOL.md](docs/GLOBAL-PROTOCOL.md#manual-trigger-patterns). That document is the single source of truth for raw Claude/Codex shell invocation shapes.
 
 ## Install
 
@@ -173,6 +159,10 @@ Those repo docs should:
 - not weaken the global safety rules
 
 See [docs/LOCAL-INTEGRATION.md](docs/LOCAL-INTEGRATION.md) for the recommended local layer and [templates/AGENT-COLLABORATION.md](templates/AGENT-COLLABORATION.md) for a starter local guide.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
 
 ## Important Rule
 

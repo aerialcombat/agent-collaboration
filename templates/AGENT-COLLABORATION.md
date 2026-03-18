@@ -94,21 +94,7 @@ If the repo has no custom helper, either document `agent-collab` usage for this 
 
 ## Manual Trigger Patterns
 
-Claude leading:
-
-```bash
-review_file="$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX.md")"
-codex exec -C "$PWD" -s read-only -o "$review_file" \
-  "Read this repo's collaboration guide and relevant scope docs. Reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests."
-```
-
-Codex leading:
-
-```bash
-prompt='Read this repo'\''s collaboration guide and relevant scope docs. Reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
-review_file="$(mktemp "${TMPDIR:-/tmp}/claude-review.XXXXXX.md")"
-printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text > "$review_file"
-```
+Copy the canonical manual trigger patterns from the global protocol reference and adapt only the repo-specific paths and prompt text for this repository.
 
 The lead should append or summarize the resulting review in the local plan or decision record.
 
