@@ -173,9 +173,9 @@ It should not become the place where repo-specific plan paths, ownership rules, 
 Claude leading:
 
 ```bash
+prompt='Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
 review_file="$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX.md")"
-codex exec -C "$PWD" -s read-only -o "$review_file" \
-  "Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests."
+printf '%s' "$prompt" | codex exec -C "$PWD" -s read-only -o "$review_file" -
 ```
 
 Codex leading:
@@ -188,6 +188,7 @@ printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text > 
 
 The lead should append or summarize the resulting review inside the repo-local plan or decision record.
 These command shapes are defaults, not standards. Prefer repo-local wrappers when they exist, and adjust for the installed CLI version when needed.
+This repository last verified them with Claude Code `2.1.78` and `codex-cli 0.115.0`.
 
 ## Global Prompt Shape
 

@@ -7,6 +7,8 @@ CODEX_TARGET="$HOME/.codex/AGENTS.md"
 BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
 COMMAND_TARGET="$BIN_DIR/agent-collab"
 START_MARKER="<!-- BEGIN agent-collaboration -->"
+TESTED_CLAUDE_VERSION="2.1.78 (Claude Code)"
+TESTED_CODEX_VERSION="codex-cli 0.115.0"
 FAILURES=0
 WARNINGS=0
 PASSES=0
@@ -86,13 +88,23 @@ check_temp_dir() {
 }
 
 check_claude_cli() {
+  local claude_help actual_version
+
   if ! command -v claude >/dev/null 2>&1; then
     block "claude CLI is not installed or not on PATH"
     return
   fi
 
   pass "claude CLI found: $(command -v claude)"
-  pass "claude version: $(claude --version)"
+  actual_version="$(claude --version)"
+  pass "claude version: $actual_version"
+  pass "last tested Claude baseline: $TESTED_CLAUDE_VERSION"
+
+  if [[ "$actual_version" == "$TESTED_CLAUDE_VERSION" ]]; then
+    pass "claude version matches last tested baseline"
+  else
+    warn "claude version differs from last tested baseline; revalidate manual trigger patterns if behavior drift appears"
+  fi
 
   claude_help="$(claude --help 2>/dev/null || true)"
 
@@ -110,13 +122,23 @@ check_claude_cli() {
 }
 
 check_codex_cli() {
+  local codex_help codex_exec_help actual_version
+
   if ! command -v codex >/dev/null 2>&1; then
     block "codex CLI is not installed or not on PATH"
     return
   fi
 
   pass "codex CLI found: $(command -v codex)"
-  pass "codex version: $(codex --version)"
+  actual_version="$(codex --version)"
+  pass "codex version: $actual_version"
+  pass "last tested Codex baseline: $TESTED_CODEX_VERSION"
+
+  if [[ "$actual_version" == "$TESTED_CODEX_VERSION" ]]; then
+    pass "codex version matches last tested baseline"
+  else
+    warn "codex version differs from last tested baseline; revalidate manual trigger patterns if behavior drift appears"
+  fi
 
   codex_help="$(codex --help 2>/dev/null || true)"
   codex_exec_help="$(codex exec --help 2>/dev/null || true)"
@@ -143,6 +165,12 @@ check_codex_cli() {
     pass "codex exec supports output capture to a file"
   else
     warn "codex exec help does not advertise -o/--output-last-message; stdout redirection may be required instead"
+  fi
+
+  if [[ "$codex_exec_help" == *"read from stdin"* ]]; then
+    pass "codex exec supports stdin prompt delivery"
+  else
+    warn "codex exec help does not advertise stdin prompt delivery; argv fallback may be required instead"
   fi
 }
 

@@ -131,6 +131,9 @@ The doctor script checks:
 - whether `claude` and `codex` are installed
 - whether the CLI help output still supports the manual trigger assumptions in this protocol
 
+The last tested CLI baseline is surfaced by `./scripts/doctor-global-protocol` and referenced in [docs/GLOBAL-PROTOCOL.md](docs/GLOBAL-PROTOCOL.md).
+If your installed versions differ, rerun the doctor for surface-compatibility checks and manually revalidate the trigger patterns before treating warnings as false positives.
+
 ## Smoke Test
 
 ```bash

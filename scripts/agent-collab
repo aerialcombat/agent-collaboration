@@ -280,7 +280,7 @@ run_codex() {
   command -v codex >/dev/null 2>&1 || err "codex CLI is not installed or not on PATH"
   (
     cd "$REPO_ROOT"
-    codex exec -C "$REPO_ROOT" -s read-only -o "$REVIEW_FILE" "$PROMPT"
+    printf '%s' "$PROMPT" | codex exec -C "$REPO_ROOT" -s read-only -o "$REVIEW_FILE" -
   )
 }
 

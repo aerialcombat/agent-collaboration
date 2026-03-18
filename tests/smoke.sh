@@ -32,6 +32,17 @@ assert_contains() {
   grep -Fq "$pattern" "$path" || fail "expected '$pattern' in $path"
 }
 
+assert_glob_exists() {
+  local pattern="$1"
+  local matches=()
+
+  shopt -s nullglob
+  matches=($pattern)
+  shopt -u nullglob
+
+  (( ${#matches[@]} > 0 )) || fail "expected at least one match for glob: $pattern"
+}
+
 trap cleanup EXIT
 
 mkdir -p "$TEST_HOME/.claude" "$TEST_HOME/.codex" "$TEST_BIN" "$SAMPLE_REPO/docs"
@@ -60,6 +71,8 @@ assert_contains "$TEST_HOME/.claude/CLAUDE.md" "# Existing Claude Defaults"
 assert_contains "$TEST_HOME/.claude/CLAUDE.md" "<!-- BEGIN agent-collaboration -->"
 assert_contains "$TEST_HOME/.codex/AGENTS.md" "# Existing Codex Defaults"
 assert_contains "$TEST_HOME/.codex/AGENTS.md" "<!-- BEGIN agent-collaboration -->"
+assert_glob_exists "$TEST_HOME/.claude/CLAUDE.md.bak.*"
+assert_glob_exists "$TEST_HOME/.codex/AGENTS.md.bak.*"
 
 "$PROJECT_ROOT/scripts/doctor-global-protocol" >/dev/null
 
@@ -101,6 +114,39 @@ if (
   fail "whitespace-only challenger output should fail"
 fi
 
+cat > "$TMP_ROOT/mock-bin/codex" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+out=""
+last=""
+previous=""
+
+for arg in "$@"; do
+  if [[ "$previous" == "-o" || "$previous" == "--output-last-message" ]]; then
+    out="$arg"
+  fi
+  previous="$arg"
+  last="$arg"
+done
+
+[[ -n "$out" ]] || exit 1
+[[ "$last" == "-" ]] || exit 1
+
+stdin_payload="$(cat)"
+[[ "$stdin_payload" == *"Codex stdin check."* ]] || exit 1
+
+printf 'mock codex review\n' > "$out"
+EOF
+chmod +x "$TMP_ROOT/mock-bin/codex"
+
+codex_run_output="$(
+  cd "$SAMPLE_REPO" &&
+    PATH="$TMP_ROOT/mock-bin:$TEST_BIN:$PATH" \
+    "$TEST_BIN/agent-collab" challenge --challenger codex --scope docs/scope.md --prompt "Codex stdin check."
+)"
+[[ "$codex_run_output" == review:\ * ]] || fail "codex challenger run did not report review output"
+
 "$PROJECT_ROOT/scripts/install-global-protocol" --uninstall >/dev/null
 
 assert_file "$TEST_HOME/.claude/CLAUDE.md"
@@ -114,5 +160,6 @@ if grep -Fq "<!-- BEGIN agent-collaboration -->" "$TEST_HOME/.codex/AGENTS.md"; 
   fail "managed block still present in Codex file after uninstall"
 fi
 [[ ! -e "$TEST_BIN/agent-collab" ]] || fail "agent-collab command still present after uninstall"
+assert_glob_exists "$TEST_BIN/agent-collab.bak.*"
 
 echo "PASS: smoke"
