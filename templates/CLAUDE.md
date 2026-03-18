@@ -19,6 +19,23 @@ Protocol reference:
 - If Codex is unavailable on a task that should have had review, treat that as a failed challenge pass rather than silently skipping collaboration.
 - Stop and escalate to the human owner if disagreement remains after the allowed rounds.
 
+## Quick Start
+
+When you are leading non-trivial work in a repo that has a local collaboration guide:
+
+```bash
+agent-collab challenge --challenger codex --scope AGENT-COLLABORATION.md
+agent-collab verify --challenger codex --scope AGENT-COLLABORATION.md
+```
+
+If you need to preview what the runner will do before invoking Codex:
+
+```bash
+agent-collab challenge --challenger codex --scope AGENT-COLLABORATION.md --dry-run
+```
+
+If the repo has no local helper or runner setup, fall back to the repo-local docs or the global protocol reference for manual shell invocation patterns.
+
 ## Scope Of This File
 
 This file defines global behavior only.

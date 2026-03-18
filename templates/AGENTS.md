@@ -29,6 +29,23 @@ Preferred global form:
 printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text
 ```
 
+## Quick Start
+
+When you are leading non-trivial work in a repo that has a local collaboration guide:
+
+```bash
+agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md
+agent-collab verify --challenger claude --scope AGENT-COLLABORATION.md
+```
+
+If you need to preview what the runner will do before invoking Claude:
+
+```bash
+agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md --dry-run
+```
+
+If the repo has no local helper or runner setup, fall back to the repo-local docs or the global protocol reference for manual shell invocation patterns.
+
 ## Scope Of This File
 
 This file defines global behavior only.
