@@ -11,6 +11,7 @@ This repository defines a global collaboration layer, not repo-local implementat
 - `scripts/agent-collab`: global runner for `challenge` and `verify` passes.
 - `scripts/install-global-protocol`: installs templates and the global command.
 - `scripts/doctor-global-protocol`: validates install state and CLI assumptions.
+- `tests/smoke.sh`: end-to-end shell smoke test for install, doctor, runner dry-run, and uninstall.
 - `README.md`: project overview and install guidance.
 - `docs/LOCAL-INTEGRATION.md`: guidance for implementing the local layer in a consuming repository.
 
@@ -21,6 +22,7 @@ Keep global behavior in `docs/` and `templates/`. Do not add repo-specific paths
 - `./scripts/install-global-protocol`: install rendered templates plus the global `agent-collab` command.
 - `./scripts/agent-collab help`: inspect subcommands and repo-local config keys.
 - `./scripts/doctor-global-protocol`: validate the global install state.
+- `bash tests/smoke.sh`: run the end-to-end smoke test in a temporary HOME.
 - `bash -n scripts/install-global-protocol`: syntax-check the installer.
 - `bash -n scripts/agent-collab`: syntax-check the global runner before committing shell changes.
 - `bash -n scripts/doctor-global-protocol`: syntax-check the doctor script.
@@ -49,6 +51,7 @@ This snapshot does not include an automated test suite. Validate changes with ta
 - execute `./scripts/install-global-protocol` and confirm backup and install output
 - execute `./scripts/agent-collab challenge --challenger claude --prompt "dry run" --dry-run`
 - execute `./scripts/doctor-global-protocol` and confirm the expected PASS/WARN/BLOCK summary
+- execute `bash tests/smoke.sh`
 - verify rendered files replace `{{PROJECT_ROOT}}` correctly
 
 ## Commit & Pull Request Guidelines

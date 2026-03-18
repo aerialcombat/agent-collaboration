@@ -88,7 +88,7 @@ detect_repo_root() {
 
   while :; do
     if [[ -f "$dir/.agent-collab.env" || -f "$dir/AGENT-COLLABORATION.md" || -e "$dir/.git" ]]; then
-      printf '%s\n' "$dir"
+      (cd "$dir" && pwd -P)
       return
     fi
 
@@ -99,7 +99,7 @@ detect_repo_root() {
     dir="$(dirname "$dir")"
   done
 
-  printf '%s\n' "$PWD"
+  pwd -P
 }
 
 load_config() {
@@ -284,6 +284,11 @@ run_codex() {
   )
 }
 
+review_file_has_content() {
+  local path="$1"
+  grep -q '[^[:space:]]' "$path"
+}
+
 MODE="${1:-help}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -424,5 +429,6 @@ case "$CHALLENGER" in
 esac
 
 [[ -s "$REVIEW_FILE" ]] || err "review command completed without usable output: $REVIEW_FILE"
+review_file_has_content "$REVIEW_FILE" || err "review command completed with only whitespace output: $REVIEW_FILE"
 
 printf 'review: %s\n' "$REVIEW_FILE"

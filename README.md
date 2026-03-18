@@ -145,6 +145,21 @@ The doctor script checks:
 - whether `claude` and `codex` are installed
 - whether the CLI help output still supports the manual trigger assumptions in this protocol
 
+## Smoke Test
+
+```bash
+cd ~/Development/agent-collaboration
+bash tests/smoke.sh
+```
+
+The smoke test exercises:
+
+- install into a temporary `HOME`
+- preservation of existing global files
+- doctor against the temporary install
+- `agent-collab` dry-run in a sample repo
+- uninstall cleanup of the managed block and command
+
 ## Suggested Repo Integration
 
 Each repo should still have its own implementation doc, for example:
