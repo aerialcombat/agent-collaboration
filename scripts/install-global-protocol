@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLAUDE_TARGET="$HOME/.claude/CLAUDE.md"
+CODEX_TARGET="$HOME/.codex/AGENTS.md"
+BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
+COMMAND_TARGET="$BIN_DIR/agent-collab"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)-$$"
+START_MARKER="<!-- BEGIN agent-collaboration -->"
+END_MARKER="<!-- END agent-collaboration -->"
+MODE="${1:-install}"
+
+err() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+render_template() {
+  local src="$1"
+  [[ -s "$src" ]] || err "missing or empty template: $src"
+  sed "s|{{PROJECT_ROOT}}|$PROJECT_ROOT|g" "$src"
+}
+
+render_block() {
+  local src="$1"
+  printf '%s\n' "$START_MARKER"
+  render_template "$src"
+  printf '\n%s\n' "$END_MARKER"
+}
+
+first_nonempty_line() {
+  local path="$1"
+  awk 'NF { print; exit }' "$path"
+}
+
+looks_like_legacy_install() {
+  local target="$1"
+  local expected_header="$2"
+
+  [[ -f "$target" ]] || return 1
+  grep -Fq "$START_MARKER" "$target" && return 1
+  [[ "$(first_nonempty_line "$target")" == "$expected_header" ]]
+}
+
+write_installed_file() {
+  local target="$1"
+  local block_file="$2"
+  local rendered_template="$3"
+  local expected_header="$4"
+  local next_file
+
+  next_file="$(mktemp)"
+
+  if [[ ! -f "$target" || ! -s "$target" ]]; then
+    cp "$block_file" "$next_file"
+  elif looks_like_legacy_install "$target" "$expected_header"; then
+    cp "$block_file" "$next_file"
+  elif grep -Fq "$START_MARKER" "$target"; then
+    awk -v start="$START_MARKER" -v end="$END_MARKER" -v block="$block_file" '
+      BEGIN {
+        while ((getline line < block) > 0) {
+          replacement = replacement line ORS
+        }
+        close(block)
+      }
+      $0 == start {
+        if (!replaced) {
+          printf "%s", replacement
+          replaced = 1
+        }
+        in_block = 1
+        next
+      }
+      $0 == end {
+        in_block = 0
+        next
+      }
+      !in_block { print }
+      END {
+        if (!replaced) {
+          if (NR > 0) print ""
+          printf "%s", replacement
+        }
+      }
+    ' "$target" > "$next_file"
+  elif cmp -s "$target" "$rendered_template"; then
+    cp "$block_file" "$next_file"
+  else
+    cp "$target" "$next_file"
+    printf '\n\n' >> "$next_file"
+    cat "$block_file" >> "$next_file"
+  fi
+
+  if [[ -f "$target" ]] && cmp -s "$target" "$next_file"; then
+    echo "current: $target"
+    rm -f "$next_file"
+    return
+  fi
+
+  if [[ -f "$target" ]]; then
+    cp "$target" "${target}.bak.${TIMESTAMP}"
+    echo "backup: ${target}.bak.${TIMESTAMP}"
+  fi
+
+  mv "$next_file" "$target"
+  echo "installed: $target"
+}
+
+remove_installed_block() {
+  local target="$1"
+  local next_file
+
+  if [[ ! -f "$target" ]]; then
+    echo "missing: $target"
+    return
+  fi
+
+  next_file="$(mktemp)"
+
+  if grep -Fq "$START_MARKER" "$target"; then
+    awk -v start="$START_MARKER" -v end="$END_MARKER" '
+      $0 == start { in_block = 1; next }
+      $0 == end { in_block = 0; next }
+      !in_block { print }
+    ' "$target" > "$next_file"
+  else
+    echo "no managed block: $target"
+    rm -f "$next_file"
+    return
+  fi
+
+  if [[ -f "$target" ]] && cmp -s "$target" "$next_file"; then
+    echo "current: $target"
+    rm -f "$next_file"
+    return
+  fi
+
+  cp "$target" "${target}.bak.${TIMESTAMP}"
+  echo "backup: ${target}.bak.${TIMESTAMP}"
+
+  if [[ -s "$next_file" ]]; then
+    mv "$next_file" "$target"
+    echo "uninstalled: $target"
+  else
+    rm -f "$next_file" "$target"
+    echo "removed empty file: $target"
+  fi
+}
+
+write_command_file() {
+  local target="$1"
+  local source="$2"
+  local next_file
+
+  [[ -s "$source" ]] || err "missing or empty command source: $source"
+
+  next_file="$(mktemp)"
+  cp "$source" "$next_file"
+  chmod +x "$next_file"
+
+  if [[ -f "$target" ]] && cmp -s "$target" "$next_file"; then
+    echo "current: $target"
+    rm -f "$next_file"
+    return
+  fi
+
+  mkdir -p "$(dirname "$target")"
+
+  if [[ -f "$target" ]]; then
+    cp "$target" "${target}.bak.${TIMESTAMP}"
+    echo "backup: ${target}.bak.${TIMESTAMP}"
+  fi
+
+  mv "$next_file" "$target"
+  chmod +x "$target"
+  echo "installed: $target"
+}
+
+remove_managed_command() {
+  local target="$1"
+
+  if [[ ! -f "$target" ]]; then
+    echo "missing: $target"
+    return
+  fi
+
+  if ! grep -Fq "# agent-collaboration managed command" "$target"; then
+    echo "no managed command: $target"
+    return
+  fi
+
+  cp "$target" "${target}.bak.${TIMESTAMP}"
+  echo "backup: ${target}.bak.${TIMESTAMP}"
+  rm -f "$target"
+  echo "uninstalled: $target"
+}
+
+mkdir -p "$HOME/.claude" "$HOME/.codex"
+
+case "$MODE" in
+  install)
+    claude_rendered="$(mktemp)"
+    codex_rendered="$(mktemp)"
+    claude_block="$(mktemp)"
+    codex_block="$(mktemp)"
+
+    render_template "$PROJECT_ROOT/templates/CLAUDE.md" > "$claude_rendered"
+    render_template "$PROJECT_ROOT/templates/AGENTS.md" > "$codex_rendered"
+    render_block "$PROJECT_ROOT/templates/CLAUDE.md" > "$claude_block"
+    render_block "$PROJECT_ROOT/templates/AGENTS.md" > "$codex_block"
+
+    [[ -s "$PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md" ]] || err "missing or empty protocol doc: $PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md"
+
+    write_installed_file "$CLAUDE_TARGET" "$claude_block" "$claude_rendered" "# Global Claude Collaboration Defaults"
+    write_installed_file "$CODEX_TARGET" "$codex_block" "$codex_rendered" "# Global Codex Collaboration Defaults"
+    write_command_file "$COMMAND_TARGET" "$PROJECT_ROOT/scripts/agent-collab"
+
+    rm -f "$claude_rendered" "$codex_rendered" "$claude_block" "$codex_block"
+
+    echo
+    echo "protocol reference:"
+    echo "  $PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md"
+    echo "global command:"
+    echo "  $COMMAND_TARGET"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+      echo "warn: $BIN_DIR is not on PATH"
+    fi
+    ;;
+  --uninstall|uninstall)
+    remove_installed_block "$CLAUDE_TARGET"
+    remove_installed_block "$CODEX_TARGET"
+    remove_managed_command "$COMMAND_TARGET"
+    ;;
+  *)
+    err "usage: $(basename "$0") [install|uninstall|--uninstall]"
+    ;;
+esac

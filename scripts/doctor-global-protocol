@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLAUDE_TARGET="$HOME/.claude/CLAUDE.md"
+CODEX_TARGET="$HOME/.codex/AGENTS.md"
+BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
+COMMAND_TARGET="$BIN_DIR/agent-collab"
+START_MARKER="<!-- BEGIN agent-collaboration -->"
+FAILURES=0
+WARNINGS=0
+PASSES=0
+
+pass() {
+  echo "PASS: $*"
+  PASSES=$((PASSES + 1))
+}
+
+warn() {
+  echo "WARN: $*"
+  WARNINGS=$((WARNINGS + 1))
+}
+
+block() {
+  echo "BLOCK: $*"
+  FAILURES=$((FAILURES + 1))
+}
+
+extract_protocol_reference() {
+  local path="$1"
+  awk '
+    /^Protocol reference:/ { capture = 1; next }
+    capture && /^- `/ {
+      line = $0
+      sub(/^- `/, "", line)
+      sub(/`$/, "", line)
+      print line
+      exit
+    }
+    capture && NF == 0 { exit }
+  ' "$path"
+}
+
+check_target() {
+  local label="$1"
+  local path="$2"
+  local protocol_path
+
+  if [[ ! -f "$path" ]]; then
+    block "$label file is missing: $path"
+    return
+  fi
+
+  pass "$label file exists: $path"
+
+  if grep -Fq "$START_MARKER" "$path"; then
+    pass "$label file contains this project's managed block"
+  else
+    warn "$label file does not contain this project's managed block"
+  fi
+
+  protocol_path="$(extract_protocol_reference "$path" || true)"
+  if [[ -z "$protocol_path" ]]; then
+    warn "$label file does not expose a protocol reference path"
+    return
+  fi
+
+  if [[ -f "$protocol_path" ]]; then
+    pass "$label protocol reference exists: $protocol_path"
+  else
+    warn "$label protocol reference is stale or missing: $protocol_path"
+  fi
+}
+
+check_temp_dir() {
+  local temp_dir="${TMPDIR:-/tmp}"
+  local probe=""
+
+  probe="$(mktemp "${temp_dir%/}/agent-collaboration-doctor.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "$probe" && -f "$probe" ]]; then
+    rm -f "$probe"
+    pass "temp directory is writable: $temp_dir"
+  else
+    warn "temp directory is not writable or is full: $temp_dir"
+  fi
+}
+
+check_claude_cli() {
+  if ! command -v claude >/dev/null 2>&1; then
+    block "claude CLI is not installed or not on PATH"
+    return
+  fi
+
+  pass "claude CLI found: $(command -v claude)"
+  pass "claude version: $(claude --version)"
+
+  claude_help="$(claude --help 2>/dev/null || true)"
+
+  if [[ "$claude_help" == *"-p, --print"* ]]; then
+    pass "claude supports non-interactive print mode"
+  else
+    block "claude help does not advertise -p/--print"
+  fi
+
+  if [[ "$claude_help" == *"--permission-mode"* ]]; then
+    pass "claude supports permission-mode selection"
+  else
+    warn "claude help does not advertise --permission-mode; manual trigger guidance may need adjustment"
+  fi
+}
+
+check_codex_cli() {
+  if ! command -v codex >/dev/null 2>&1; then
+    block "codex CLI is not installed or not on PATH"
+    return
+  fi
+
+  pass "codex CLI found: $(command -v codex)"
+  pass "codex version: $(codex --version)"
+
+  codex_help="$(codex --help 2>/dev/null || true)"
+  codex_exec_help="$(codex exec --help 2>/dev/null || true)"
+
+  if [[ "$codex_help" == *$'\n  exec'* || "$codex_help" == *$'\n  exec '* ]]; then
+    pass "codex supports exec mode"
+  else
+    block "codex help does not advertise exec mode"
+  fi
+
+  if [[ "$codex_exec_help" == *"-C, --cd"* ]]; then
+    pass "codex exec supports selecting a working directory"
+  else
+    warn "codex exec help does not advertise -C/--cd; manual trigger guidance may need adjustment"
+  fi
+
+  if [[ "$codex_exec_help" == *"-s, --sandbox"* && "$codex_exec_help" == *"read-only"* ]]; then
+    pass "codex exec supports read-only sandbox selection"
+  else
+    warn "codex exec help does not clearly advertise read-only sandbox support"
+  fi
+
+  if [[ "$codex_exec_help" == *"-o, --output-last-message"* ]]; then
+    pass "codex exec supports output capture to a file"
+  else
+    warn "codex exec help does not advertise -o/--output-last-message; stdout redirection may be required instead"
+  fi
+}
+
+check_global_command() {
+  if [[ -x "$COMMAND_TARGET" ]]; then
+    pass "global command installed: $COMMAND_TARGET"
+  else
+    warn "global command is not installed at $COMMAND_TARGET"
+  fi
+
+  if ! command -v agent-collab >/dev/null 2>&1; then
+    warn "agent-collab is not on PATH"
+    return
+  fi
+
+  pass "agent-collab found: $(command -v agent-collab)"
+
+  agent_help="$(agent-collab --help 2>/dev/null || true)"
+
+  if [[ "$agent_help" == *"agent-collab challenge"* && "$agent_help" == *"agent-collab verify"* ]]; then
+    pass "agent-collab exposes challenge and verify subcommands"
+  else
+    warn "agent-collab help output is missing expected subcommands"
+  fi
+}
+
+check_project() {
+  if [[ -f "$PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md" ]]; then
+    pass "project protocol doc exists"
+  else
+    block "project protocol doc is missing: $PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md"
+  fi
+
+  if [[ -x "$PROJECT_ROOT/scripts/install-global-protocol" ]]; then
+    pass "installer is executable"
+  else
+    warn "installer is not executable"
+  fi
+}
+
+check_project
+check_temp_dir
+check_target "Claude" "$CLAUDE_TARGET"
+check_target "Codex" "$CODEX_TARGET"
+check_global_command
+check_claude_cli
+check_codex_cli
+
+echo
+echo "Summary: $PASSES PASS, $WARNINGS WARN, $FAILURES BLOCK"
+
+if (( FAILURES > 0 )); then
+  exit 1
+fi

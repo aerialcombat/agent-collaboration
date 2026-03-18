@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# agent-collaboration managed command
+set -euo pipefail
+
+PROGRAM="$(basename "$0")"
+MODE=""
+CHALLENGER=""
+GUIDE_OVERRIDE=""
+REVIEW_DIR_OVERRIDE=""
+OUT_OVERRIDE=""
+EXTRA_PROMPT=""
+DRY_RUN=0
+
+CONFIG_FILE=""
+CONFIG_GUIDE=""
+CONFIG_REVIEW_DIR=""
+CONFIG_DEFAULT_CHALLENGER=""
+
+REPO_ROOT=""
+GUIDE_PATH=""
+GUIDE_DISPLAY=""
+REVIEW_DIR=""
+REVIEW_FILE=""
+PROMPT=""
+
+SCOPE_INPUTS=()
+CONTEXT_INPUTS=()
+SCOPE_DISPLAY=()
+CONTEXT_DISPLAY=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent-collab challenge --challenger claude|codex [options]
+  agent-collab verify --challenger claude|codex [options]
+  agent-collab help
+
+Options:
+  --challenger <claude|codex>  Agent to invoke for the review pass.
+  --scope <path>               Scope plan or other primary task context. Repeatable.
+  --context <path>             Additional changed-file or design context. Repeatable.
+  --guide <path>               Override the repo-local collaboration guide path.
+  --review-dir <path>          Directory for generated review files, relative to repo root.
+  --out <path>                 Exact output file path, relative to repo root if not absolute.
+  --prompt <text>              Extra instructions appended to the default prompt shape.
+  --dry-run                    Print the derived prompt and file paths without invoking a CLI.
+  -h, --help                   Show this help.
+
+Repo-local config:
+  The command looks for a data-only .agent-collab.env file at the repo root.
+  Supported keys:
+    AGENT_COLLAB_GUIDE=AGENT-COLLABORATION.md
+    AGENT_COLLAB_REVIEW_DIR=.agent-collab/reviews
+    AGENT_COLLAB_DEFAULT_CHALLENGER=claude
+EOF
+}
+
+err() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "warn: $*" >&2
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+strip_optional_quotes() {
+  local value="$1"
+
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+
+  printf '%s' "$value"
+}
+
+detect_repo_root() {
+  local dir="$PWD"
+
+  while :; do
+    if [[ -f "$dir/.agent-collab.env" || -f "$dir/AGENT-COLLABORATION.md" || -e "$dir/.git" ]]; then
+      printf '%s\n' "$dir"
+      return
+    fi
+
+    if [[ "$dir" == "/" ]]; then
+      break
+    fi
+
+    dir="$(dirname "$dir")"
+  done
+
+  printf '%s\n' "$PWD"
+}
+
+load_config() {
+  local file="$1"
+  local raw_line line key value
+
+  [[ -f "$file" ]] || return 0
+
+  CONFIG_FILE="$file"
+
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    line="$(trim "$raw_line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    if [[ "$line" != *=* ]]; then
+      warn "ignoring invalid config line in $file: $raw_line"
+      continue
+    fi
+
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+    value="$(strip_optional_quotes "$value")"
+
+    case "$key" in
+      AGENT_COLLAB_GUIDE)
+        CONFIG_GUIDE="$value"
+        ;;
+      AGENT_COLLAB_REVIEW_DIR)
+        CONFIG_REVIEW_DIR="$value"
+        ;;
+      AGENT_COLLAB_DEFAULT_CHALLENGER)
+        CONFIG_DEFAULT_CHALLENGER="$value"
+        ;;
+      *)
+        warn "ignoring unknown config key in $file: $key"
+        ;;
+    esac
+  done < "$file"
+}
+
+absolute_existing_path() {
+  local input="$1"
+  local candidate="" dir base
+
+  if [[ "$input" == /* ]]; then
+    candidate="$input"
+  elif [[ -e "$input" ]]; then
+    candidate="$PWD/$input"
+  elif [[ -e "$REPO_ROOT/$input" ]]; then
+    candidate="$REPO_ROOT/$input"
+  else
+    err "path does not exist: $input"
+  fi
+
+  [[ -e "$candidate" ]] || err "path does not exist: $input"
+
+  dir="$(cd "$(dirname "$candidate")" && pwd -P)"
+  base="$(basename "$candidate")"
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+absolute_output_path() {
+  local input="$1"
+  local dir base
+
+  if [[ "$input" == /* ]]; then
+    dir="$(cd "$(dirname "$input")" && pwd -P)"
+    base="$(basename "$input")"
+    printf '%s/%s\n' "$dir" "$base"
+    return
+  fi
+
+  printf '%s/%s\n' "$REPO_ROOT" "$input"
+}
+
+display_path() {
+  local absolute_path="$1"
+
+  if [[ "$absolute_path" == "$REPO_ROOT" ]]; then
+    printf '.\n'
+  elif [[ "$absolute_path" == "$REPO_ROOT/"* ]]; then
+    printf '%s\n' "${absolute_path#$REPO_ROOT/}"
+  else
+    printf '%s\n' "$absolute_path"
+  fi
+}
+
+validate_challenger() {
+  case "$1" in
+    claude|codex) ;;
+    *)
+      err "unsupported challenger: $1"
+      ;;
+  esac
+}
+
+prepare_review_file() {
+  local timestamp out_dir temp_root
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  temp_root="${TMPDIR:-/tmp}"
+  temp_root="${temp_root%/}"
+
+  if [[ -n "$OUT_OVERRIDE" ]]; then
+    REVIEW_FILE="$(absolute_output_path "$OUT_OVERRIDE")"
+    if (( ! DRY_RUN )); then
+      mkdir -p "$(dirname "$REVIEW_FILE")"
+    fi
+    return
+  fi
+
+  if [[ -n "$REVIEW_DIR" ]]; then
+    out_dir="$(absolute_output_path "$REVIEW_DIR")"
+    if (( ! DRY_RUN )); then
+      mkdir -p "$out_dir"
+    fi
+    REVIEW_FILE="$out_dir/${timestamp}-${MODE}-${CHALLENGER}.md"
+    return
+  fi
+
+  if (( DRY_RUN )); then
+    REVIEW_FILE="$temp_root/agent-collab.${MODE}.${CHALLENGER}.${timestamp}.preview"
+    return
+  fi
+
+  REVIEW_FILE="$(mktemp "$temp_root/agent-collab.${MODE}.${CHALLENGER}.XXXXXX")"
+}
+
+build_prompt() {
+  local path
+
+  if [[ "$MODE" == "challenge" ]]; then
+    printf '%s\n' "Read the repo-local collaboration guide and relevant scope docs."
+    printf '%s\n' "Reply in markdown only."
+    printf '%s\n' "Do not modify files."
+    printf '%s\n' "Focus on risks, regressions, simpler alternatives, and missing tests."
+  else
+    printf '%s\n' "Read the repo-local collaboration guide, scope docs, and resulting changes."
+    printf '%s\n' "Reply in markdown only."
+    printf '%s\n' "Do not modify files."
+    printf '%s\n' "Focus on requirement mismatch, regressions, and missing verification."
+  fi
+
+  printf '\n'
+  printf 'Repository root: %s\n' "$REPO_ROOT"
+
+  if [[ -n "$GUIDE_DISPLAY" ]]; then
+    printf 'Repo-local collaboration guide: %s\n' "$GUIDE_DISPLAY"
+  fi
+
+  if (( ${#SCOPE_DISPLAY[@]} > 0 )); then
+    printf '%s\n' "Required scope paths:"
+    for path in "${SCOPE_DISPLAY[@]}"; do
+      printf -- '- %s\n' "$path"
+    done
+  fi
+
+  if (( ${#CONTEXT_DISPLAY[@]} > 0 )); then
+    printf '%s\n' "Additional context paths:"
+    for path in "${CONTEXT_DISPLAY[@]}"; do
+      printf -- '- %s\n' "$path"
+    done
+  fi
+
+  if [[ -n "$EXTRA_PROMPT" ]]; then
+    printf '\nAdditional instructions:\n%s\n' "$EXTRA_PROMPT"
+  fi
+}
+
+run_claude() {
+  command -v claude >/dev/null 2>&1 || err "claude CLI is not installed or not on PATH"
+  (
+    cd "$REPO_ROOT"
+    printf '%s' "$PROMPT" | claude -p --permission-mode plan --output-format text > "$REVIEW_FILE"
+  )
+}
+
+run_codex() {
+  command -v codex >/dev/null 2>&1 || err "codex CLI is not installed or not on PATH"
+  (
+    cd "$REPO_ROOT"
+    codex exec -C "$REPO_ROOT" -s read-only -o "$REVIEW_FILE" "$PROMPT"
+  )
+}
+
+MODE="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$MODE" in
+  help|-h|--help)
+    usage
+    exit 0
+    ;;
+  challenge|verify) ;;
+  *)
+    err "unknown subcommand: $MODE"
+    ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --challenger)
+      [[ $# -ge 2 ]] || err "--challenger requires a value"
+      CHALLENGER="$2"
+      shift 2
+      ;;
+    --scope)
+      [[ $# -ge 2 ]] || err "--scope requires a value"
+      SCOPE_INPUTS+=("$2")
+      shift 2
+      ;;
+    --context)
+      [[ $# -ge 2 ]] || err "--context requires a value"
+      CONTEXT_INPUTS+=("$2")
+      shift 2
+      ;;
+    --guide)
+      [[ $# -ge 2 ]] || err "--guide requires a value"
+      GUIDE_OVERRIDE="$2"
+      shift 2
+      ;;
+    --review-dir)
+      [[ $# -ge 2 ]] || err "--review-dir requires a value"
+      REVIEW_DIR_OVERRIDE="$2"
+      shift 2
+      ;;
+    --out)
+      [[ $# -ge 2 ]] || err "--out requires a value"
+      OUT_OVERRIDE="$2"
+      shift 2
+      ;;
+    --prompt)
+      [[ $# -ge 2 ]] || err "--prompt requires a value"
+      EXTRA_PROMPT="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      err "unknown argument: $1"
+      ;;
+  esac
+done
+
+REPO_ROOT="$(detect_repo_root)"
+load_config "$REPO_ROOT/.agent-collab.env"
+
+if [[ -n "$GUIDE_OVERRIDE" ]]; then
+  GUIDE_PATH="$(absolute_existing_path "$GUIDE_OVERRIDE")"
+elif [[ -n "$CONFIG_GUIDE" ]]; then
+  GUIDE_PATH="$(absolute_existing_path "$CONFIG_GUIDE")"
+elif [[ -f "$REPO_ROOT/AGENT-COLLABORATION.md" ]]; then
+  GUIDE_PATH="$(absolute_existing_path "$REPO_ROOT/AGENT-COLLABORATION.md")"
+fi
+
+if [[ -n "$GUIDE_PATH" ]]; then
+  GUIDE_DISPLAY="$(display_path "$GUIDE_PATH")"
+fi
+
+if [[ -n "$REVIEW_DIR_OVERRIDE" ]]; then
+  REVIEW_DIR="$REVIEW_DIR_OVERRIDE"
+elif [[ -n "$CONFIG_REVIEW_DIR" ]]; then
+  REVIEW_DIR="$CONFIG_REVIEW_DIR"
+fi
+
+if [[ -z "$CHALLENGER" ]]; then
+  CHALLENGER="$CONFIG_DEFAULT_CHALLENGER"
+fi
+
+[[ -n "$CHALLENGER" ]] || err "set --challenger or AGENT_COLLAB_DEFAULT_CHALLENGER in .agent-collab.env"
+validate_challenger "$CHALLENGER"
+
+if (( ${#SCOPE_INPUTS[@]} == 0 && ${#CONTEXT_INPUTS[@]} == 0 )) && [[ -z "$EXTRA_PROMPT" ]]; then
+  err "provide at least one --scope, --context, or --prompt value"
+fi
+
+if (( ${#SCOPE_INPUTS[@]} > 0 )); then
+  for path in "${SCOPE_INPUTS[@]}"; do
+    absolute_path="$(absolute_existing_path "$path")"
+    SCOPE_DISPLAY+=("$(display_path "$absolute_path")")
+  done
+fi
+
+if (( ${#CONTEXT_INPUTS[@]} > 0 )); then
+  for path in "${CONTEXT_INPUTS[@]}"; do
+    absolute_path="$(absolute_existing_path "$path")"
+    CONTEXT_DISPLAY+=("$(display_path "$absolute_path")")
+  done
+fi
+
+prepare_review_file
+PROMPT="$(build_prompt)"
+
+if (( DRY_RUN )); then
+  cat <<EOF
+mode: $MODE
+challenger: $CHALLENGER
+repo_root: $REPO_ROOT
+config: ${CONFIG_FILE:-none}
+review_file: $REVIEW_FILE
+
+prompt:
+$PROMPT
+EOF
+  exit 0
+fi
+
+case "$CHALLENGER" in
+  claude)
+    run_claude
+    ;;
+  codex)
+    run_codex
+    ;;
+esac
+
+[[ -s "$REVIEW_FILE" ]] || err "review command completed without usable output: $REVIEW_FILE"
+
+printf 'review: %s\n' "$REVIEW_FILE"

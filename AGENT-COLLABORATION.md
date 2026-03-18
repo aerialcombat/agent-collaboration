@@ -1,0 +1,90 @@
+# Agent Collaboration
+
+This repository follows the global Claude Code + Codex CLI collaboration protocol, but its local implementation is intentionally light.
+
+Global protocol reference:
+- `docs/GLOBAL-PROTOCOL.md`
+
+Local integration reference:
+- `docs/LOCAL-INTEGRATION.md`
+
+## Local Sources Of Truth
+
+- local collaboration guide: `AGENT-COLLABORATION.md`
+- global protocol spec: `docs/GLOBAL-PROTOCOL.md`
+- repo integration guide: `docs/LOCAL-INTEGRATION.md`
+- global runner: `scripts/agent-collab`
+- installer: `scripts/install-global-protocol`
+- doctor: `scripts/doctor-global-protocol`
+- review artifacts: `.agent-collab/reviews/`
+
+This repo does not use plan/state/event files by default because most work here is doc-heavy and low-risk.
+
+## When Collaboration Is Required Here
+
+Use a challenge pass by default for:
+
+- changes to `docs/GLOBAL-PROTOCOL.md`
+- changes to `scripts/install-global-protocol`
+- changes to `scripts/agent-collab`
+- changes to `scripts/doctor-global-protocol`
+- changes that blur the global/local boundary
+- changes that alter default trigger rules or escalation behavior
+
+Skip collaboration by default for:
+
+- obvious typo fixes
+- isolated copy edits with no behavioral change
+- purely mechanical formatting changes
+
+## Roles
+
+- `lead`
+  Coordinates the change, invokes the challenger, and decides what feedback is accepted.
+- `challenger`
+  Returns text only, focuses on unsafe defaults and boundary mistakes, and does not recursively call back.
+
+## Default Path
+
+1. Lead updates the relevant docs or scripts.
+2. Lead runs `agent-collab challenge`.
+3. Challenger reviews the changed files in read-only mode.
+4. Lead applies justified fixes.
+5. Lead runs `agent-collab verify` or a second challenge pass if needed.
+6. If disagreement survives two rounds, escalate.
+
+## Local Helper Commands
+
+Use the global runner directly in this repo:
+
+```bash
+agent-collab challenge --challenger claude --scope docs/GLOBAL-PROTOCOL.md
+agent-collab verify --challenger codex --context scripts/install-global-protocol
+```
+
+The repo-local defaults come from `.agent-collab.env`.
+
+## Review Focus For This Repo
+
+Challenge reviews in this repo should focus on:
+
+- destructive installer behavior
+- stale CLI assumptions
+- unsafe subprocess defaults
+- global/local boundary confusion
+- documentation that promises behavior the scripts do not enforce
+
+## Verification
+
+Minimum verification for changes here:
+
+- `bash -n` for edited shell scripts
+- `./scripts/doctor-global-protocol`
+- rerun `./scripts/install-global-protocol` when installer or templates change
+- inspect the rendered globals if install behavior changed
+
+## Escalation
+
+- default maximum: two challenge rounds
+- if the challenger fails or returns unusable output, record that fact
+- if the agents still disagree after two rounds, escalate to the human owner
