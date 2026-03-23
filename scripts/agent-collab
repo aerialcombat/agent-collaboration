@@ -9,12 +9,17 @@ GUIDE_OVERRIDE=""
 REVIEW_DIR_OVERRIDE=""
 OUT_OVERRIDE=""
 EXTRA_PROMPT=""
+TIMEOUT_OVERRIDE=""
 DRY_RUN=0
 
 CONFIG_FILE=""
 CONFIG_GUIDE=""
 CONFIG_REVIEW_DIR=""
 CONFIG_DEFAULT_CHALLENGER=""
+CONFIG_TIMEOUT_SECONDS=""
+CONFIG_CLAUDE_TIMEOUT_SECONDS=""
+CONFIG_CODEX_TIMEOUT_SECONDS=""
+CONFIG_CLAUDE_EFFORT=""
 
 REPO_ROOT=""
 GUIDE_PATH=""
@@ -22,9 +27,17 @@ GUIDE_DISPLAY=""
 REVIEW_DIR=""
 REVIEW_FILE=""
 PROMPT=""
+INLINE_FILE_LIMIT_BYTES=$((40 * 1024))
+INLINE_TOTAL_LIMIT_BYTES=$((200 * 1024))
+TIMEOUT_SECONDS="300"
+TIMEOUT_BACKEND=""
+TIMEOUT_COMMAND=""
+CLAUDE_EFFORT="low"
 
 SCOPE_INPUTS=()
 CONTEXT_INPUTS=()
+SCOPE_PATHS=()
+CONTEXT_PATHS=()
 SCOPE_DISPLAY=()
 CONTEXT_DISPLAY=()
 
@@ -43,6 +56,7 @@ Options:
   --review-dir <path>          Directory for generated review files, relative to repo root.
   --out <path>                 Exact output file path, relative to repo root if not absolute.
   --prompt <text>              Extra instructions appended to the default prompt shape.
+  --timeout-seconds <n>        Hard timeout for the challenger subprocess. Use 0 to disable.
   --dry-run                    Print the derived prompt and file paths without invoking a CLI.
   -h, --help                   Show this help.
 
@@ -52,6 +66,10 @@ Repo-local config:
     AGENT_COLLAB_GUIDE=AGENT-COLLABORATION.md
     AGENT_COLLAB_REVIEW_DIR=.agent-collab/reviews
     AGENT_COLLAB_DEFAULT_CHALLENGER=claude
+    AGENT_COLLAB_TIMEOUT_SECONDS=300
+    AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
+    AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+    AGENT_COLLAB_CLAUDE_EFFORT=low
 EOF
 }
 
@@ -133,6 +151,18 @@ load_config() {
       AGENT_COLLAB_DEFAULT_CHALLENGER)
         CONFIG_DEFAULT_CHALLENGER="$value"
         ;;
+      AGENT_COLLAB_TIMEOUT_SECONDS)
+        CONFIG_TIMEOUT_SECONDS="$value"
+        ;;
+      AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS)
+        CONFIG_CLAUDE_TIMEOUT_SECONDS="$value"
+        ;;
+      AGENT_COLLAB_CODEX_TIMEOUT_SECONDS)
+        CONFIG_CODEX_TIMEOUT_SECONDS="$value"
+        ;;
+      AGENT_COLLAB_CLAUDE_EFFORT)
+        CONFIG_CLAUDE_EFFORT="$value"
+        ;;
       *)
         warn "ignoring unknown config key in $file: $key"
         ;;
@@ -196,6 +226,130 @@ validate_challenger() {
   esac
 }
 
+validate_claude_effort() {
+  case "$1" in
+    low|medium|high|max) ;;
+    *)
+      err "unsupported Claude effort: $1"
+      ;;
+  esac
+}
+
+validate_timeout_seconds() {
+  local value="$1"
+
+  [[ "$value" =~ ^[0-9]+$ ]] || err "timeout must be a non-negative integer: $value"
+}
+
+resolve_timeout_backend() {
+  if (( TIMEOUT_SECONDS == 0 )); then
+    TIMEOUT_BACKEND="disabled"
+    TIMEOUT_COMMAND=""
+    return
+  fi
+
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BACKEND="timeout"
+    TIMEOUT_COMMAND="$(command -v timeout)"
+    return
+  fi
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BACKEND="timeout"
+    TIMEOUT_COMMAND="$(command -v gtimeout)"
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    TIMEOUT_BACKEND="python3"
+    TIMEOUT_COMMAND="$(command -v python3)"
+    return
+  fi
+
+  err "no timeout backend available; install timeout/gtimeout or python3, or set --timeout-seconds 0"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+  local seconds_duration
+
+  if (( seconds == 0 )); then
+    "$@"
+    return $?
+  fi
+
+  seconds_duration="${seconds}s"
+
+  case "$TIMEOUT_BACKEND" in
+    timeout)
+      local stderr_output="" rc=0
+
+      # Run the challenger directly so timeout's kill-after path keeps control
+      # of the full subprocess instead of only an intermediate shell wrapper.
+      exec 3>&1
+      stderr_output="$("$TIMEOUT_COMMAND" -k 5s "$seconds_duration" "$@" 2>&1 1>&3)" || rc=$?
+      exec 3>&-
+
+      if [[ -n "$stderr_output" ]]; then
+        printf '%s\n' "$stderr_output" >&2
+      fi
+
+      return "$rc"
+      ;;
+    python3)
+      "$TIMEOUT_COMMAND" -c '
+import os
+import signal
+import subprocess
+import sys
+
+timeout_seconds = int(sys.argv[1])
+command = sys.argv[2:]
+kwargs = {}
+if hasattr(os, "setsid"):
+    kwargs["start_new_session"] = True
+
+proc = subprocess.Popen(command, **kwargs)
+try:
+    sys.exit(proc.wait(timeout=timeout_seconds))
+except subprocess.TimeoutExpired:
+    try:
+        if hasattr(os, "killpg") and hasattr(os, "setsid"):
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if hasattr(os, "killpg") and hasattr(os, "setsid"):
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+    sys.exit(124)
+' "$seconds" "$@"
+      ;;
+    *)
+      err "timeout backend is not configured"
+      ;;
+  esac
+}
+
+is_timeout_status() {
+  case "$1" in
+    124|137) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 prepare_review_file() {
   local timestamp out_dir temp_root
   timestamp="$(date +%Y%m%d-%H%M%S)"
@@ -228,7 +382,9 @@ prepare_review_file() {
 }
 
 build_prompt() {
-  local path
+  local path absolute_path display inline_bytes_used remaining_budget file_size include_bytes
+
+  inline_bytes_used=0
 
   if [[ "$MODE" == "challenge" ]]; then
     printf '%s\n' "Read the repo-local collaboration guide and relevant scope docs."
@@ -266,27 +422,149 @@ build_prompt() {
   if [[ -n "$EXTRA_PROMPT" ]]; then
     printf '\nAdditional instructions:\n%s\n' "$EXTRA_PROMPT"
   fi
+
+  if [[ -n "$GUIDE_PATH" || ${#SCOPE_PATHS[@]} -gt 0 || ${#CONTEXT_PATHS[@]} -gt 0 ]]; then
+    printf '\n'
+    printf '%s\n' "Review the provided file contents directly."
+    printf '%s\n' "Do not assume any additional repo context beyond the files included below."
+  fi
+
+  if [[ -n "$GUIDE_PATH" ]]; then
+    remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+    file_size="$(wc -c < "$GUIDE_PATH" | tr -d '[:space:]')"
+    if (( remaining_budget <= 0 )); then
+      printf -- '\n----- BEGIN FILE: %s -----\n' "$GUIDE_DISPLAY"
+      printf '[omitted: inline prompt size budget exhausted]\n'
+      printf -- '----- END FILE: %s -----\n' "$GUIDE_DISPLAY"
+    else
+      include_bytes=$INLINE_FILE_LIMIT_BYTES
+      (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+      (( include_bytes > file_size )) && include_bytes=$file_size
+      printf -- '\n----- BEGIN FILE: %s -----\n' "$GUIDE_DISPLAY"
+      if (( include_bytes > 0 )); then
+        LC_ALL=C head -c "$include_bytes" "$GUIDE_PATH"
+        printf '\n'
+      fi
+      if (( file_size > include_bytes )); then
+        printf '\n[truncated: showing first %d of %d bytes]\n' "$include_bytes" "$file_size"
+      fi
+      printf -- '----- END FILE: %s -----\n' "$GUIDE_DISPLAY"
+      inline_bytes_used=$((inline_bytes_used + include_bytes))
+    fi
+  fi
+
+  if (( ${#SCOPE_PATHS[@]} > 0 )); then
+    for path in "${!SCOPE_PATHS[@]}"; do
+      absolute_path="${SCOPE_PATHS[$path]}"
+      display="${SCOPE_DISPLAY[$path]}"
+      remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+      file_size="$(wc -c < "$absolute_path" | tr -d '[:space:]')"
+      if (( remaining_budget <= 0 )); then
+        printf -- '\n----- BEGIN FILE: %s -----\n' "$display"
+        printf '[omitted: inline prompt size budget exhausted]\n'
+        printf -- '----- END FILE: %s -----\n' "$display"
+        continue
+      fi
+      include_bytes=$INLINE_FILE_LIMIT_BYTES
+      (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+      (( include_bytes > file_size )) && include_bytes=$file_size
+      printf -- '\n----- BEGIN FILE: %s -----\n' "$display"
+      if (( include_bytes > 0 )); then
+        LC_ALL=C head -c "$include_bytes" "$absolute_path"
+        printf '\n'
+      fi
+      if (( file_size > include_bytes )); then
+        printf '\n[truncated: showing first %d of %d bytes]\n' "$include_bytes" "$file_size"
+      fi
+      printf -- '----- END FILE: %s -----\n' "$display"
+      inline_bytes_used=$((inline_bytes_used + include_bytes))
+    done
+  fi
+
+  if (( ${#CONTEXT_PATHS[@]} > 0 )); then
+    for path in "${!CONTEXT_PATHS[@]}"; do
+      absolute_path="${CONTEXT_PATHS[$path]}"
+      display="${CONTEXT_DISPLAY[$path]}"
+      remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+      file_size="$(wc -c < "$absolute_path" | tr -d '[:space:]')"
+      if (( remaining_budget <= 0 )); then
+        printf -- '\n----- BEGIN FILE: %s -----\n' "$display"
+        printf '[omitted: inline prompt size budget exhausted]\n'
+        printf -- '----- END FILE: %s -----\n' "$display"
+        continue
+      fi
+      include_bytes=$INLINE_FILE_LIMIT_BYTES
+      (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+      (( include_bytes > file_size )) && include_bytes=$file_size
+      printf -- '\n----- BEGIN FILE: %s -----\n' "$display"
+      if (( include_bytes > 0 )); then
+        LC_ALL=C head -c "$include_bytes" "$absolute_path"
+        printf '\n'
+      fi
+      if (( file_size > include_bytes )); then
+        printf '\n[truncated: showing first %d of %d bytes]\n' "$include_bytes" "$file_size"
+      fi
+      printf -- '----- END FILE: %s -----\n' "$display"
+      inline_bytes_used=$((inline_bytes_used + include_bytes))
+    done
+  fi
 }
 
 run_claude() {
+  local output_file="$1"
   command -v claude >/dev/null 2>&1 || err "claude CLI is not installed or not on PATH"
   (
     cd "$REPO_ROOT"
-    printf '%s' "$PROMPT" | claude -p --permission-mode plan --output-format text > "$REVIEW_FILE"
+    # Inline prompt context plus read-only tool access keeps the review bounded
+    # while still allowing Claude to fetch file tails if an inline block is truncated.
+    printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" claude -p --permission-mode plan --output-format text --tools "Read" --effort "$CLAUDE_EFFORT" > "$output_file"
   )
 }
 
 run_codex() {
+  local output_file="$1"
   command -v codex >/dev/null 2>&1 || err "codex CLI is not installed or not on PATH"
   (
     cd "$REPO_ROOT"
-    printf '%s' "$PROMPT" | codex exec -C "$REPO_ROOT" -s read-only -o "$REVIEW_FILE" -
+    printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" codex exec -C "$REPO_ROOT" -s read-only -o "$output_file" -
   )
 }
 
 review_file_has_content() {
   local path="$1"
   grep -q '[^[:space:]]' "$path"
+}
+
+run_review_command() {
+  local challenger="$1"
+  local temp_output temp_root status
+
+  temp_root="${TMPDIR:-/tmp}"
+  temp_root="${temp_root%/}"
+  temp_output="$(mktemp "$temp_root/agent-collab.${MODE}.${challenger}.output.XXXXXX")"
+
+  if "run_${challenger}" "$temp_output"; then
+    :
+  else
+    status=$?
+    rm -f "$temp_output"
+    if is_timeout_status "$status"; then
+      err "$challenger review timed out after ${TIMEOUT_SECONDS}s"
+    fi
+    err "$challenger review command failed with exit status $status"
+  fi
+
+  [[ -s "$temp_output" ]] || {
+    rm -f "$temp_output"
+    err "$challenger review command completed without usable output"
+  }
+
+  review_file_has_content "$temp_output" || {
+    rm -f "$temp_output"
+    err "$challenger review command completed with only whitespace output"
+  }
+
+  mv "$temp_output" "$REVIEW_FILE"
 }
 
 MODE="${1:-help}"
@@ -342,6 +620,11 @@ while [[ $# -gt 0 ]]; do
       EXTRA_PROMPT="$2"
       shift 2
       ;;
+    --timeout-seconds)
+      [[ $# -ge 2 ]] || err "--timeout-seconds requires a value"
+      TIMEOUT_OVERRIDE="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -384,6 +667,26 @@ fi
 [[ -n "$CHALLENGER" ]] || err "set --challenger or AGENT_COLLAB_DEFAULT_CHALLENGER in .agent-collab.env"
 validate_challenger "$CHALLENGER"
 
+if [[ -n "$CONFIG_CLAUDE_EFFORT" ]]; then
+  CLAUDE_EFFORT="$CONFIG_CLAUDE_EFFORT"
+fi
+validate_claude_effort "$CLAUDE_EFFORT"
+
+if [[ -n "$TIMEOUT_OVERRIDE" ]]; then
+  TIMEOUT_SECONDS="$TIMEOUT_OVERRIDE"
+elif [[ "$CHALLENGER" == "claude" && -n "$CONFIG_CLAUDE_TIMEOUT_SECONDS" ]]; then
+  TIMEOUT_SECONDS="$CONFIG_CLAUDE_TIMEOUT_SECONDS"
+elif [[ "$CHALLENGER" == "codex" && -n "$CONFIG_CODEX_TIMEOUT_SECONDS" ]]; then
+  TIMEOUT_SECONDS="$CONFIG_CODEX_TIMEOUT_SECONDS"
+elif [[ -n "$CONFIG_TIMEOUT_SECONDS" ]]; then
+  TIMEOUT_SECONDS="$CONFIG_TIMEOUT_SECONDS"
+fi
+validate_timeout_seconds "$TIMEOUT_SECONDS"
+resolve_timeout_backend
+if (( TIMEOUT_SECONDS == 0 )); then
+  warn "timeouts are disabled for $CHALLENGER review"
+fi
+
 if (( ${#SCOPE_INPUTS[@]} == 0 && ${#CONTEXT_INPUTS[@]} == 0 )) && [[ -z "$EXTRA_PROMPT" ]]; then
   err "provide at least one --scope, --context, or --prompt value"
 fi
@@ -391,6 +694,7 @@ fi
 if (( ${#SCOPE_INPUTS[@]} > 0 )); then
   for path in "${SCOPE_INPUTS[@]}"; do
     absolute_path="$(absolute_existing_path "$path")"
+    SCOPE_PATHS+=("$absolute_path")
     SCOPE_DISPLAY+=("$(display_path "$absolute_path")")
   done
 fi
@@ -398,6 +702,7 @@ fi
 if (( ${#CONTEXT_INPUTS[@]} > 0 )); then
   for path in "${CONTEXT_INPUTS[@]}"; do
     absolute_path="$(absolute_existing_path "$path")"
+    CONTEXT_PATHS+=("$absolute_path")
     CONTEXT_DISPLAY+=("$(display_path "$absolute_path")")
   done
 fi
@@ -412,6 +717,8 @@ challenger: $CHALLENGER
 repo_root: $REPO_ROOT
 config: ${CONFIG_FILE:-none}
 review_file: $REVIEW_FILE
+timeout_seconds: $TIMEOUT_SECONDS
+timeout_backend: $TIMEOUT_BACKEND
 
 prompt:
 $PROMPT
@@ -419,16 +726,6 @@ EOF
   exit 0
 fi
 
-case "$CHALLENGER" in
-  claude)
-    run_claude
-    ;;
-  codex)
-    run_codex
-    ;;
-esac
-
-[[ -s "$REVIEW_FILE" ]] || err "review command completed without usable output: $REVIEW_FILE"
-review_file_has_content "$REVIEW_FILE" || err "review command completed with only whitespace output: $REVIEW_FILE"
+run_review_command "$CHALLENGER"
 
 printf 'review: %s\n' "$REVIEW_FILE"

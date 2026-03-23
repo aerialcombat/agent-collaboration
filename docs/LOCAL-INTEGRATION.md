@@ -120,9 +120,15 @@ If the repo wants to use the global `agent-collab` command instead of a custom w
 AGENT_COLLAB_GUIDE=AGENT-COLLABORATION.md
 AGENT_COLLAB_REVIEW_DIR=.agent-collab/reviews
 AGENT_COLLAB_DEFAULT_CHALLENGER=claude
+AGENT_COLLAB_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CLAUDE_EFFORT=low
 ```
 
 Keep that file data-only. Do not rely on shell execution in repo config.
+
+When using `agent-collab` with Claude as the challenger, prefer passing the actual guide, scope, and changed files that matter. The runner can inline those files into the prompt, which is faster and more reliable than asking Claude to discover them from path names during the review pass. The runner also supports hard timeout defaults and per-challenger timeout overrides so the lead can bound challenge latency explicitly.
 
 ## Manual Trigger Examples
 

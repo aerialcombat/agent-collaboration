@@ -21,12 +21,12 @@ Protocol reference:
 
 ## Subprocess Rule
 
-When calling Claude from Codex in subprocess mode, pipe the prompt via stdin.
+When calling Claude from Codex in subprocess mode, pipe the prompt via stdin and apply a hard timeout using the timeout backend available on that machine (`timeout` or `gtimeout`).
 
 Preferred global form:
 
 ```bash
-printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text
+printf '%s' "$prompt" | timeout -k 5s 300 claude -p --permission-mode plan --output-format text --tools "Read" --effort low
 ```
 
 ## Quick Start

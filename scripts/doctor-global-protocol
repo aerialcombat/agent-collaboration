@@ -175,6 +175,8 @@ check_codex_cli() {
 }
 
 check_global_command() {
+  local agent_help
+
   if [[ -x "$COMMAND_TARGET" ]]; then
     pass "global command installed: $COMMAND_TARGET"
   else
@@ -195,6 +197,31 @@ check_global_command() {
   else
     warn "agent-collab help output is missing expected subcommands"
   fi
+
+  if grep -Fq -- "--timeout-seconds" <<<"$agent_help"; then
+    pass "agent-collab advertises timeout override support"
+  else
+    warn "agent-collab help output is missing --timeout-seconds"
+  fi
+}
+
+check_timeout_backend() {
+  if command -v timeout >/dev/null 2>&1; then
+    pass "timeout backend available: $(command -v timeout)"
+    return
+  fi
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    pass "timeout backend available: $(command -v gtimeout)"
+    return
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    pass "timeout backend fallback available via python3: $(command -v python3)"
+    return
+  fi
+
+  block "no timeout backend available for agent-collab; install timeout/gtimeout or python3"
 }
 
 check_project() {
@@ -216,6 +243,7 @@ check_temp_dir
 check_target "Claude" "$CLAUDE_TARGET"
 check_target "Codex" "$CODEX_TARGET"
 check_global_command
+check_timeout_backend
 check_claude_cli
 check_codex_cli
 

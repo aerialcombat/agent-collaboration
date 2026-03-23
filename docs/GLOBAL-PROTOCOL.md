@@ -137,7 +137,7 @@ If the other agent or CLI is unavailable, treat that the same way as a failed ch
 
 ## Global Subprocess Rule
 
-When Codex calls Claude in subprocess mode, pipe the prompt through stdin instead of passing the full prompt only as a positional argument.
+When Codex calls Claude in subprocess mode, pipe the prompt through stdin instead of passing the full prompt only as a positional argument, and apply a hard timeout with the timeout backend available on that machine (`timeout` or `gtimeout`).
 
 Recommended pattern:
 
@@ -167,6 +167,8 @@ The global runner should remain thin:
 - prompt shaping
 - review file creation
 - explicit failure handling
+- explicit subprocess deadlines
+- when concrete review files are already known, it may inline those file contents into the prompt instead of forcing the challenger to read them via tools
 
 It should not become the place where repo-specific plan paths, ownership rules, or test commands live.
 
@@ -175,7 +177,7 @@ Claude leading:
 ```bash
 prompt='Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
 review_file="$(mktemp "${TMPDIR:-/tmp}/codex-review.XXXXXX.md")"
-printf '%s' "$prompt" | codex exec -C "$PWD" -s read-only -o "$review_file" -
+printf '%s' "$prompt" | timeout -k 5s 300 codex exec -C "$PWD" -s read-only -o "$review_file" -
 ```
 
 Codex leading:
@@ -183,8 +185,13 @@ Codex leading:
 ```bash
 prompt='Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
 review_file="$(mktemp "${TMPDIR:-/tmp}/claude-review.XXXXXX.md")"
-printf '%s' "$prompt" | claude -p --permission-mode plan --output-format text > "$review_file"
+printf '%s' "$prompt" | timeout -k 5s 300 claude -p --permission-mode plan --output-format text --tools "Read" --effort low > "$review_file"
 ```
+
+If the lead already has a concrete set of files to review, prefer inlining those file contents into the prompt for Claude challenge passes rather than sending only path names. That avoids a slower repo/tool bootstrap path and is less likely to hit external timeouts. If the wrapper also restricts Claude to read-only tool access for that bounded review, prefer a configurable low-effort default to keep latency down, but allow repos to raise it when they need deeper review.
+
+On macOS without GNU coreutils, replace `timeout` with `gtimeout` in the manual examples.
+The global runner can fall back to `python3` internally when neither binary is available, but the manual shell examples assume a timeout command exists.
 
 The lead should append or summarize the resulting review inside the repo-local plan or decision record.
 These command shapes are defaults, not standards. Prefer repo-local wrappers when they exist, and adjust for the installed CLI version when needed.

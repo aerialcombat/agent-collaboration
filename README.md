@@ -21,7 +21,7 @@ The goal is to make the two agents behave consistently across repos without forc
 - `scripts/install-global-protocol`
   Installs rendered templates into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and a global `agent-collab` command.
 - `scripts/agent-collab`
-  Thin global runner for `challenge` and `verify` passes with safe Claude/Codex invocation defaults.
+  Thin global runner for `challenge` and `verify` passes with safe Claude/Codex invocation defaults. It applies hard subprocess timeouts, and for Claude review passes it inlines the provided guide, scope, and context files into the prompt, narrows Claude to read-only file access, and uses a configurable effort level.
 - `scripts/doctor-global-protocol`
   Checks the install state and the local Claude/Codex CLI assumptions used by the protocol.
 - `docs/LOCAL-INTEGRATION.md`
@@ -87,9 +87,17 @@ The runner looks for an optional repo-local `.agent-collab.env` file with values
 AGENT_COLLAB_GUIDE=AGENT-COLLABORATION.md
 AGENT_COLLAB_REVIEW_DIR=.agent-collab/reviews
 AGENT_COLLAB_DEFAULT_CHALLENGER=claude
+AGENT_COLLAB_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+AGENT_COLLAB_CLAUDE_EFFORT=low
 ```
 
 That file is data-only. The command parses the supported keys and does not source arbitrary shell.
+
+For Claude challenge and verify passes, `agent-collab` reviews the contents of the files you pass with `--guide`, `--scope`, and `--context` directly. That is intentional: path-only prompts were noticeably slower and more likely to hit timeouts because Claude had to spend the review pass reading the repo on its own. The Claude runner also uses read-only `Read` tool access and a configurable effort level that defaults to `low` so the challenge pass stays bounded without losing file-read fallback.
+
+The runner enforces a hard timeout internally. It prefers `timeout`, falls back to `gtimeout` or `python3` when needed, and can be tuned with repo config or `--timeout-seconds`.
 
 Manual fallback:
 

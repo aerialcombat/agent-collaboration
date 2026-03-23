@@ -39,7 +39,7 @@ This repo also self-hosts a thin local layer so the global runner can be used ag
 - **Evidence rule**: Neither agent accepts the other's position without support from code, tool output, tests, or repo rules.
 - **Two-round max**: If agents don't converge after two challenge rounds, escalate to human.
 - **Failure honesty**: If challenger doesn't return, record that fact — never invent review content.
-- **Subprocess rule for Codex→Claude**: Pipe prompt via stdin (`printf '%s' "$prompt" | claude -p ...`) to avoid a known hang pattern.
+- **Subprocess rule for Codex→Claude**: Pipe prompt via stdin, apply a hard timeout, and prefer the same read-only Claude flags the runner uses so subprocess review cannot hang indefinitely.
 
 ## Template Variable
 
