@@ -13,8 +13,9 @@ This repo defines a **global collaboration protocol** for Claude Code, Codex CLI
 - `docs/GLOBAL-PROTOCOL.md` — The canonical protocol specification: roles (lead/challenger), trigger rules, synchronous vs parallel paths, review focus areas, evidence rules, round limits, escalation, and subprocess invocation patterns.
 - `templates/CLAUDE.md` — Template for global Claude Code instructions. Contains `{{PROJECT_ROOT}}` placeholder.
 - `templates/AGENTS.md` — Template for global Codex CLI instructions. Contains `{{PROJECT_ROOT}}` placeholder.
+- `templates/GEMINI.md` — Template for global Gemini CLI instructions. Contains `{{PROJECT_ROOT}}` placeholder.
 - `templates/AGENT-COLLABORATION.md` — Starter template for a consuming repo's local collaboration guide.
-- `scripts/install-global-protocol` — Bash installer that renders templates (replacing `{{PROJECT_ROOT}}`) and writes them to `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`, backing up existing files with timestamps.
+- `scripts/install-global-protocol` — Bash installer that renders templates (replacing `{{PROJECT_ROOT}}`) and writes them to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `~/.gemini/GEMINI.md`, backing up existing files with timestamps.
 - `scripts/doctor-global-protocol` — Validates install state and the CLI capability assumptions used by the global protocol.
 - `docs/LOCAL-INTEGRATION.md` — Guide for adding the repo-local layer in consuming repositories.
 
@@ -40,6 +41,7 @@ This repo also self-hosts a thin local layer so the global runner can be used ag
 - **Two-round max**: If agents don't converge after two challenge rounds, escalate to human.
 - **Failure honesty**: If challenger doesn't return, record that fact — never invent review content.
 - **Subprocess rule for Codex→Claude**: Pipe prompt via stdin, apply a hard timeout, and prefer the same read-only Claude flags the runner uses so subprocess review cannot hang indefinitely.
+- **Subprocess rule for Gemini**: Pipe prompt via stdin with `-p ""` flag, use `--approval-mode plan` for read-only review, capture stdout to review file.
 
 ## Template Variable
 

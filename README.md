@@ -1,12 +1,12 @@
 # Agent Collaboration
 
-Global collaboration protocol for Claude Code and Codex CLI.
+Global collaboration protocol for Claude Code, Codex CLI, and Gemini CLI.
 
 This project separates:
 - global collaboration behavior
 - repo-local implementation details
 
-The goal is to make the two agents behave consistently across repos without forcing every repo to use the same file paths or helper scripts.
+The goal is to make the three agents behave consistently across repos without forcing every repo to use the same file paths or helper scripts.
 
 ## What This Project Contains
 
@@ -16,14 +16,16 @@ The goal is to make the two agents behave consistently across repos without forc
   Global Claude Code instructions template.
 - `templates/AGENTS.md`
   Global Codex CLI instructions template.
+- `templates/GEMINI.md`
+  Global Gemini CLI instructions template.
 - `templates/AGENT-COLLABORATION.md`
   Starter repo-local collaboration guide for consuming repositories.
 - `scripts/install-global-protocol`
-  Installs rendered templates into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and a global `agent-collab` command.
+  Installs rendered templates into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`, and a global `agent-collab` command.
 - `scripts/agent-collab`
-  Thin global runner for `challenge` and `verify` passes with safe Claude/Codex invocation defaults. It applies hard subprocess timeouts, and for Claude review passes it inlines the provided guide, scope, and context files into the prompt, narrows Claude to read-only file access, and uses a configurable effort level.
+  Thin global runner for `challenge` and `verify` passes with safe Claude/Codex/Gemini invocation defaults. It applies hard subprocess timeouts, deduplicates overlapping guide/scope/context paths, and for Claude review passes it inlines the provided files into the prompt and only enables read-only file access when the inline budget truncates or omits content.
 - `scripts/doctor-global-protocol`
-  Checks the install state and the local Claude/Codex CLI assumptions used by the protocol.
+  Checks the install state and the local Claude/Codex/Gemini CLI assumptions used by the protocol.
 - `docs/LOCAL-INTEGRATION.md`
   Explains how consuming repositories should implement their local layer.
 
@@ -90,18 +92,19 @@ AGENT_COLLAB_DEFAULT_CHALLENGER=claude
 AGENT_COLLAB_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+AGENT_COLLAB_GEMINI_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CLAUDE_EFFORT=low
 ```
 
 That file is data-only. The command parses the supported keys and does not source arbitrary shell.
 
-For Claude challenge and verify passes, `agent-collab` reviews the contents of the files you pass with `--guide`, `--scope`, and `--context` directly. That is intentional: path-only prompts were noticeably slower and more likely to hit timeouts because Claude had to spend the review pass reading the repo on its own. The Claude runner also uses read-only `Read` tool access and a configurable effort level that defaults to `low` so the challenge pass stays bounded without losing file-read fallback.
+For Claude challenge and verify passes, `agent-collab` reviews the contents of the files you pass with `--guide`, `--scope`, and `--context` directly. That is intentional: path-only prompts were noticeably slower and more likely to hit timeouts because Claude had to spend the review pass reading the repo on its own. The Claude runner deduplicates overlapping paths before inlining them, and it only enables read-only `Read` tool access when the inline prompt budget truncates or omits file contents. Claude effort remains configurable and defaults to `low`.
 
 The runner enforces a hard timeout internally. It prefers `timeout`, falls back to `gtimeout` or `python3` when needed, and can be tuned with repo config or `--timeout-seconds`.
 
 Manual fallback:
 
-Use the canonical manual trigger patterns in [docs/GLOBAL-PROTOCOL.md](docs/GLOBAL-PROTOCOL.md#manual-trigger-patterns). That document is the single source of truth for raw Claude/Codex shell invocation shapes.
+Use the canonical manual trigger patterns in [docs/GLOBAL-PROTOCOL.md](docs/GLOBAL-PROTOCOL.md#manual-trigger-patterns). That document is the single source of truth for raw Claude/Codex/Gemini shell invocation shapes.
 
 ## Install
 
@@ -111,7 +114,7 @@ cd ~/Development/agent-collaboration
 ```
 
 The installer:
-- creates `~/.claude/` and `~/.codex/` if needed
+- creates `~/.claude/`, `~/.codex/`, and `~/.gemini/` if needed
 - installs `agent-collab` to `~/.local/bin/` by default
 - preserves non-managed content and only updates a marked collaboration block
 - backs up target files before changing them
@@ -132,12 +135,12 @@ cd ~/Development/agent-collaboration
 
 The doctor script checks:
 
-- whether the global Claude and Codex files exist
+- whether the global Claude, Codex, and Gemini files exist
 - whether they contain the managed block from this project
 - whether the referenced protocol doc still exists
 - whether the global `agent-collab` command is installed and on `PATH`
-- whether `claude` and `codex` are installed
-- whether the CLI help output still supports the manual trigger assumptions in this protocol
+- whether `claude`, `codex`, and `gemini` are installed
+- whether each CLI's help output still supports the manual trigger assumptions in this protocol
 
 The last tested CLI baseline is surfaced by `./scripts/doctor-global-protocol` and referenced in [docs/GLOBAL-PROTOCOL.md](docs/GLOBAL-PROTOCOL.md).
 If your installed versions differ, rerun the doctor for surface-compatibility checks and manually revalidate the trigger patterns before treating warnings as false positives.
@@ -177,6 +180,6 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Important Rule
 
-The two agents should never “collaborate” by pretending agreement exists when it does not.
+The agents should never “collaborate” by pretending agreement exists when it does not.
 
 If the challenger does not return, the lead must record that fact and proceed conservatively instead of inventing review output.
