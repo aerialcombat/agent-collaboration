@@ -149,6 +149,16 @@ This avoids a known subprocess hang pattern where Claude blocks on stdin.
 
 When Claude calls Codex, use the repo-local preferred invocation. If a read-only challenge mode exists, prefer it.
 
+When calling Gemini from another agent, pipe the prompt through stdin with the `-p` flag for headless mode, set `--approval-mode plan` for read-only review, and apply a hard timeout.
+
+Recommended pattern:
+
+```bash
+printf '%s' "$prompt" | gemini -p "" --approval-mode plan -o text
+```
+
+Gemini writes to stdout. Use shell redirection to capture the output to a review file.
+
 ## Manual Trigger Patterns
 
 If a repo has a local collaboration helper, use it.
@@ -160,6 +170,11 @@ Example global runner shapes:
 ```bash
 agent-collab challenge --challenger codex --scope plans/<scope>.md
 agent-collab verify --challenger claude --scope plans/<scope>.md --context <changed-file>
+```
+
+```bash
+agent-collab challenge --challenger gemini --scope plans/<scope>.md
+agent-collab verify --challenger gemini --scope plans/<scope>.md --context <changed-file>
 ```
 
 The global runner should remain thin:
@@ -188,14 +203,22 @@ review_file="$(mktemp "${TMPDIR:-/tmp}/claude-review.XXXXXX.md")"
 printf '%s' "$prompt" | timeout -k 5s 300 claude -p --permission-mode plan --output-format text --tools "Read" --effort low > "$review_file"
 ```
 
-If the lead already has a concrete set of files to review, prefer inlining those file contents into the prompt for Claude challenge passes rather than sending only path names. That avoids a slower repo/tool bootstrap path and is less likely to hit external timeouts. If the wrapper also restricts Claude to read-only tool access for that bounded review, prefer a configurable low-effort default to keep latency down, but allow repos to raise it when they need deeper review.
+Gemini as challenger:
+
+```bash
+prompt='Read the relevant scope docs and reply in markdown only. Do not modify files. Focus on risks, regressions, simpler alternatives, and missing tests.'
+review_file="$(mktemp "${TMPDIR:-/tmp}/gemini-review.XXXXXX.md")"
+printf '%s' "$prompt" | timeout -k 5s 300 gemini -p "" --approval-mode plan -o text > "$review_file"
+```
+
+If the lead already has a concrete set of files to review, prefer inlining those file contents into the prompt for Claude challenge passes rather than sending only path names. That avoids a slower repo/tool bootstrap path and is less likely to hit external timeouts. Repo-local wrappers should deduplicate overlapping file inputs before inlining them. If the wrapper also restricts Claude to read-only tool access for that bounded review, prefer enabling `Read` only when the inline prompt budget truncates or omits file contents, and keep a configurable low-effort default unless the repo needs deeper review.
 
 On macOS without GNU coreutils, replace `timeout` with `gtimeout` in the manual examples.
 The global runner can fall back to `python3` internally when neither binary is available, but the manual shell examples assume a timeout command exists.
 
 The lead should append or summarize the resulting review inside the repo-local plan or decision record.
 These command shapes are defaults, not standards. Prefer repo-local wrappers when they exist, and adjust for the installed CLI version when needed.
-This repository last verified them with Claude Code `2.1.78` and `codex-cli 0.115.0`.
+This repository last verified them with Claude Code `2.1.78`, `codex-cli 0.115.0`, and `@google/gemini-cli 0.38.1`.
 
 ## Global Prompt Shape
 
@@ -234,12 +257,14 @@ Repo-local implementations may extend the protocol, but they should not weaken t
 When no repo-specific rule says otherwise:
 - Claude is a strong default lead for planning and orchestration
 - Codex is a strong default challenger for adversarial review and verification
+- Gemini is a strong default for fast, independent review passes
 
 Swap roles when the task favors it.
 
 Role selection heuristics:
 - prefer Claude as lead for ambiguous planning, broad orchestration, or documentation-heavy work
 - prefer Codex as lead for bounded implementation, CLI/tooling work, or verification-heavy changes
+- prefer Gemini as challenger for fast review passes or when a third perspective adds signal
 - do not open nested challenge loops from inside a challenge pass; finish the current round first, then let the lead decide whether a new scope is needed
 
 ## Human Tie-Breaker

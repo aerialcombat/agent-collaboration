@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLAUDE_TARGET="$HOME/.claude/CLAUDE.md"
 CODEX_TARGET="$HOME/.codex/AGENTS.md"
+GEMINI_TARGET="$HOME/.gemini/GEMINI.md"
 BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
 COMMAND_TARGET="$BIN_DIR/agent-collab"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)-$$"
@@ -196,27 +197,32 @@ remove_managed_command() {
   echo "uninstalled: $target"
 }
 
-mkdir -p "$HOME/.claude" "$HOME/.codex"
+mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
 
 case "$MODE" in
   install)
     claude_rendered="$(mktemp)"
     codex_rendered="$(mktemp)"
+    gemini_rendered="$(mktemp)"
     claude_block="$(mktemp)"
     codex_block="$(mktemp)"
+    gemini_block="$(mktemp)"
 
     render_template "$PROJECT_ROOT/templates/CLAUDE.md" > "$claude_rendered"
     render_template "$PROJECT_ROOT/templates/AGENTS.md" > "$codex_rendered"
+    render_template "$PROJECT_ROOT/templates/GEMINI.md" > "$gemini_rendered"
     render_block "$PROJECT_ROOT/templates/CLAUDE.md" > "$claude_block"
     render_block "$PROJECT_ROOT/templates/AGENTS.md" > "$codex_block"
+    render_block "$PROJECT_ROOT/templates/GEMINI.md" > "$gemini_block"
 
     [[ -s "$PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md" ]] || err "missing or empty protocol doc: $PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md"
 
     write_installed_file "$CLAUDE_TARGET" "$claude_block" "$claude_rendered" "# Global Claude Collaboration Defaults"
     write_installed_file "$CODEX_TARGET" "$codex_block" "$codex_rendered" "# Global Codex Collaboration Defaults"
+    write_installed_file "$GEMINI_TARGET" "$gemini_block" "$gemini_rendered" "# Global Gemini Collaboration Defaults"
     write_command_file "$COMMAND_TARGET" "$PROJECT_ROOT/scripts/agent-collab"
 
-    rm -f "$claude_rendered" "$codex_rendered" "$claude_block" "$codex_block"
+    rm -f "$claude_rendered" "$codex_rendered" "$gemini_rendered" "$claude_block" "$codex_block" "$gemini_block"
 
     echo
     echo "protocol reference:"
@@ -230,6 +236,7 @@ case "$MODE" in
   --uninstall|uninstall)
     remove_installed_block "$CLAUDE_TARGET"
     remove_installed_block "$CODEX_TARGET"
+    remove_installed_block "$GEMINI_TARGET"
     remove_managed_command "$COMMAND_TARGET"
     ;;
   *)

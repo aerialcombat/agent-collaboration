@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-This repo defines a **global collaboration protocol** for Claude Code and Codex CLI. It separates global collaboration behavior (roles, review rules, escalation) from repo-local implementation details (paths, helpers, commands). The output is rendered instruction files installed into `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md`.
+This repo defines a **global collaboration protocol** for Claude Code, Codex CLI, and Gemini CLI. It separates global collaboration behavior (roles, review rules, escalation) from repo-local implementation details (paths, helpers, commands). The output is rendered instruction files installed into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `~/.gemini/GEMINI.md`.
 
 ## Repository Structure
 

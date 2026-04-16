@@ -60,6 +60,8 @@ Use the global runner directly in this repo:
 ```bash
 agent-collab challenge --challenger claude --scope docs/GLOBAL-PROTOCOL.md
 agent-collab verify --challenger codex --context scripts/install-global-protocol
+agent-collab challenge --challenger gemini --scope docs/GLOBAL-PROTOCOL.md
+agent-collab verify --challenger gemini --context scripts/install-global-protocol
 ```
 
 The repo-local defaults come from `.agent-collab.env`, including the default hard timeout budget. Use `--timeout-seconds` when a specific challenger or scope needs a different ceiling.

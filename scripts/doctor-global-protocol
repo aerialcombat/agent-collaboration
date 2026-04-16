@@ -4,11 +4,13 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLAUDE_TARGET="$HOME/.claude/CLAUDE.md"
 CODEX_TARGET="$HOME/.codex/AGENTS.md"
+GEMINI_TARGET="$HOME/.gemini/GEMINI.md"
 BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
 COMMAND_TARGET="$BIN_DIR/agent-collab"
 START_MARKER="<!-- BEGIN agent-collaboration -->"
 TESTED_CLAUDE_VERSION="2.1.78 (Claude Code)"
 TESTED_CODEX_VERSION="codex-cli 0.115.0"
+TESTED_GEMINI_VERSION="@google/gemini-cli 0.38.1"
 FAILURES=0
 WARNINGS=0
 PASSES=0
@@ -174,6 +176,40 @@ check_codex_cli() {
   fi
 }
 
+check_gemini_cli() {
+  local gemini_help actual_version
+
+  if ! command -v gemini >/dev/null 2>&1; then
+    block "gemini CLI is not installed or not on PATH"
+    return
+  fi
+
+  pass "gemini CLI found: $(command -v gemini)"
+  actual_version="$(gemini --version 2>/dev/null | head -1)"
+  pass "gemini version: $actual_version"
+  pass "last tested Gemini baseline: $TESTED_GEMINI_VERSION"
+
+  gemini_help="$(gemini --help 2>/dev/null || true)"
+
+  if [[ "$gemini_help" == *"-p, --prompt"* ]]; then
+    pass "gemini supports non-interactive prompt mode"
+  else
+    block "gemini help does not advertise -p/--prompt"
+  fi
+
+  if [[ "$gemini_help" == *"--approval-mode"* ]]; then
+    pass "gemini supports approval-mode selection"
+  else
+    warn "gemini help does not advertise --approval-mode; manual trigger guidance may need adjustment"
+  fi
+
+  if [[ "$gemini_help" == *"-o, --output-format"* ]]; then
+    pass "gemini supports output format selection"
+  else
+    warn "gemini help does not advertise -o/--output-format"
+  fi
+}
+
 check_global_command() {
   local agent_help
 
@@ -246,6 +282,8 @@ check_global_command
 check_timeout_backend
 check_claude_cli
 check_codex_cli
+check_target "Gemini" "$GEMINI_TARGET"
+check_gemini_cli
 
 echo
 echo "Summary: $PASSES PASS, $WARNINGS WARN, $FAILURES BLOCK"

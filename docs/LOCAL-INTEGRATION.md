@@ -13,6 +13,8 @@ A consuming repository should provide at least:
   Repo-local instructions for Claude Code.
 - `AGENTS.md`
   Repo-local instructions for Codex CLI.
+- `GEMINI.md`
+  Repo-local instructions for Gemini CLI.
 - `AGENT-COLLABORATION.md`
   The concrete workflow for this repo: paths, helper commands, ownership rules, and verification flow.
 
@@ -75,6 +77,15 @@ Should say:
 - what files or directories Codex should treat as the local source of truth
 - any repo-specific constraints for Codex
 
+### `GEMINI.md`
+
+Should say:
+
+- this repo follows the global protocol
+- where the local collaboration guide lives
+- what files or directories Gemini should treat as the local source of truth
+- any repo-specific constraints for Gemini
+
 ### `AGENT-COLLABORATION.md`
 
 Should define:
@@ -123,6 +134,7 @@ AGENT_COLLAB_DEFAULT_CHALLENGER=claude
 AGENT_COLLAB_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+AGENT_COLLAB_GEMINI_TIMEOUT_SECONDS=300
 AGENT_COLLAB_CLAUDE_EFFORT=low
 ```
 
@@ -140,6 +152,7 @@ Use this checklist when adding the local layer to a repo:
 
 - add `CLAUDE.md`
 - add `AGENTS.md`
+- add `GEMINI.md`
 - add `AGENT-COLLABORATION.md`
 - link local docs to the global protocol
 - choose plan and review artifacts

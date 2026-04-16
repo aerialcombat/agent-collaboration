@@ -1,6 +1,6 @@
 # Global Codex Collaboration Defaults
 
-This file provides global Codex CLI defaults for collaboration with Claude Code.
+This file provides global Codex CLI defaults for collaboration with Claude Code and Gemini CLI.
 
 Protocol reference:
 - `{{PROJECT_ROOT}}/docs/GLOBAL-PROTOCOL.md`
@@ -45,6 +45,13 @@ agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md --dry-
 ```
 
 If the repo has no local helper or runner setup, fall back to the repo-local docs or the global protocol reference for manual shell invocation patterns.
+
+To invoke Gemini as challenger:
+
+```bash
+agent-collab challenge --challenger gemini --scope AGENT-COLLABORATION.md
+agent-collab verify --challenger gemini --scope AGENT-COLLABORATION.md
+```
 
 ## Scope Of This File
 

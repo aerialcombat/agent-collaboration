@@ -19,6 +19,7 @@ CONFIG_DEFAULT_CHALLENGER=""
 CONFIG_TIMEOUT_SECONDS=""
 CONFIG_CLAUDE_TIMEOUT_SECONDS=""
 CONFIG_CODEX_TIMEOUT_SECONDS=""
+CONFIG_GEMINI_TIMEOUT_SECONDS=""
 CONFIG_CLAUDE_EFFORT=""
 
 REPO_ROOT=""
@@ -33,6 +34,7 @@ TIMEOUT_SECONDS="300"
 TIMEOUT_BACKEND=""
 TIMEOUT_COMMAND=""
 CLAUDE_EFFORT="low"
+CLAUDE_USE_READ_TOOL=0
 
 SCOPE_INPUTS=()
 CONTEXT_INPUTS=()
@@ -44,12 +46,12 @@ CONTEXT_DISPLAY=()
 usage() {
   cat <<'EOF'
 Usage:
-  agent-collab challenge --challenger claude|codex [options]
-  agent-collab verify --challenger claude|codex [options]
+  agent-collab challenge --challenger claude|codex|gemini [options]
+  agent-collab verify --challenger claude|codex|gemini [options]
   agent-collab help
 
 Options:
-  --challenger <claude|codex>  Agent to invoke for the review pass.
+  --challenger <claude|codex|gemini>  Agent to invoke for the review pass.
   --scope <path>               Scope plan or other primary task context. Repeatable.
   --context <path>             Additional changed-file or design context. Repeatable.
   --guide <path>               Override the repo-local collaboration guide path.
@@ -69,6 +71,7 @@ Repo-local config:
     AGENT_COLLAB_TIMEOUT_SECONDS=300
     AGENT_COLLAB_CLAUDE_TIMEOUT_SECONDS=300
     AGENT_COLLAB_CODEX_TIMEOUT_SECONDS=300
+    AGENT_COLLAB_GEMINI_TIMEOUT_SECONDS=300
     AGENT_COLLAB_CLAUDE_EFFORT=low
 EOF
 }
@@ -160,6 +163,9 @@ load_config() {
       AGENT_COLLAB_CODEX_TIMEOUT_SECONDS)
         CONFIG_CODEX_TIMEOUT_SECONDS="$value"
         ;;
+      AGENT_COLLAB_GEMINI_TIMEOUT_SECONDS)
+        CONFIG_GEMINI_TIMEOUT_SECONDS="$value"
+        ;;
       AGENT_COLLAB_CLAUDE_EFFORT)
         CONFIG_CLAUDE_EFFORT="$value"
         ;;
@@ -219,7 +225,7 @@ display_path() {
 
 validate_challenger() {
   case "$1" in
-    claude|codex) ;;
+    claude|codex|gemini) ;;
     *)
       err "unsupported challenger: $1"
       ;;
@@ -239,6 +245,85 @@ validate_timeout_seconds() {
   local value="$1"
 
   [[ "$value" =~ ^[0-9]+$ ]] || err "timeout must be a non-negative integer: $value"
+}
+
+path_already_selected() {
+  local absolute_path="$1"
+  local path
+
+  if [[ -n "$GUIDE_PATH" && "$absolute_path" == "$GUIDE_PATH" ]]; then
+    return 0
+  fi
+
+  if (( ${#SCOPE_PATHS[@]} > 0 )); then
+    for path in "${SCOPE_PATHS[@]}"; do
+      [[ "$path" == "$absolute_path" ]] && return 0
+    done
+  fi
+
+  if (( ${#CONTEXT_PATHS[@]} > 0 )); then
+    for path in "${CONTEXT_PATHS[@]}"; do
+      [[ "$path" == "$absolute_path" ]] && return 0
+    done
+  fi
+
+  return 1
+}
+
+prompt_needs_read_tool() {
+  local inline_bytes_used=0
+  local remaining_budget file_size include_bytes path
+
+  if [[ -n "$GUIDE_PATH" ]]; then
+    remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+    file_size="$(wc -c < "$GUIDE_PATH" | tr -d '[:space:]')"
+    if (( remaining_budget <= 0 )); then
+      return 0
+    fi
+    include_bytes=$INLINE_FILE_LIMIT_BYTES
+    (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+    (( include_bytes > file_size )) && include_bytes=$file_size
+    if (( file_size > include_bytes )); then
+      return 0
+    fi
+    inline_bytes_used=$((inline_bytes_used + include_bytes))
+  fi
+
+  if (( ${#SCOPE_PATHS[@]} > 0 )); then
+    for path in "${SCOPE_PATHS[@]}"; do
+      remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+      file_size="$(wc -c < "$path" | tr -d '[:space:]')"
+      if (( remaining_budget <= 0 )); then
+        return 0
+      fi
+      include_bytes=$INLINE_FILE_LIMIT_BYTES
+      (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+      (( include_bytes > file_size )) && include_bytes=$file_size
+      if (( file_size > include_bytes )); then
+        return 0
+      fi
+      inline_bytes_used=$((inline_bytes_used + include_bytes))
+    done
+  fi
+
+  if (( ${#CONTEXT_PATHS[@]} > 0 )); then
+    for path in "${CONTEXT_PATHS[@]}"; do
+      remaining_budget=$((INLINE_TOTAL_LIMIT_BYTES - inline_bytes_used))
+      file_size="$(wc -c < "$path" | tr -d '[:space:]')"
+      if (( remaining_budget <= 0 )); then
+        return 0
+      fi
+      include_bytes=$INLINE_FILE_LIMIT_BYTES
+      (( include_bytes > remaining_budget )) && include_bytes=$remaining_budget
+      (( include_bytes > file_size )) && include_bytes=$file_size
+      if (( file_size > include_bytes )); then
+        return 0
+      fi
+      inline_bytes_used=$((inline_bytes_used + include_bytes))
+    done
+  fi
+
+  return 1
 }
 
 resolve_timeout_backend() {
@@ -427,6 +512,9 @@ build_prompt() {
     printf '\n'
     printf '%s\n' "Review the provided file contents directly."
     printf '%s\n' "Do not assume any additional repo context beyond the files included below."
+    if (( CLAUDE_USE_READ_TOOL )); then
+      printf '%s\n' "Some files below are truncated or omitted. Use the Read tool only if you need missing content."
+    fi
   fi
 
   if [[ -n "$GUIDE_PATH" ]]; then
@@ -512,12 +600,20 @@ build_prompt() {
 
 run_claude() {
   local output_file="$1"
+  local claude_args=()
   command -v claude >/dev/null 2>&1 || err "claude CLI is not installed or not on PATH"
+
+  claude_args=(claude -p --permission-mode plan --output-format text)
+  if (( CLAUDE_USE_READ_TOOL )); then
+    claude_args+=(--tools "Read")
+  fi
+  claude_args+=(--effort "$CLAUDE_EFFORT")
+
   (
     cd "$REPO_ROOT"
-    # Inline prompt context plus read-only tool access keeps the review bounded
-    # while still allowing Claude to fetch file tails if an inline block is truncated.
-    printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" claude -p --permission-mode plan --output-format text --tools "Read" --effort "$CLAUDE_EFFORT" > "$output_file"
+    # Only grant file reads when the inline prompt budget forced truncation or
+    # omission. Fully inlined reviews stay faster and more tightly bounded.
+    printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" "${claude_args[@]}" > "$output_file"
   )
 }
 
@@ -527,6 +623,15 @@ run_codex() {
   (
     cd "$REPO_ROOT"
     printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" codex exec -C "$REPO_ROOT" -s read-only -o "$output_file" -
+  )
+}
+
+run_gemini() {
+  local output_file="$1"
+  command -v gemini >/dev/null 2>&1 || err "gemini CLI is not installed or not on PATH"
+  (
+    cd "$REPO_ROOT"
+    printf '%s' "$PROMPT" | run_with_timeout "$TIMEOUT_SECONDS" gemini -p "" --approval-mode plan -o text > "$output_file"
   )
 }
 
@@ -678,6 +783,8 @@ elif [[ "$CHALLENGER" == "claude" && -n "$CONFIG_CLAUDE_TIMEOUT_SECONDS" ]]; the
   TIMEOUT_SECONDS="$CONFIG_CLAUDE_TIMEOUT_SECONDS"
 elif [[ "$CHALLENGER" == "codex" && -n "$CONFIG_CODEX_TIMEOUT_SECONDS" ]]; then
   TIMEOUT_SECONDS="$CONFIG_CODEX_TIMEOUT_SECONDS"
+elif [[ "$CHALLENGER" == "gemini" && -n "$CONFIG_GEMINI_TIMEOUT_SECONDS" ]]; then
+  TIMEOUT_SECONDS="$CONFIG_GEMINI_TIMEOUT_SECONDS"
 elif [[ -n "$CONFIG_TIMEOUT_SECONDS" ]]; then
   TIMEOUT_SECONDS="$CONFIG_TIMEOUT_SECONDS"
 fi
@@ -694,6 +801,9 @@ fi
 if (( ${#SCOPE_INPUTS[@]} > 0 )); then
   for path in "${SCOPE_INPUTS[@]}"; do
     absolute_path="$(absolute_existing_path "$path")"
+    if path_already_selected "$absolute_path"; then
+      continue
+    fi
     SCOPE_PATHS+=("$absolute_path")
     SCOPE_DISPLAY+=("$(display_path "$absolute_path")")
   done
@@ -702,12 +812,18 @@ fi
 if (( ${#CONTEXT_INPUTS[@]} > 0 )); then
   for path in "${CONTEXT_INPUTS[@]}"; do
     absolute_path="$(absolute_existing_path "$path")"
+    if path_already_selected "$absolute_path"; then
+      continue
+    fi
     CONTEXT_PATHS+=("$absolute_path")
     CONTEXT_DISPLAY+=("$(display_path "$absolute_path")")
   done
 fi
 
 prepare_review_file
+if [[ "$CHALLENGER" == "claude" ]] && prompt_needs_read_tool; then
+  CLAUDE_USE_READ_TOOL=1
+fi
 PROMPT="$(build_prompt)"
 
 if (( DRY_RUN )); then
