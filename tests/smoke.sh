@@ -516,6 +516,32 @@ PY
     fail "ambiguous auto-infer send was accepted"
   fi
 
+  echo "-- peer-inbox: v1.7 register sweeps stale markers for same label --"
+  local sw_db="$TMP_ROOT/peer-inbox-sw.db"
+  local sw_cwd="$TMP_ROOT/peer-inbox-sw"
+  mkdir -p "$sw_cwd"
+  local sw_real
+  sw_real="$(cd "$sw_cwd" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$sw_db" AGENT_COLLAB_SESSION_KEY=swA \
+    "$agent_collab" session register --cwd "$sw_real" --label joseph --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$sw_db" AGENT_COLLAB_SESSION_KEY=swB \
+    "$agent_collab" session register --cwd "$sw_real" --label joseph --agent claude --force >/dev/null
+  local sw_count
+  sw_count=$(ls "$sw_real/.agent-collab/sessions/" | wc -l | tr -d ' ')
+  [[ "$sw_count" == "1" ]] || fail "expected 1 marker after re-register, got $sw_count"
+  # resolve_self single-marker fallback must succeed now (not hit multi-marker error).
+  AGENT_COLLAB_INBOX_DB="$sw_db" AGENT_COLLAB_SESSION_KEY=swB \
+    "$agent_collab" peer list --cwd "$sw_real" --json >/dev/null \
+    || fail "peer list failed after re-register; sweep didn't clean stale marker"
+
+  echo "-- peer-inbox: v1.7 session close via hook-log fallback --"
+  # No --label, no env var, but hook has logged the session_id — close should resolve.
+  AGENT_COLLAB_INBOX_DB="$sw_db" \
+    "$agent_collab" hook log-session --cwd "$sw_real" --session-id swB >/dev/null
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" AGENT_COLLAB_INBOX_DB="$sw_db" \
+    "$agent_collab" session close --cwd "$sw_real" >/dev/null \
+    || fail "session close should fall back to hook-log when no label and no env var"
+
   echo "-- peer-inbox: v1.7 codex/gemini auto session-key (no env var needed) --"
   local ak_db="$TMP_ROOT/peer-inbox-ak.db"
   local ak_cwd="$TMP_ROOT/peer-inbox-ak"

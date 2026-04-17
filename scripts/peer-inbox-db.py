@@ -674,6 +674,34 @@ def delete_marker(cwd: Path, session_key: str) -> None:
         marker.unlink()
 
 
+def sweep_stale_markers_for_label(cwd: Path, label: str, keep_session_key: str) -> None:
+    """Remove any other markers in this cwd that claim the same label.
+
+    Prevents the "multiple sessions registered ... labels: ['joseph']" error
+    that happens when a session re-registers with a new session key — the
+    old marker file (keyed on the old key hash) would otherwise linger and
+    break resolve_self's single-marker convenience path.
+    """
+    sess_dir = sessions_dir(cwd)
+    if not sess_dir.is_dir():
+        return
+    keep_filename = f"{session_key_hash(keep_session_key)}.json"
+    for marker in sess_dir.iterdir():
+        if not (marker.is_file() and marker.suffix == ".json"):
+            continue
+        if marker.name == keep_filename:
+            continue
+        try:
+            data = json.loads(marker.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict) and data.get("label") == label:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+
+
 def resolve_self(as_label: Optional[str], cwd: Path) -> tuple[Path, str]:
     """Return (canonical_cwd, label) for the calling session.
 
@@ -913,6 +941,7 @@ def cmd_session_register(args: argparse.Namespace) -> int:
         conn.close()
 
     write_marker(cwd, args.label, session_key)
+    sweep_stale_markers_for_label(cwd, args.label, session_key)
     channel_note = " [channel: paired]" if channel_socket else " [channel: none]"
     pair_note = f" [pair_key={pair_key}]" if pair_key else ""
     print(
@@ -925,6 +954,28 @@ def cmd_session_register(args: argparse.Namespace) -> int:
 def cmd_session_close(args: argparse.Namespace) -> int:
     cwd_raw = resolve_cwd(args.cwd)
     session_key = args.session_key or discover_session_key()
+    if session_key is None:
+        # Same hook-log fallback register uses: Claude's UserPromptSubmit hook
+        # records session_ids seen in this cwd. Pick the most recent one that
+        # is currently registered (for close we want a live row, not an unused
+        # id).
+        seen = recent_seen_sessions(cwd_raw)
+        if seen:
+            conn = open_db()
+            try:
+                active = {
+                    r["session_key"]
+                    for r in conn.execute(
+                        "SELECT session_key FROM sessions WHERE cwd = ? AND session_key IS NOT NULL",
+                        (str(cwd_raw),),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            for sid in seen:
+                if sid in active:
+                    session_key = sid
+                    break
 
     # Resolve which session to close. Precedence: explicit --label + --cwd;
     # else discover via walk-parents using session_key; else error.
