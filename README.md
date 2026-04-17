@@ -22,6 +22,19 @@ Two delivery modes:
   live context without waiting for a user prompt. Conversations
   self-sustain between two channel-enabled sessions.
 
+Pairing model (v1.7+):
+- **Cwd-scoped** (default) — two sessions launched in the same working
+  directory find each other automatically.
+- **Pair-key** — `agent-collab session register --new-pair` mints a
+  sharable slug (`swift-canyon-8f3a`); the other session joins with
+  `--pair-key KEY` from any cwd on the same machine.
+
+Claude Code integration (v1.7+):
+- `/agent-collab` slash command walks the user through register →
+  new-or-join → pair-key prompt.
+- `/peer send|check|list|end` wraps the CLI with short verbs.
+- `install agent-collab` skill clones + installs on request.
+
 Observability surfaces:
 - `agent-collab peer watch` — terminal live-tail
 - `agent-collab peer web` — live browser dashboard
@@ -34,7 +47,7 @@ channels are an additive push signal.
 Docs:
 - [Peer Inbox Guide](docs/PEER-INBOX-GUIDE.md) — install, daily use, troubleshooting
 - [Peer Inbox Architecture](docs/PEER-INBOX-ARCHITECTURE.md) — system design, schema, delivery paths
-- [CHANGELOG](CHANGELOG.md) — v1.0 through v1.5
+- [CHANGELOG](CHANGELOG.md) — v1.0 through v1.7
 
 ## What This Project Contains
 

@@ -399,7 +399,10 @@ def _ppid_of(pid: int) -> int:
             stderr=subprocess.DEVNULL,
         ).strip()
         return int(out) if out else 0
-    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        # OSError covers FileNotFoundError and sandbox PermissionError (e.g.
+        # codex exec's Seatbelt blocks spawning `ps`). Channel pairing is
+        # best-effort; never let it crash register.
         return 0
 
 
@@ -800,6 +803,25 @@ def cmd_session_register(args: argparse.Namespace) -> int:
                 if sid not in already:
                     session_key = sid
                     break
+    if session_key is None and args.agent in {"codex", "gemini"}:
+        # Codex and Gemini do not export a session id to the shell tool's
+        # subprocess env, and they have no UserPromptSubmit hook. Reuse the
+        # session_key from the existing (cwd, label) row if any — makes
+        # re-register idempotent — else mint a fresh UUID so first register
+        # succeeds.
+        import uuid as _uuid
+        conn = open_db()
+        try:
+            row = conn.execute(
+                "SELECT session_key FROM sessions WHERE cwd = ? AND label = ?",
+                (str(cwd), args.label),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is not None and row["session_key"]:
+            session_key = row["session_key"]
+        else:
+            session_key = f"auto-{args.agent}-{_uuid.uuid4()}"
     if session_key is None:
         err(
             "no session key available. This session's runtime did not export "

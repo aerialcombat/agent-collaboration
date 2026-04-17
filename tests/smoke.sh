@@ -516,6 +516,29 @@ PY
     fail "ambiguous auto-infer send was accepted"
   fi
 
+  echo "-- peer-inbox: v1.7 codex/gemini auto session-key (no env var needed) --"
+  local ak_db="$TMP_ROOT/peer-inbox-ak.db"
+  local ak_cwd="$TMP_ROOT/peer-inbox-ak"
+  mkdir -p "$ak_cwd"
+  local ak_real
+  ak_real="$(cd "$ak_cwd" && pwd -P)"
+  # Run in a clean env — no session key at all. Codex path must auto-mint.
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" AGENT_COLLAB_INBOX_DB="$ak_db" \
+    "$agent_collab" session register --cwd "$ak_real" --label ca --agent codex >/dev/null \
+    || fail "codex register without env var failed (auto-key shim broken)"
+  # Re-register must be idempotent (same session_key) — else user sees spurious collisions.
+  local ak_first ak_second
+  ak_first=$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" AGENT_COLLAB_INBOX_DB="$ak_db" \
+    "$agent_collab" session list --json | python3 -c "import json,sys; print(sys.stdin.read())")
+  env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" AGENT_COLLAB_INBOX_DB="$ak_db" \
+    "$agent_collab" session register --cwd "$ak_real" --label ca --agent codex >/dev/null \
+    || fail "codex re-register failed"
+  # Claude without any env var must still error (no hook logs in this test).
+  if env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" AGENT_COLLAB_INBOX_DB="$ak_db" \
+       "$agent_collab" session register --cwd "$ak_real" --label cb --agent claude >/dev/null 2>&1; then
+    fail "claude register without session key should error (auto-key is codex/gemini only)"
+  fi
+
   echo "-- peer-inbox: v1.7 cross-runtime env vars (CLAUDE/CODEX/GEMINI_SESSION_ID) --"
   # Each runtime exports a different env var. The helper must pick any of them.
   # Here we simulate: a "claude" session reads CLAUDE_SESSION_ID; a "codex"
