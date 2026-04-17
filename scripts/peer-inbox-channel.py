@@ -62,10 +62,19 @@ MAX_BODY_BYTES = 8 * 1024
 REPLY_TOOL = {
     "name": "peer_inbox_reply",
     "description": (
-        "Send a message to peer sessions over the peer-inbox channel. "
-        "Use to reply to an incoming <channel source=\"peer-inbox\"> "
-        "message, or to initiate a turn. Omit `to` to broadcast to every "
-        "live peer in the current room; include `to` to direct to one peer."
+        "Send a message over the peer-inbox channel. Three modes, chosen "
+        "by the `to` argument:\n"
+        "  • omit `to`            → broadcast to every live peer in the room\n"
+        "  • `to: \"alice\"`       → 1:1 direct message to one peer\n"
+        "  • `to: [\"a\", \"b\"]`  → multicast to a named subset\n"
+        "\n"
+        "All three count as one room turn against the shared budget. "
+        "Incoming <channel> notifications carry meta.room_size and "
+        "meta.members so you can see the full roster before choosing. "
+        "Pick the mode that matches your intent — group question, side-"
+        "bar, or private handoff. Don't default to 1:1 just because one "
+        "peer spoke last; don't default to broadcast just because you "
+        "can."
     ),
     "inputSchema": {
         "type": "object",
@@ -75,10 +84,14 @@ REPLY_TOOL = {
                 "description": "Message text. UTF-8, max 8 KB.",
             },
             "to": {
-                "type": "string",
                 "description": (
-                    "Recipient peer label. Omit for room broadcast."
+                    "Recipient(s). Omit to broadcast, pass a string for "
+                    "1:1, or pass an array of labels for multicast."
                 ),
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                ],
             },
         },
         "required": ["body"],
@@ -135,10 +148,19 @@ def handle_mcp(req: dict) -> None:
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
                     "Messages from other sessions arrive as "
-                    "<channel source=\"peer-inbox\" from=\"...\">body"
-                    "</channel>. Respond by calling the peer_inbox_reply "
-                    "tool (preferred) or the Bash tool with "
-                    "`agent-collab peer send --to <sender> --message ...`."
+                    "<channel source=\"peer-inbox\" from=\"...\" "
+                    "meta.room_size=\"N\" meta.members=\"a,b,c\">body"
+                    "</channel>.\n\n"
+                    "Reply with the peer_inbox_reply tool. Three modes:\n"
+                    "  • omit `to`            → broadcast to the whole room\n"
+                    "  • `to: \"alice\"`       → 1:1 to one peer\n"
+                    "  • `to: [\"a\", \"b\"]`  → multicast to a subset\n"
+                    "Pick the mode that matches your intent; meta.members "
+                    "gives you the full roster.\n\n"
+                    "Shell fallback: `agent-collab peer broadcast "
+                    "--message ...` (all), `peer broadcast --to a --to b "
+                    "--message ...` (subset), `peer send --to a "
+                    "--message ...` (1:1)."
                 ),
             },
         )
@@ -184,6 +206,43 @@ def _agent_collab_bin() -> str:
     return "agent-collab"
 
 
+def _room_roster() -> tuple[str | None, list[str]] | None:
+    """Look up the receiver's pair_key and full member roster (self first).
+
+    Returns (pair_key, members) where members is sorted, self-inclusive.
+    pair_key is None for cwd-only rooms; members then collapses to the
+    sessions in the receiver's cwd. Returns None if the channel isn't
+    yet bound to a session row.
+    """
+    resolved = _resolve_self_from_socket()
+    if resolved is None:
+        return None
+    self_cwd, self_label, self_pair_key = resolved
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            if self_pair_key:
+                rows = conn.execute(
+                    "SELECT label FROM sessions WHERE pair_key = ? ORDER BY label",
+                    (self_pair_key,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT label FROM sessions WHERE cwd = ? ORDER BY label",
+                    (self_cwd,),
+                ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        stderr(f"[peer-inbox-channel] sqlite error in roster: {e}")
+        return (self_pair_key, [self_label])
+    members = [r["label"] for r in rows]
+    if self_label not in members:
+        members.append(self_label)
+    return (self_pair_key, sorted(members))
+
+
 def _resolve_self_from_socket() -> tuple[str, str, str | None] | None:
     """Look up (cwd, label, pair_key) for the session bound to this channel."""
     if not _socket_path or not DB_PATH.exists():
@@ -208,11 +267,16 @@ def _resolve_self_from_socket() -> tuple[str, str, str | None] | None:
 
 
 def _call_peer(
-    self_cwd: str, self_label: str, subcmd: str, body: str, to: str | None = None
+    self_cwd: str,
+    self_label: str,
+    subcmd: str,
+    body: str,
+    to: str | list[str] | None = None,
 ) -> tuple[bool, str]:
     """Invoke `agent-collab peer <subcmd>` as a subprocess. Returns (ok, message).
 
-    `subcmd` is "send" (requires `to`) or "broadcast" (ignores `to`).
+    `subcmd` is "send" (requires a single `to`) or "broadcast" (optional
+    list of `--to` for multicast; no `--to` = room-wide).
     """
     cmd = [
         _agent_collab_bin(),
@@ -221,9 +285,12 @@ def _call_peer(
         "--cwd", self_cwd,
     ]
     if subcmd == "send":
-        if to is None:
-            return False, "peer send requires `to`"
+        if not isinstance(to, str) or not to:
+            return False, "peer send requires a single `to` label"
         cmd.extend(["--to", to])
+    elif subcmd == "broadcast" and isinstance(to, list):
+        for t in to:
+            cmd.extend(["--to", t])
     cmd.append("--message-stdin")
     try:
         res = subprocess.run(
@@ -266,8 +333,25 @@ def handle_tools_call(req_id, params: dict) -> None:
     if body_bytes > MAX_BODY_BYTES:
         _tool_error(req_id, f"error: body too large ({body_bytes} > {MAX_BODY_BYTES} bytes)")
         return
-    if to is not None and (not isinstance(to, str) or not to):
-        _tool_error(req_id, "error: `to` must be a non-empty string when provided")
+
+    # Normalize `to`: None (broadcast), str (1:1), or list[str] (multicast).
+    to_list: list[str] | None = None
+    if to is None:
+        pass
+    elif isinstance(to, str):
+        if not to:
+            _tool_error(req_id, "error: `to` string must be non-empty")
+            return
+    elif isinstance(to, list):
+        if not to or not all(isinstance(t, str) and t for t in to):
+            _tool_error(
+                req_id,
+                "error: `to` array must be a non-empty list of non-empty strings",
+            )
+            return
+        to_list = to
+    else:
+        _tool_error(req_id, "error: `to` must be a string, an array of strings, or omitted")
         return
 
     resolved = _resolve_self_from_socket()
@@ -280,8 +364,10 @@ def handle_tools_call(req_id, params: dict) -> None:
         return
     self_cwd, self_label, self_pair_key = resolved
 
-    if to:
+    if isinstance(to, str):
         ok, msg = _call_peer(self_cwd, self_label, "send", body, to=to)
+    elif to_list is not None:
+        ok, msg = _call_peer(self_cwd, self_label, "broadcast", body, to=to_list)
     else:
         ok, msg = _call_peer(self_cwd, self_label, "broadcast", body)
     reply(req_id, {
@@ -395,6 +481,19 @@ def handle_socket_client(conn: socket.socket) -> None:
         key = str(k)
         if all(c.isalnum() or c == "_" for c in key):
             meta[key] = str(v)
+
+    # Enrich with room context so the receiving agent knows whether this
+    # is a 1:1 pair or a group chat, and can see the full roster before
+    # choosing reply/broadcast/multicast. Resolution looks up the
+    # receiver's own session row via channel_socket; if registration is
+    # still pending we just skip enrichment.
+    roster = _room_roster()
+    if roster is not None:
+        pair_key, members = roster
+        if pair_key:
+            meta.setdefault("pair_key", pair_key)
+        meta.setdefault("room_size", str(len(members)))
+        meta.setdefault("members", ",".join(members))
 
     if not content:
         write_http_response(conn, 400, {"error": "body.body (or body.content) required"})

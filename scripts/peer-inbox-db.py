@@ -1279,6 +1279,17 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
     if len(body_bytes) == 0:
         err("empty message rejected", EXIT_VALIDATION)
 
+    # Optional multicast filter: --to may be passed multiple times to
+    # restrict delivery to a named subset of the room while still
+    # counting as one room turn.
+    cohort: Optional[set[str]] = None
+    if getattr(args, "to", None):
+        cohort = {t for t in args.to if t}
+        for t in cohort:
+            validate_label(t)
+        if self_label in cohort:
+            err(f"cannot multicast to self: {self_label!r}", EXIT_VALIDATION)
+
     # Resolve recipients and filter out stale sessions.
     conn = open_db()
     try:
@@ -1303,6 +1314,15 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
         r for r in rows
         if seconds_since(r["last_seen_at"]) <= STALE_THRESHOLD_SECS
     ]
+    if cohort is not None:
+        present = {r["label"] for r in live}
+        missing = cohort - present
+        if missing:
+            err(
+                f"unknown or stale peer(s) in multicast: {sorted(missing)}",
+                EXIT_NOT_FOUND,
+            )
+        live = [r for r in live if r["label"] in cohort]
     if not live:
         scope = f"pair_key={self_pair_key}" if self_pair_key else f"cwd={self_cwd}"
         err(f"no live peers in {scope}", EXIT_NOT_FOUND)
@@ -2863,6 +2883,11 @@ def build_parser() -> argparse.ArgumentParser:
     pb = sub.add_parser("peer-broadcast")
     pb.add_argument("--cwd")
     pb.add_argument("--as", dest="as_label")
+    pb.add_argument(
+        "--to", action="append", default=[],
+        help="restrict delivery to a subset (multicast); repeat per label. "
+             "omit for room-wide broadcast",
+    )
     pb.add_argument("--message")
     pb.add_argument("--message-file")
     pb.add_argument("--message-stdin", action="store_true")

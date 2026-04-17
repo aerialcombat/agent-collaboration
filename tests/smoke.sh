@@ -739,6 +739,59 @@ assert 'one' in bodies and 'two' in bodies, bodies
   kill $rw_pid $rw_cwd_pid 2>/dev/null || true
   wait $rw_pid $rw_cwd_pid 2>/dev/null || true
 
+  echo "-- peer-inbox: v2.0 peer broadcast --to multicast (subset) --"
+  local mc_db="$TMP_ROOT/peer-inbox-mc.db"
+  local mc_a="$TMP_ROOT/peer-inbox-mc-a"
+  local mc_b="$TMP_ROOT/peer-inbox-mc-b"
+  local mc_c="$TMP_ROOT/peer-inbox-mc-c"
+  local mc_d="$TMP_ROOT/peer-inbox-mc-d"
+  mkdir -p "$mc_a" "$mc_b" "$mc_c" "$mc_d"
+  local mc_a_real mc_b_real mc_c_real mc_d_real
+  mc_a_real="$(cd "$mc_a" && pwd -P)"
+  mc_b_real="$(cd "$mc_b" && pwd -P)"
+  mc_c_real="$(cd "$mc_c" && pwd -P)"
+  mc_d_real="$(cd "$mc_d" && pwd -P)"
+  local mc_out mc_key
+  mc_out=$(AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcA \
+    "$agent_collab" session register --cwd "$mc_a_real" --label alpha --agent claude --new-pair)
+  mc_key=$(printf '%s\n' "$mc_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcB \
+    "$agent_collab" session register --cwd "$mc_b_real" --label beta --agent claude --pair-key "$mc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcC \
+    "$agent_collab" session register --cwd "$mc_c_real" --label gamma --agent claude --pair-key "$mc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcD \
+    "$agent_collab" session register --cwd "$mc_d_real" --label delta --agent claude --pair-key "$mc_key" >/dev/null
+
+  # Multicast to beta + gamma only; delta must NOT receive.
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcA \
+    "$agent_collab" peer broadcast --cwd "$mc_a_real" --as alpha \
+      --to beta --to gamma --message "hey subset" \
+    | grep -q "broadcast to 2 peer(s)" || fail "multicast did not report 2 recipients"
+
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcB \
+    "$agent_collab" peer receive --cwd "$mc_b_real" --as beta --format plain --mark-read \
+    | grep -q "hey subset" || fail "multicast did not reach beta"
+  AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcC \
+    "$agent_collab" peer receive --cwd "$mc_c_real" --as gamma --format plain --mark-read \
+    | grep -q "hey subset" || fail "multicast did not reach gamma"
+  if AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcD \
+       "$agent_collab" peer receive --cwd "$mc_d_real" --as delta --format plain --mark-read \
+       | grep -q "hey subset"; then
+    fail "multicast leaked to delta (should have been excluded)"
+  fi
+
+  # Multicast counts as ONE room turn (not 2).
+  local mc_turns
+  mc_turns=$(sqlite3 "$mc_db" "SELECT turn_count FROM peer_rooms WHERE room_key='pk:$mc_key';")
+  [[ "$mc_turns" == "1" ]] || fail "multicast should bump room by 1 turn, got $mc_turns"
+
+  # Unknown label in multicast must error cleanly.
+  if AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcA \
+       "$agent_collab" peer broadcast --cwd "$mc_a_real" --as alpha \
+         --to beta --to nonexistent --message "oops" >/dev/null 2>&1; then
+    fail "multicast to unknown label was accepted"
+  fi
+
   echo "-- peer-inbox: v2.0 room-level turn cap blocks every sender --"
   local rc_db="$TMP_ROOT/peer-inbox-rc.db"
   local rc_a="$TMP_ROOT/peer-inbox-rc-a"
