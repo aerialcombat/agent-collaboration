@@ -343,6 +343,20 @@ def migrate_sessions_pair_key(conn: sqlite3.Connection) -> None:
     )
 
 
+def migrate_inbox_room_key(conn: sqlite3.Connection) -> None:
+    """Stamp each inbox row with its room_key so room views can filter
+    by room identity, not just by (sender_label, receiver_label) — which
+    bleeds in unrelated 1:1 history when labels get reused across rooms.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(inbox)")}
+    if "room_key" not in cols:
+        conn.execute("ALTER TABLE inbox ADD COLUMN room_key TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inbox_room_key "
+        "ON inbox(room_key) WHERE room_key IS NOT NULL"
+    )
+
+
 def migrate_peer_rooms(conn: sqlite3.Connection) -> None:
     """Create peer_rooms table for room-level turn counting + termination.
 
@@ -382,6 +396,7 @@ def open_db() -> sqlite3.Connection:
     migrate_sessions_session_key(conn)
     migrate_sessions_channel_socket(conn)
     migrate_sessions_pair_key(conn)
+    migrate_inbox_room_key(conn)
     migrate_peer_rooms(conn)
     return conn
 
@@ -1211,10 +1226,10 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         conn.execute(
             """
             INSERT INTO inbox
-              (to_cwd, to_label, from_cwd, from_label, body, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (str(to_cwd), args.to, str(self_cwd), self_label, body, now),
+            (str(to_cwd), args.to, str(self_cwd), self_label, body, now, room_key),
         )
         _bump_room(conn, room_key, self_pair_key)
         if terminates:
@@ -1373,14 +1388,14 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
                     EXIT_VALIDATION,
                 )
 
-        for r, _ in recipients:
+        for r, room_key in recipients:
             conn.execute(
                 """
                 INSERT INTO inbox
-                  (to_cwd, to_label, from_cwd, from_label, body, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (r["cwd"], r["label"], str(self_cwd), self_label, body, now),
+                (r["cwd"], r["label"], str(self_cwd), self_label, body, now, room_key),
             )
 
         # Bump each distinct room exactly once. In pair_key mode that's a
@@ -1812,18 +1827,18 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             member_labels = sorted({lbl for (_, lbl) in pair_members})
             if not member_labels:
                 return []
-            q_marks = ",".join("?" for _ in member_labels)
+            room_key_value = f"pk:{pair_key}"
             stats = c.execute(
-                f"""
+                """
                 SELECT
                   MAX(id)         AS last_id,
                   MAX(created_at) AS last_at,
                   COUNT(*)        AS total,
                   SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread
                 FROM inbox
-                WHERE from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                WHERE room_key = ?
                 """,
-                member_labels + member_labels,
+                (room_key_value,),
             ).fetchone()
 
             members: list[dict] = []
@@ -1887,33 +1902,28 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         c = open_db()
         try:
             if pair_key:
-                member_labels = tuple({lbl for (_, lbl) in pair_members})
-                if not member_labels:
-                    return []
-                q_marks = ",".join("?" for _ in member_labels)
+                room_key_value = f"pk:{pair_key}"
                 if pair is not None:
                     pa, pb = pair
                     return c.execute(
-                        f"""
+                        """
                         SELECT id, from_label, to_label, body, created_at, read_at
                         FROM inbox
-                        WHERE id > ?
-                          AND from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                        WHERE id > ? AND room_key = ?
                           AND ((from_label = ? AND to_label = ?)
                             OR (from_label = ? AND to_label = ?))
                         ORDER BY id ASC
                         """,
-                        (after,) + member_labels + member_labels + (pa, pb, pb, pa),
+                        (after, room_key_value, pa, pb, pb, pa),
                     ).fetchall()
                 return c.execute(
-                    f"""
+                    """
                     SELECT id, from_label, to_label, body, created_at, read_at
                     FROM inbox
-                    WHERE id > ?
-                      AND from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                    WHERE id > ? AND room_key = ?
                     ORDER BY id ASC
                     """,
-                    (after,) + member_labels + member_labels,
+                    (after, room_key_value),
                 ).fetchall()
             if pair is not None:
                 pa, pb = pair

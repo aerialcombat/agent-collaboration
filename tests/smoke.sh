@@ -739,6 +739,74 @@ assert 'one' in bodies and 'two' in bodies, bodies
   kill $rw_pid $rw_cwd_pid 2>/dev/null || true
   wait $rw_pid $rw_cwd_pid 2>/dev/null || true
 
+  echo "-- peer-inbox: v2.0 room_key scoping — pre-room history doesn't bleed --"
+  local bl_db="$TMP_ROOT/peer-inbox-bleed.db"
+  local bl_a="$TMP_ROOT/peer-inbox-bl-a"
+  local bl_b="$TMP_ROOT/peer-inbox-bl-b"
+  local bl_c="$TMP_ROOT/peer-inbox-bl-c"
+  mkdir -p "$bl_a" "$bl_b" "$bl_c"
+  local bl_a_real bl_b_real bl_c_real
+  bl_a_real="$(cd "$bl_a" && pwd -P)"
+  bl_b_real="$(cd "$bl_b" && pwd -P)"
+  bl_c_real="$(cd "$bl_c" && pwd -P)"
+
+  # Phase 1: alice and bob chat 1:1 in a simple cwd, no pair_key.
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl1 \
+    "$agent_collab" session register --cwd "$bl_a_real" --label alice --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl2 \
+    "$agent_collab" session register --cwd "$bl_a_real" --label bob --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl1 \
+    "$agent_collab" peer send --cwd "$bl_a_real" --as alice --to bob --message "private history one" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl2 \
+    "$agent_collab" peer send --cwd "$bl_a_real" --as bob --to alice --message "private history two" >/dev/null
+
+  # Phase 2: close the cwd pair, drop the sessions, then stand up a new
+  # 3-person pair_key room that happens to reuse the same labels.
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl1 \
+    "$agent_collab" session close --cwd "$bl_a_real" --label alice >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl2 \
+    "$agent_collab" session close --cwd "$bl_a_real" --label bob >/dev/null
+
+  local bl_out bl_key
+  bl_out=$(AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl3 \
+    "$agent_collab" session register --cwd "$bl_a_real" --label alice --agent claude --new-pair)
+  bl_key=$(printf '%s\n' "$bl_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl4 \
+    "$agent_collab" session register --cwd "$bl_b_real" --label bob --agent claude --pair-key "$bl_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl5 \
+    "$agent_collab" session register --cwd "$bl_c_real" --label carol --agent claude --pair-key "$bl_key" >/dev/null
+
+  AGENT_COLLAB_INBOX_DB="$bl_db" AGENT_COLLAB_SESSION_KEY=bl3 \
+    "$agent_collab" peer broadcast --cwd "$bl_a_real" --as alice --message "room hello" >/dev/null
+
+  # Start the viewer scoped to the new room.
+  AGENT_COLLAB_INBOX_DB="$bl_db" \
+    "$agent_collab" peer web --cwd "$bl_a_real" --pair-key "$bl_key" --port 8801 \
+    >"$TMP_ROOT/peer-inbox-bleed.log" 2>&1 &
+  local bl_pid=$!
+  sleep 0.4
+
+  curl -s "http://127.0.0.1:8801/rooms.json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+r = d['rooms'][0]
+# Only the new room_hello broadcast (→ bob, → carol = 2 rows). Old
+# 1:1 alice<->bob history must NOT show up.
+assert r['total'] == 2, r
+" || { kill $bl_pid 2>/dev/null || true; fail "old history bled into /rooms.json total"; }
+
+  curl -s "http://127.0.0.1:8801/messages.json?pair_key=$bl_key&after=0" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+bodies = [m['body'] for m in d['messages']]
+assert 'room hello' in bodies, bodies
+assert 'private history one' not in bodies, bodies
+assert 'private history two' not in bodies, bodies
+" || { kill $bl_pid 2>/dev/null || true; fail "old 1:1 history leaked into room stream"; }
+
+  kill $bl_pid 2>/dev/null || true
+  wait $bl_pid 2>/dev/null || true
+
   echo "-- peer-inbox: v2.0 peer broadcast --to multicast (subset) --"
   local mc_db="$TMP_ROOT/peer-inbox-mc.db"
   local mc_a="$TMP_ROOT/peer-inbox-mc-a"
