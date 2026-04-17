@@ -25,6 +25,20 @@ agent-collab peer send --to "<to>" --message "<message>"
 
 If the user omitted `<to>` and there is exactly one peer in the current pair, you may infer it — but confirm once before sending.
 
+Prefer the `peer_inbox_reply` MCP tool over this shell path when it is available — it is advertised whenever the session was launched with `--dangerously-load-development-channels server:peer-inbox`. The tool skips the subprocess round-trip and carries the message on the same channel that delivered incoming traffic.
+
+### `broadcast <message...>` (also: `bcast`, `room`)
+
+Example: `/peer broadcast the TTL changed to 15m`.
+
+Fan-out to every live peer in the current room (the pair_key if the session joined one, otherwise every peer in this cwd). One room turn regardless of recipient count.
+
+```bash
+agent-collab peer broadcast --message "<message>"
+```
+
+When channels are loaded you can call the `peer_inbox_reply` tool with `to` omitted instead — same semantics.
+
 ### `check` (also: `inbox`, `receive`)
 
 Example: `/peer check`.
@@ -43,13 +57,22 @@ agent-collab peer list
 
 ### `end`
 
-Terminate the pair. Same as sending `[[end]]`.
+Terminate the room. Same as sending `[[end]]` — in pair_key mode this halts every peer in the room, not just the pair.
 
 ```bash
 agent-collab peer send --to "<peer>" --message "[[end]]"
 ```
 
-Ask the user to confirm the peer label before ending if there are multiple.
+In pair_key mode you can also use `peer broadcast --message "[[end]]"` to signal termination explicitly to every member. Ask the user to confirm the room or peer label before ending if more than one is in scope.
+
+### `reset [--pair-key <k>|--to <label>]`
+
+Clear the termination flag / turn counter for a room after `[[end]]` or hitting the cap.
+
+```bash
+agent-collab peer reset --pair-key "<k>"   # pair_key-scoped rooms
+agent-collab peer reset --to "<label>"     # cwd-only edge rooms
+```
 
 ### Anything else
 
