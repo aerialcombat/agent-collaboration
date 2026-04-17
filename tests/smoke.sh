@@ -313,6 +313,7 @@ print('replay HTML parses OK')
   ch_real="$(cd "$ch_repo" && pwd -P)"
   (
     exec 3<>"$ch_fifo"
+    AGENT_COLLAB_INBOX_DB="$ch_db" \
     PEER_INBOX_SOCKET_DIR="$ch_sockets" \
     PEER_INBOX_PENDING_DIR="$ch_pending" \
       python3 "$PROJECT_ROOT/scripts/peer-inbox-channel.py" <&3 \
@@ -348,6 +349,27 @@ print('replay HTML parses OK')
       || { echo "FAIL: channel notification not emitted" >&2; kill $chpid; exit 1; }
     grep -q '"content":"channel push test"' "$ch_stdout_log" \
       || { echo "FAIL: channel notification missing body" >&2; kill $chpid; exit 1; }
+
+    # v2.0: peer_inbox_reply MCP tool — advertised in tools/list, delivers via
+    # tools/call for directed and broadcast sends.
+    printf '%s\n' '{"jsonrpc":"2.0","id":100,"method":"tools/list"}' >&3
+    sleep 0.2
+    grep -q '"name":"peer_inbox_reply"' "$ch_stdout_log" \
+      || { echo "FAIL: peer_inbox_reply missing from tools/list" >&2; kill $chpid; exit 1; }
+
+    printf '%s\n' '{"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"peer_inbox_reply","arguments":{"to":"chb","body":"reply tool directed"}}}' >&3
+    sleep 0.4
+    AGENT_COLLAB_INBOX_DB="$ch_db" AGENT_COLLAB_SESSION_KEY="chB" \
+      "$agent_collab" peer receive --as chb --cwd "$ch_real" --format plain \
+      | grep -q "reply tool directed" \
+      || { echo "FAIL: reply tool directed message not delivered" >&2; kill $chpid; exit 1; }
+
+    printf '%s\n' '{"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"peer_inbox_reply","arguments":{"body":"reply tool broadcast"}}}' >&3
+    sleep 0.4
+    AGENT_COLLAB_INBOX_DB="$ch_db" AGENT_COLLAB_SESSION_KEY="chB" \
+      "$agent_collab" peer receive --as chb --cwd "$ch_real" --format plain \
+      | grep -q "reply tool broadcast" \
+      || { echo "FAIL: reply tool broadcast did not reach peer chb" >&2; kill $chpid; exit 1; }
 
     kill $chpid 2>/dev/null || true
     wait $chpid 2>/dev/null || true
