@@ -53,8 +53,8 @@ use_cwd="${hook_cwd:-$PWD}"
 if [[ -n "$session_id" ]]; then
   export CLAUDE_SESSION_ID="$session_id"
   # Record seen session_id so future `session register` calls can find it.
-  agent-collab hook-log-session --cwd "$use_cwd" --session-id "$session_id" \
-    >/dev/null 2>>"$LOG" || log "hook-log-session failed"
+  agent-collab hook log-session --cwd "$use_cwd" --session-id "$session_id" \
+    >/dev/null 2>>"$LOG" || log "hook log-session failed"
 fi
 
 # peer receive --format hook-json emits the full Claude UserPromptSubmit
