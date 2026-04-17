@@ -343,19 +343,28 @@ def migrate_sessions_pair_key(conn: sqlite3.Connection) -> None:
     )
 
 
-def migrate_peer_pairs(conn: sqlite3.Connection) -> None:
-    """Create peer_pairs table for turn counting + termination tracking."""
+def migrate_peer_rooms(conn: sqlite3.Connection) -> None:
+    """Create peer_rooms table for room-level turn counting + termination.
+
+    Room identity:
+      - pair_key-scoped rooms: room_key = "pk:<pair_key>"
+      - cwd-only degenerate rooms: room_key = "cwd:<cwd>#<a>+<b>" where (a,b)
+        is the canonical (lexicographically sorted) pair of labels.
+
+    The prior per-edge peer_pairs table from v1.7 is dropped — the room
+    table handles its cases as the degenerate N=2 room. Keeping the
+    legacy table would diverge the two code paths.
+    """
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS peer_pairs (
-          cwd            TEXT NOT NULL,
-          a_label        TEXT NOT NULL,
-          b_label        TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS peer_rooms (
+          room_key       TEXT PRIMARY KEY,
+          pair_key       TEXT,
           turn_count     INTEGER NOT NULL DEFAULT 0,
           terminated_at  TEXT,
-          terminated_by  TEXT,
-          PRIMARY KEY (cwd, a_label, b_label)
+          terminated_by  TEXT
         );
+        DROP TABLE IF EXISTS peer_pairs;
         """
     )
 
@@ -373,7 +382,7 @@ def open_db() -> sqlite3.Connection:
     migrate_sessions_session_key(conn)
     migrate_sessions_channel_socket(conn)
     migrate_sessions_pair_key(conn)
-    migrate_peer_pairs(conn)
+    migrate_peer_rooms(conn)
     return conn
 
 
@@ -476,53 +485,67 @@ def _send_over_unix_socket(socket_path: str, payload: dict, timeout: float = 2.0
     return code, resp_body.decode("utf-8", errors="replace")
 
 
-# ---- Pair state helpers -----------------------------------------------------
+# ---- Room state helpers -----------------------------------------------------
 
 
 def _pair_key(a: str, b: str) -> tuple[str, str]:
-    """Canonicalize a pair so (backend, frontend) == (frontend, backend)."""
+    """Canonicalize a label pair so (backend, frontend) == (frontend, backend)."""
     return (a, b) if a <= b else (b, a)
 
 
-def _get_pair(conn: sqlite3.Connection, cwd: str, a: str, b: str) -> Optional[sqlite3.Row]:
+def _room_key_for(cwd: str, a: str, b: str, pair_key: Optional[str]) -> str:
+    """Build the room identifier for accounting.
+
+    - pair_key-scoped rooms share a single counter under "pk:<pair_key>".
+    - cwd-only pairs degenerate to a per-edge room keyed by
+      "cwd:<cwd>#<a>+<b>" (canonicalised) — each two-person conversation
+      gets its own budget, matching v1.7 behaviour.
+    """
+    if pair_key:
+        return f"pk:{pair_key}"
     ka, kb = _pair_key(a, b)
+    return f"cwd:{cwd}#{ka}+{kb}"
+
+
+def _get_room(conn: sqlite3.Connection, room_key: str) -> Optional[sqlite3.Row]:
     return conn.execute(
-        "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
-        "WHERE cwd = ? AND a_label = ? AND b_label = ?",
-        (cwd, ka, kb),
+        "SELECT turn_count, terminated_at, terminated_by FROM peer_rooms "
+        "WHERE room_key = ?",
+        (room_key,),
     ).fetchone()
 
 
-def _bump_pair(conn: sqlite3.Connection, cwd: str, a: str, b: str) -> None:
-    ka, kb = _pair_key(a, b)
+def _bump_room(
+    conn: sqlite3.Connection, room_key: str, pair_key: Optional[str]
+) -> None:
     conn.execute(
         """
-        INSERT INTO peer_pairs (cwd, a_label, b_label, turn_count)
-        VALUES (?, ?, ?, 1)
-        ON CONFLICT(cwd, a_label, b_label) DO UPDATE SET
-          turn_count = turn_count + 1
+        INSERT INTO peer_rooms (room_key, pair_key, turn_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(room_key) DO UPDATE SET turn_count = turn_count + 1
         """,
-        (cwd, ka, kb),
+        (room_key, pair_key),
     )
 
 
-def _terminate_pair(
-    conn: sqlite3.Connection, cwd: str, a: str, b: str, by: str
+def _terminate_room(
+    conn: sqlite3.Connection, room_key: str, pair_key: Optional[str], by: str
 ) -> None:
-    ka, kb = _pair_key(a, b)
     conn.execute(
         """
-        INSERT INTO peer_pairs (cwd, a_label, b_label, turn_count, terminated_at, terminated_by)
-        VALUES (?, ?, ?, 0, ?, ?)
-        ON CONFLICT(cwd, a_label, b_label) DO UPDATE SET
+        INSERT INTO peer_rooms
+          (room_key, pair_key, turn_count, terminated_at, terminated_by)
+        VALUES (?, ?, 0, ?, ?)
+        ON CONFLICT(room_key) DO UPDATE SET
           terminated_at = excluded.terminated_at,
           terminated_by = excluded.terminated_by
         """,
-        (cwd, ka, kb, now_iso(), by),
+        (room_key, pair_key, now_iso(), by),
     )
 
 
-def _max_pair_turns() -> int:
+def _max_room_turns() -> int:
+    """Per-room turn budget. Env var keeps its v1.7 name for continuity."""
     try:
         return int(os.environ.get("AGENT_COLLAB_MAX_PAIR_TURNS", str(DEFAULT_MAX_PAIR_TURNS)))
     except ValueError:
@@ -1135,6 +1158,15 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     if len(body_bytes) == 0:
         err("empty message rejected", EXIT_VALIDATION)
 
+    # Room identity for accounting. pair_key-scoped rooms share a counter
+    # across every member; cwd-only two-person pairs get a synthesized
+    # per-edge key (degenerate N=2 room).
+    room_key = _room_key_for(str(self_cwd), self_label, args.to, self_pair_key)
+    reset_hint = (
+        f"peer reset --pair-key {self_pair_key}"
+        if self_pair_key else f"peer reset --to {args.to}"
+    )
+
     conn = open_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1153,29 +1185,25 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
                 EXIT_PEER_OFFLINE,
             )
 
-        # Conversation cap + termination guards. Same-cwd pair only — cross-cwd
-        # sends (rare) skip the pair accounting to keep it simple.
-        same_cwd_pair = str(to_cwd) == str(self_cwd)
-        if same_cwd_pair:
-            pair = _get_pair(conn, str(self_cwd), self_label, args.to)
-            if pair and pair["terminated_at"]:
-                conn.execute("ROLLBACK")
-                err(
-                    f"pair ({self_label}, {args.to}) terminated at "
-                    f"{pair['terminated_at']} by {pair['terminated_by']}; "
-                    f"run 'agent-collab peer reset --to {args.to}' to resume",
-                    EXIT_VALIDATION,
-                )
-            current = pair["turn_count"] if pair else 0
-            max_turns = _max_pair_turns()
-            if current >= max_turns:
-                conn.execute("ROLLBACK")
-                err(
-                    f"pair ({self_label}, {args.to}) reached max turns "
-                    f"({current}/{max_turns}); set AGENT_COLLAB_MAX_PAIR_TURNS "
-                    f"or run 'agent-collab peer reset --to {args.to}'",
-                    EXIT_VALIDATION,
-                )
+        room = _get_room(conn, room_key)
+        if room and room["terminated_at"]:
+            conn.execute("ROLLBACK")
+            err(
+                f"room terminated at {room['terminated_at']} "
+                f"by {room['terminated_by']}; "
+                f"run 'agent-collab {reset_hint}' to resume",
+                EXIT_VALIDATION,
+            )
+        current = room["turn_count"] if room else 0
+        max_turns = _max_room_turns()
+        if current >= max_turns:
+            conn.execute("ROLLBACK")
+            err(
+                f"room reached max turns ({current}/{max_turns}); "
+                f"set AGENT_COLLAB_MAX_PAIR_TURNS or run "
+                f"'agent-collab {reset_hint}'",
+                EXIT_VALIDATION,
+            )
 
         terminates = TERMINATION_TOKEN.lower() in body.lower()
 
@@ -1188,10 +1216,9 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
             """,
             (str(to_cwd), args.to, str(self_cwd), self_label, body, now),
         )
-        if same_cwd_pair:
-            _bump_pair(conn, str(self_cwd), self_label, args.to)
-            if terminates:
-                _terminate_pair(conn, str(self_cwd), self_label, args.to, self_label)
+        _bump_room(conn, room_key, self_pair_key)
+        if terminates:
+            _terminate_room(conn, room_key, self_pair_key, self_label)
         bump_last_seen(conn, str(self_cwd), self_label)
         conn.execute("COMMIT")
 
@@ -1217,7 +1244,7 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         else:
             push_status = f"push-failed({code})"
 
-    term_note = " [[end]]→pair terminated" if terminates and same_cwd_pair else ""
+    term_note = " [[end]]→room terminated" if terminates else ""
     print(f"sent to {args.to} ({push_status}){term_note}")
     return EXIT_OK
 
@@ -1225,10 +1252,10 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
 def cmd_peer_broadcast(args: argparse.Namespace) -> int:
     """Fan-out send to every live peer in the sender's scope (pair_key or cwd).
 
-    v2.0 step 2: sender-side fan-out. N unicast inbox rows + N best-effort
-    channel pushes, single DB transaction. Per-edge pair accounting mirrors
-    peer send for same-cwd recipients. Step 4 will replace per-edge caps
-    with a unified room counter.
+    Sender-side fan-out: N unicast inbox rows + N best-effort channel pushes
+    in a single transaction. Accounting is room-level (one turn regardless
+    of recipients) when a pair_key is set; cwd-only broadcasts bump each
+    synthesized per-edge room independently.
     """
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
@@ -1281,38 +1308,52 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
         err(f"no live peers in {scope}", EXIT_NOT_FOUND)
 
     terminates = TERMINATION_TOKEN.lower() in body.lower()
-    max_turns = _max_pair_turns()
+    max_turns = _max_room_turns()
     now = now_iso()
+
+    # Plan per-recipient room keys. pair_key mode collapses to a single
+    # room_key; cwd mode gives each edge its own room.
+    recipients: list[tuple[sqlite3.Row, str]] = [
+        (r, _room_key_for(str(self_cwd), self_label, r["label"], self_pair_key))
+        for r in live
+    ]
 
     conn = open_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Pre-check per-edge caps for same-cwd recipients so a partial
-        # failure doesn't leave a half-delivered broadcast.
-        for r in live:
-            if r["cwd"] != str(self_cwd):
+        # Pre-check rooms so a partial failure never leaves a half-delivered
+        # broadcast. In pair_key mode this is the same row for every
+        # recipient; dedup before checking.
+        checked: set[str] = set()
+        for _, room_key in recipients:
+            if room_key in checked:
                 continue
-            pair = _get_pair(conn, str(self_cwd), self_label, r["label"])
-            if pair and pair["terminated_at"]:
+            checked.add(room_key)
+            room = _get_room(conn, room_key)
+            reset_hint = (
+                f"peer reset --pair-key {self_pair_key}"
+                if self_pair_key else f"peer reset --room-key {room_key}"
+            )
+            if room and room["terminated_at"]:
                 conn.execute("ROLLBACK")
                 err(
-                    f"pair ({self_label}, {r['label']}) terminated at "
-                    f"{pair['terminated_at']} by {pair['terminated_by']}; "
-                    f"run 'agent-collab peer reset --to {r['label']}' to resume",
+                    f"room {room_key} terminated at {room['terminated_at']} "
+                    f"by {room['terminated_by']}; "
+                    f"run 'agent-collab {reset_hint}' to resume",
                     EXIT_VALIDATION,
                 )
-            current = pair["turn_count"] if pair else 0
+            current = room["turn_count"] if room else 0
             if current >= max_turns:
                 conn.execute("ROLLBACK")
                 err(
-                    f"pair ({self_label}, {r['label']}) reached max turns "
-                    f"({current}/{max_turns}); set AGENT_COLLAB_MAX_PAIR_TURNS "
-                    f"or run 'agent-collab peer reset --to {r['label']}'",
+                    f"room {room_key} reached max turns ({current}/{max_turns}); "
+                    f"set AGENT_COLLAB_MAX_PAIR_TURNS or run "
+                    f"'agent-collab {reset_hint}'",
                     EXIT_VALIDATION,
                 )
 
-        for r in live:
+        for r, _ in recipients:
             conn.execute(
                 """
                 INSERT INTO inbox
@@ -1321,12 +1362,17 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
                 """,
                 (r["cwd"], r["label"], str(self_cwd), self_label, body, now),
             )
-            if r["cwd"] == str(self_cwd):
-                _bump_pair(conn, str(self_cwd), self_label, r["label"])
-                if terminates:
-                    _terminate_pair(
-                        conn, str(self_cwd), self_label, r["label"], self_label
-                    )
+
+        # Bump each distinct room exactly once. In pair_key mode that's a
+        # single counter regardless of recipient count.
+        bumped: set[str] = set()
+        for _, room_key in recipients:
+            if room_key in bumped:
+                continue
+            bumped.add(room_key)
+            _bump_room(conn, room_key, self_pair_key)
+            if terminates:
+                _terminate_room(conn, room_key, self_pair_key, self_label)
 
         bump_last_seen(conn, str(self_cwd), self_label)
         conn.execute("COMMIT")
@@ -1349,7 +1395,7 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
             status = "pushed" if code == 200 else f"push-failed({code})"
         statuses.append(f"{r['label']} ({status})")
 
-    term_note = " [[end]]→same-cwd pairs terminated" if terminates else ""
+    term_note = " [[end]]→room terminated" if terminates else ""
     print(f"broadcast to {len(live)} peer(s): {', '.join(statuses)}{term_note}")
     return EXIT_OK
 
@@ -1681,10 +1727,12 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
                         "WHERE cwd = ? AND label = ?",
                         (str(cwd), b),
                     ).fetchone()
+                    # cwd-mode edge rooms live under "cwd:<cwd>#<a>+<b>".
+                    edge_room_key = f"cwd:{cwd}#{a}+{b}"
                     pair_state = c.execute(
-                        "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
-                        "WHERE cwd = ? AND a_label = ? AND b_label = ?",
-                        (str(cwd), a, b),
+                        "SELECT turn_count, terminated_at, terminated_by FROM peer_rooms "
+                        "WHERE room_key = ?",
+                        (edge_room_key,),
                     ).fetchone()
 
                 def _peer_info(s) -> dict:
@@ -1792,19 +1840,24 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             last_id = stats["last_id"] or 0 if stats else 0
             last_at = stats["last_at"] if stats else None
 
+            room_state = c.execute(
+                "SELECT turn_count, terminated_at, terminated_by FROM peer_rooms "
+                "WHERE room_key = ?",
+                (f"pk:{pair_key}",),
+            ).fetchone()
+            activity = best_activity if members else "unknown"
+            if room_state and room_state["terminated_at"]:
+                activity = "terminated"
             return [{
                 "pair_key": pair_key,
                 "key": pair_key,
-                "activity": best_activity if members else "unknown",
+                "activity": activity,
                 "total": total,
                 "last_id": last_id,
                 "last_at": last_at,
-                # Step 4 will populate these from peer_rooms. Until then
-                # the edge peer_pairs table is cwd-keyed and can't give a
-                # meaningful room-level turn count.
-                "turn_count": 0,
-                "terminated_at": None,
-                "terminated_by": None,
+                "turn_count": room_state["turn_count"] if room_state else 0,
+                "terminated_at": room_state["terminated_at"] if room_state else None,
+                "terminated_by": room_state["terminated_by"] if room_state else None,
                 "members": members,
             }]
         finally:
@@ -2443,26 +2496,49 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
 
 
 def cmd_peer_reset(args: argparse.Namespace) -> int:
-    """Clear the termination flag + turn counter for a pair."""
-    validate_label(args.to)
-    cwd = resolve_cwd(args.cwd)
-    self_cwd, self_label = resolve_self(args.as_label, cwd)
-    ka, kb = _pair_key(self_label, args.to)
+    """Clear the termination flag + turn counter for a room.
+
+    Exactly one of --to, --pair-key, --room-key must be given.
+    --to         resets the cwd-only edge between self and <label>
+    --pair-key   resets the whole pair_key-scoped room
+    --room-key   resets an arbitrary room by its exact key (escape hatch)
+    """
+    provided = [bool(args.to), bool(args.pair_key), bool(args.room_key)]
+    if sum(provided) != 1:
+        err(
+            "exactly one of --to, --pair-key, --room-key is required",
+            EXIT_VALIDATION,
+        )
+
+    if args.room_key:
+        room_key = args.room_key
+        label_for_msg = room_key
+    elif args.pair_key:
+        validate_pair_key(args.pair_key)
+        room_key = f"pk:{args.pair_key}"
+        label_for_msg = f"pair {args.pair_key}"
+    else:
+        validate_label(args.to)
+        cwd = resolve_cwd(args.cwd)
+        self_cwd, self_label = resolve_self(args.as_label, cwd)
+        room_key = _room_key_for(str(self_cwd), self_label, args.to, None)
+        label_for_msg = f"({self_label}, {args.to}) at {self_cwd}"
+
     conn = open_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
         cur = conn.execute(
-            "DELETE FROM peer_pairs WHERE cwd = ? AND a_label = ? AND b_label = ?",
-            (str(self_cwd), ka, kb),
+            "DELETE FROM peer_rooms WHERE room_key = ?",
+            (room_key,),
         )
         deleted = cur.rowcount
         conn.execute("COMMIT")
     finally:
         conn.close()
     if deleted:
-        print(f"reset: ({self_label}, {args.to}) at {self_cwd}")
+        print(f"reset: {label_for_msg}")
     else:
-        print(f"note: ({self_label}, {args.to}) had no pair state at {self_cwd}")
+        print(f"note: {label_for_msg} had no room state")
     return EXIT_OK
 
 
@@ -2831,9 +2907,13 @@ def build_parser() -> argparse.ArgumentParser:
     prst = sub.add_parser("peer-reset")
     prst.add_argument("--cwd")
     prst.add_argument("--as", dest="as_label")
-    prst.add_argument("--to", required=True,
-                      help="peer label; resets turn count + termination flag "
-                           "for this pair")
+    prst.add_argument("--to",
+                      help="peer label; resets the cwd-only edge room between "
+                           "self and <label>")
+    prst.add_argument("--pair-key", dest="pair_key",
+                      help="resets the whole pair_key-scoped room")
+    prst.add_argument("--room-key", dest="room_key",
+                      help="reset an arbitrary room by its exact key")
     prst.set_defaults(func=cmd_peer_reset)
 
     pwb = sub.add_parser("peer-web")

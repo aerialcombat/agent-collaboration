@@ -77,10 +77,11 @@ Usage:
                                 Emit self-contained HTML transcript of
                                 messages in the current cwd (or narrowed to
                                 a label's conversations).
-  agent-collab peer reset --to <label>
+  agent-collab peer reset (--to <label> | --pair-key <k> | --room-key <k>)
                                 Clear termination flag + turn counter for
-                                the pair (<self-label>, <label>). Use after
-                                [[end]] or after hitting the max-turns cap.
+                                a room. Use after [[end]] or after hitting
+                                the max-turns cap. --to resets a cwd-only
+                                edge; --pair-key resets the shared room.
   agent-collab peer web [--as <label>] [--port 8787]
                                 Serve a live-updating browser view of the
                                 current cwd's peer messages. Blocks until

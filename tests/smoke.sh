@@ -739,6 +739,78 @@ assert 'one' in bodies and 'two' in bodies, bodies
   kill $rw_pid $rw_cwd_pid 2>/dev/null || true
   wait $rw_pid $rw_cwd_pid 2>/dev/null || true
 
+  echo "-- peer-inbox: v2.0 room-level turn cap blocks every sender --"
+  local rc_db="$TMP_ROOT/peer-inbox-rc.db"
+  local rc_a="$TMP_ROOT/peer-inbox-rc-a"
+  local rc_b="$TMP_ROOT/peer-inbox-rc-b"
+  local rc_c="$TMP_ROOT/peer-inbox-rc-c"
+  mkdir -p "$rc_a" "$rc_b" "$rc_c"
+  local rc_a_real rc_b_real rc_c_real
+  rc_a_real="$(cd "$rc_a" && pwd -P)"
+  rc_b_real="$(cd "$rc_b" && pwd -P)"
+  rc_c_real="$(cd "$rc_c" && pwd -P)"
+  local rc_out rc_key
+  rc_out=$(AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcA \
+    "$agent_collab" session register --cwd "$rc_a_real" --label alpha --agent claude --new-pair)
+  rc_key=$(printf '%s\n' "$rc_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcB \
+    "$agent_collab" session register --cwd "$rc_b_real" --label beta --agent codex --pair-key "$rc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcC \
+    "$agent_collab" session register --cwd "$rc_c_real" --label gamma --agent gemini --pair-key "$rc_key" >/dev/null
+  # Cap = 3 room turns total. alpha→beta, beta→alpha, alpha→gamma = 3 turns.
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcA AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+    "$agent_collab" peer send --cwd "$rc_a_real" --as alpha --to beta --message "1" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcB AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+    "$agent_collab" peer send --cwd "$rc_b_real" --as beta --to alpha --message "2" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcA AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+    "$agent_collab" peer send --cwd "$rc_a_real" --as alpha --to gamma --message "3" >/dev/null
+  # Fourth send from ANY sender (gamma here) must be blocked.
+  if AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcC AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+       "$agent_collab" peer send --cwd "$rc_c_real" --as gamma --to alpha --message "4" >/dev/null 2>&1; then
+    fail "room cap did not block 4th message from a different sender"
+  fi
+  # Broadcast past the cap is also blocked (one turn that would put us over).
+  if AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcB AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+       "$agent_collab" peer broadcast --cwd "$rc_b_real" --as beta --message "bcast past cap" >/dev/null 2>&1; then
+    fail "room cap did not block broadcast"
+  fi
+  # Reset by pair_key and verify a fresh send goes through.
+  AGENT_COLLAB_INBOX_DB="$rc_db" \
+    "$agent_collab" peer reset --pair-key "$rc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rc_db" AGENT_COLLAB_SESSION_KEY=rcA AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+    "$agent_collab" peer send --cwd "$rc_a_real" --as alpha --to beta --message "revived" >/dev/null \
+    || fail "send after peer reset --pair-key was rejected"
+
+  echo "-- peer-inbox: v2.0 [[end]] terminates the whole room --"
+  local te_db="$TMP_ROOT/peer-inbox-te.db"
+  local te_a="$TMP_ROOT/peer-inbox-te-a"
+  local te_b="$TMP_ROOT/peer-inbox-te-b"
+  local te_c="$TMP_ROOT/peer-inbox-te-c"
+  mkdir -p "$te_a" "$te_b" "$te_c"
+  local te_a_real te_b_real te_c_real
+  te_a_real="$(cd "$te_a" && pwd -P)"
+  te_b_real="$(cd "$te_b" && pwd -P)"
+  te_c_real="$(cd "$te_c" && pwd -P)"
+  local te_out te_key
+  te_out=$(AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teA \
+    "$agent_collab" session register --cwd "$te_a_real" --label alpha --agent claude --new-pair)
+  te_key=$(printf '%s\n' "$te_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teB \
+    "$agent_collab" session register --cwd "$te_b_real" --label beta --agent codex --pair-key "$te_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teC \
+    "$agent_collab" session register --cwd "$te_c_real" --label gamma --agent gemini --pair-key "$te_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teA \
+    "$agent_collab" peer send --cwd "$te_a_real" --as alpha --to beta --message "shutting down [[end]]" >/dev/null
+  if AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teC \
+       "$agent_collab" peer send --cwd "$te_c_real" --as gamma --to alpha --message "can i?" >/dev/null 2>&1; then
+    fail "room termination did not block non-sender peers"
+  fi
+  AGENT_COLLAB_INBOX_DB="$te_db" \
+    "$agent_collab" peer reset --pair-key "$te_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$te_db" AGENT_COLLAB_SESSION_KEY=teC \
+    "$agent_collab" peer send --cwd "$te_c_real" --as gamma --to alpha --message "back" >/dev/null \
+    || fail "send after room reset was rejected"
+
   echo "-- peer-inbox: v2.0 peer broadcast errors when no peers --"
   local solo_db="$TMP_ROOT/peer-inbox-bc-solo.db"
   local solo_repo="$TMP_ROOT/peer-inbox-bc-solo"
