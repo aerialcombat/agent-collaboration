@@ -24,17 +24,24 @@ Protocol reference:
 When you are leading non-trivial work in a repo that has a local collaboration guide:
 
 ```bash
-agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md
+agent-collab challenge --challenger codex --scope AGENT-COLLABORATION.md
 agent-collab verify --challenger codex --scope AGENT-COLLABORATION.md
 ```
 
-If you need to preview what the runner will do before invoking a challenger:
+If you need to preview what the runner will do before invoking Codex:
 
 ```bash
-agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md --dry-run
+agent-collab challenge --challenger codex --scope AGENT-COLLABORATION.md --dry-run
 ```
 
 If the repo has no local helper or runner setup, fall back to the repo-local docs or the global protocol reference for manual shell invocation patterns.
+
+To invoke Claude as challenger:
+
+```bash
+agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md
+agent-collab verify --challenger claude --scope AGENT-COLLABORATION.md
+```
 
 ## Scope Of This File
 

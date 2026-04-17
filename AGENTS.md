@@ -7,7 +7,7 @@ This repository defines a global collaboration layer, not repo-local implementat
 - `docs/GLOBAL-PROTOCOL.md`: canonical protocol for roles, evidence rules, escalation, and subprocess behavior.
 - `AGENT-COLLABORATION.md`: this repo's local collaboration guide.
 - `.agent-collab.env`: local defaults for the global runner in this repo.
-- `templates/CLAUDE.md`, `templates/AGENTS.md`, and `templates/AGENT-COLLABORATION.md`: starter templates for global and repo-local docs.
+- `templates/CLAUDE.md`, `templates/AGENTS.md`, `templates/GEMINI.md`, and `templates/AGENT-COLLABORATION.md`: starter templates for global and repo-local docs.
 - `scripts/agent-collab`: global runner for `challenge` and `verify` passes.
 - `scripts/install-global-protocol`: installs templates and the global command.
 - `scripts/doctor-global-protocol`: validates install state and CLI assumptions.

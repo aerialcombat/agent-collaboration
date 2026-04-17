@@ -1,6 +1,6 @@
 # Global Protocol
 
-This document defines the repo-agnostic collaboration contract for Claude Code and Codex CLI.
+This document defines the repo-agnostic collaboration contract for Claude Code, Codex CLI, and Gemini CLI.
 
 It does not define repo-specific plan paths, ownership rules, or verification commands.
 
@@ -135,7 +135,7 @@ If the challenger does not return usable output:
 
 If the other agent or CLI is unavailable, treat that the same way as a failed challenge pass. Do not silently drop collaboration on a task that should have had review.
 
-## Global Subprocess Rule
+## Global Subprocess Rules
 
 When Codex calls Claude in subprocess mode, pipe the prompt through stdin instead of passing the full prompt only as a positional argument, and apply a hard timeout with the timeout backend available on that machine (`timeout` or `gtimeout`).
 
