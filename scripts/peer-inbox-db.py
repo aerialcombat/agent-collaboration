@@ -1121,15 +1121,20 @@ def cmd_session_adopt(args: argparse.Namespace) -> int:
 
 
 def cmd_peer_web(args: argparse.Namespace) -> int:
-    """Serve a live-updating browser view of the current cwd's messages.
+    """Serve a Slack-shaped live view of the current cwd's peer traffic.
 
-    Browser-side JS polls /messages.json?after=<id> every second and appends
-    new rows. Same chat-log look as peer replay; scope is caller's cwd
-    (narrow to a label's conversations with --as). Blocks until Ctrl-C.
+    Sidebar lists every pair (canonical a_label < b_label) grouped by
+    activity (active / idle / stale / terminated); clicking a pair shows
+    its message stream in the main pane. Both panes auto-poll at 1s.
+
+    Endpoints:
+      GET /                                  → SPA HTML
+      GET /pairs.json                        → pair list + metadata
+      GET /messages.json?pair=a+b&after=N    → messages for one pair
+      GET /messages.json?after=N             → all cwd messages (back-compat)
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from urllib.parse import parse_qs, urlparse
-    import threading as _threading
 
     cwd = resolve_cwd(args.cwd)
     as_label = args.as_label
@@ -1137,9 +1142,110 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         validate_label(as_label)
     port = int(args.port)
 
-    def _fetch(after: int) -> list[sqlite3.Row]:
+    def _canonical_pair(a: str, b: str) -> tuple[str, str]:
+        return (a, b) if a <= b else (b, a)
+
+    def _fetch_pairs() -> list[dict]:
+        """Aggregate pair metadata from inbox + sessions + peer_pairs tables."""
         c = open_db()
         try:
+            # Distinct pairs ever active in this cwd (same-cwd pair only —
+            # cross-cwd sends don't form a "pair" in the termination sense).
+            rows = c.execute(
+                """
+                SELECT
+                  CASE WHEN from_label < to_label THEN from_label ELSE to_label END AS a,
+                  CASE WHEN from_label < to_label THEN to_label ELSE from_label END AS b,
+                  MAX(id)              AS last_id,
+                  MAX(created_at)      AS last_at,
+                  COUNT(*)             AS total,
+                  SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread_backend
+                FROM inbox
+                WHERE to_cwd = ? AND from_cwd = ?
+                GROUP BY a, b
+                ORDER BY last_at DESC
+                """,
+                (str(cwd), str(cwd)),
+            ).fetchall()
+
+            # Per-pair session activity + termination.
+            pairs = []
+            for r in rows:
+                a, b = r["a"], r["b"]
+                sess_a = c.execute(
+                    "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                    "WHERE cwd = ? AND label = ?",
+                    (str(cwd), a),
+                ).fetchone()
+                sess_b = c.execute(
+                    "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                    "WHERE cwd = ? AND label = ?",
+                    (str(cwd), b),
+                ).fetchone()
+                pair_state = c.execute(
+                    "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
+                    "WHERE cwd = ? AND a_label = ? AND b_label = ?",
+                    (str(cwd), a, b),
+                ).fetchone()
+
+                def _peer_info(s) -> dict:
+                    if s is None:
+                        return {"agent": None, "role": None, "activity": "unknown",
+                                "last_seen_at": None, "channel": False}
+                    return {
+                        "agent": s["agent"],
+                        "role": s["role"],
+                        "activity": activity_state(s["last_seen_at"]),
+                        "last_seen_at": s["last_seen_at"],
+                        "channel": s["channel_socket"] is not None,
+                    }
+
+                ai = _peer_info(sess_a)
+                bi = _peer_info(sess_b)
+
+                # Pair activity = worst of the two (any stale → pair stale).
+                def _worse(x: str, y: str) -> str:
+                    order = {"unknown": -1, "active": 0, "idle": 1, "stale": 2}
+                    return x if order.get(x, -1) >= order.get(y, -1) else y
+                pair_activity = _worse(ai["activity"], bi["activity"])
+
+                terminated = pair_state["terminated_at"] if pair_state else None
+                if terminated:
+                    pair_activity = "terminated"
+
+                pairs.append({
+                    "a": a,
+                    "b": b,
+                    "key": f"{a}+{b}",
+                    "activity": pair_activity,
+                    "total": r["total"],
+                    "last_id": r["last_id"],
+                    "last_at": r["last_at"],
+                    "turn_count": pair_state["turn_count"] if pair_state else 0,
+                    "terminated_at": terminated,
+                    "terminated_by": pair_state["terminated_by"] if pair_state else None,
+                    "peers": {a: ai, b: bi},
+                })
+            return pairs
+        finally:
+            c.close()
+
+    def _fetch_messages(after: int, pair: Optional[tuple[str, str]]) -> list[sqlite3.Row]:
+        c = open_db()
+        try:
+            if pair is not None:
+                pa, pb = pair
+                return c.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE id > ? AND to_cwd = ? AND from_cwd = ?
+                      AND ((from_label = ? AND to_label = ?)
+                        OR (from_label = ? AND to_label = ?))
+                    ORDER BY id ASC
+                    """,
+                    (after, str(cwd), str(cwd), pa, pb, pb, pa),
+                ).fetchall()
             if as_label:
                 return c.execute(
                     """
@@ -1164,9 +1270,18 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             c.close()
 
     scope = f"conversations involving {as_label}" if as_label else "all cross-session messages"
-    title = f"peer-inbox live — {scope} in {cwd}"
+    title = f"peer-inbox — {scope} in {cwd}"
+    index_html = _PEER_WEB_HTML_TEMPLATE.replace("__TITLE__", html_lib.escape(title)) \
+                                         .replace("__CWD__", html_lib.escape(str(cwd)))
 
-    index_html = _PEER_WEB_HTML_TEMPLATE.replace("__TITLE__", html_lib.escape(title))
+    def _send_json(handler, code: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        handler.send_response(code)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(body)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -1183,36 +1298,54 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+
+            if parsed.path == "/pairs.json":
+                _send_json(self, 200, {"cwd": str(cwd), "pairs": _fetch_pairs()})
+                return
+
             if parsed.path == "/messages.json":
                 q = parse_qs(parsed.query)
                 try:
                     after = int(q.get("after", ["0"])[0])
                 except ValueError:
                     after = 0
-                rows = _fetch(after)
-                payload = {
-                    "cwd": str(cwd),
-                    "as_label": as_label,
-                    "messages": [
-                        {
-                            "id": r["id"],
-                            "from": r["from_label"],
-                            "to": r["to_label"],
-                            "body": r["body"],
-                            "created_at": r["created_at"],
-                            "read": r["read_at"] is not None,
-                        }
-                        for r in rows
-                    ],
-                }
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(body)
+                # Accept two styles for back-compat:
+                # 1. ?a=X&b=Y (preferred; avoids + → space URL-decode trap).
+                # 2. ?pair=X+Y or ?pair=X:Y (for hand-crafted curls).
+                a_arg = q.get("a", [None])[0]
+                b_arg = q.get("b", [None])[0]
+                pair_arg = q.get("pair", [None])[0]
+                pair: Optional[tuple[str, str]] = None
+                if a_arg and b_arg:
+                    pair = _canonical_pair(a_arg, b_arg)
+                elif pair_arg:
+                    for sep in (":", " ", "+"):
+                        if sep in pair_arg:
+                            a, b = pair_arg.split(sep, 1)
+                            pair = _canonical_pair(a.strip(), b.strip())
+                            break
+                rows = _fetch_messages(after, pair)
+                _send_json(
+                    self,
+                    200,
+                    {
+                        "cwd": str(cwd),
+                        "pair": f"{pair[0]}+{pair[1]}" if pair else None,
+                        "messages": [
+                            {
+                                "id": r["id"],
+                                "from": r["from_label"],
+                                "to": r["to_label"],
+                                "body": r["body"],
+                                "created_at": r["created_at"],
+                                "read": r["read_at"] is not None,
+                            }
+                            for r in rows
+                        ],
+                    },
+                )
                 return
+
             self.send_response(404)
             self.end_headers()
 
@@ -1234,77 +1367,147 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
 <style>
   :root {
     --bg:#0e1015; --fg:#e6e6e6; --muted:#8a8f98; --accent:#6cd9ff;
-    --panel:#181b23; --border:#262a33;
+    --panel:#181b23; --border:#262a33; --sidebar-bg:#12141b;
+    --hover:#1f242e; --selected:#223041; --unread:#6cd9ff;
+    --terminated:#f59e0b;
   }
   * { box-sizing:border-box }
   html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
-    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif; }
-  header { padding:16px 24px; border-bottom:1px solid var(--border);
-    position:sticky; top:0; background:var(--bg); z-index:1; }
-  header h1 { font-size:15px; margin:0; color:var(--fg); font-weight:500 }
-  header .sub { color:var(--muted); font-size:12px; margin-top:4px;
-    display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
-    box-shadow:0 0 8px var(--accent); animation:pulse 2s infinite; }
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;
+    height:100%; }
+  .app { display:grid; grid-template-columns:280px 1fr; height:100vh;
+    overflow:hidden; }
+
+  /* Sidebar */
+  aside { background:var(--sidebar-bg); border-right:1px solid var(--border);
+    overflow-y:auto; }
+  aside .brand { padding:16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:8px; }
+  aside .brand h1 { margin:0; font-size:13px; font-weight:600;
+    letter-spacing:.04em; text-transform:uppercase; color:var(--fg); }
+  aside .brand .dot { width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 6px var(--accent);
+    animation:pulse 2s infinite; }
   @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
-  main { padding:16px 24px 120px; max-width:880px }
-  .day { color:var(--muted); text-align:center; margin:24px 0 8px;
-    font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
-  .msg { margin:12px 0; padding:12px 14px; background:var(--panel);
-    border:1px solid var(--border); border-radius:8px; }
-  .msg.new { animation:flash 1.2s ease-out; }
-  @keyframes flash { 0% { background:#2a3340 } 100% { background:var(--panel) } }
-  .meta { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
-    font-size:12px; color:var(--muted); margin-bottom:6px; }
+  aside .cwd { padding:0 16px 12px; color:var(--muted); font-size:11px;
+    word-break:break-all; border-bottom:1px solid var(--border); }
+  aside .section-label { padding:12px 16px 4px; font-size:11px;
+    color:var(--muted); letter-spacing:.12em; text-transform:uppercase; }
+  .pair-item { display:block; padding:8px 16px; cursor:pointer;
+    border-left:2px solid transparent; color:var(--fg);
+    text-decoration:none; user-select:none; }
+  .pair-item:hover { background:var(--hover); }
+  .pair-item.selected { background:var(--selected);
+    border-left-color:var(--accent); }
+  .pair-item.terminated .labels,
+  .pair-item.terminated .meta-row { opacity:.55;
+    text-decoration:line-through; }
+  .pair-item .labels { display:flex; align-items:center; gap:6px;
+    font-size:13px; font-weight:500; }
+  .pair-item .labels .sep { color:var(--muted); font-size:11px; }
+  .pair-item .unread-badge { margin-left:auto; min-width:18px;
+    padding:1px 6px; border-radius:9px; background:var(--unread);
+    color:#0e1015; font-size:10px; font-weight:600; text-align:center;
+    display:none; }
+  .pair-item.has-unread .unread-badge { display:inline-block }
+  .pair-item .meta-row { display:flex; gap:8px; font-size:11px;
+    color:var(--muted); margin-top:2px; }
+  .activity-dot { width:6px; height:6px; border-radius:50%;
+    display:inline-block; margin-right:4px; }
+  .activity-dot.active { background:#22c55e }
+  .activity-dot.idle { background:#eab308 }
+  .activity-dot.stale { background:#6b7280 }
+  .activity-dot.terminated { background:var(--terminated) }
+  .activity-dot.unknown { background:#4b5563 }
+
+  /* Main pane */
+  main { display:flex; flex-direction:column; overflow:hidden; }
+  .pair-header { padding:14px 24px; border-bottom:1px solid var(--border);
+    background:var(--bg); }
+  .pair-header h2 { margin:0; font-size:15px; font-weight:500;
+    display:flex; align-items:center; gap:8px; }
+  .pair-header .sub { color:var(--muted); font-size:12px; margin-top:4px;
+    display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
   .pill { color:#1a1d24; padding:2px 8px; border-radius:10px;
     font-weight:500; font-size:11px; }
   .arrow { color:var(--muted) }
+
+  .stream { flex:1; overflow-y:auto; padding:16px 24px 40px; }
+  .empty { color:var(--muted); text-align:center; padding:60px 20px;
+    font-size:13px; }
+  .day { color:var(--muted); text-align:center; margin:20px 0 8px;
+    font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
+  .msg { margin:10px 0; padding:10px 14px; background:var(--panel);
+    border:1px solid var(--border); border-radius:8px; max-width:760px; }
+  .msg.new { animation:flash 1.2s ease-out; }
+  @keyframes flash { 0% { background:#2a3340 } 100% { background:var(--panel) } }
+  .msg.end-marker { border-color:var(--terminated);
+    background:rgba(245,158,11,.08); }
+  .meta { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    font-size:11px; color:var(--muted); margin-bottom:5px; }
   .time { margin-left:auto; font-family:SF Mono,Menlo,monospace; }
-  .status.unread { color:var(--accent) }
-  .status.read { color:var(--muted) }
   .id { font-family:SF Mono,Menlo,monospace; opacity:.5 }
   .body { margin:0; white-space:pre-wrap; word-wrap:break-word;
     color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }
-  .empty { color:var(--muted); text-align:center; padding:40px 0; }
-  .scroll-btn { position:fixed; bottom:16px; right:24px; padding:8px 12px;
+  .term-banner { margin:16px 0; padding:10px 14px;
+    background:rgba(245,158,11,.08); border:1px dashed var(--terminated);
+    border-radius:8px; color:var(--terminated); font-size:12px;
+    text-align:center; }
+
+  .scroll-btn { position:absolute; bottom:20px; right:32px; padding:6px 12px;
     background:var(--panel); color:var(--fg); border:1px solid var(--border);
     border-radius:6px; cursor:pointer; font-size:12px; display:none; }
   .scroll-btn.show { display:block }
 </style>
-<header>
-  <h1>peer-inbox live view</h1>
-  <div class=sub>
-    <span class=dot></span>
-    <span id=scope>__TITLE__</span>
-    <span id=stats>0 messages</span>
-    <span id=last>waiting for first poll…</span>
-  </div>
-</header>
-<main id=log><div class=empty id=empty>no messages yet</div></main>
-<button class=scroll-btn id=scrollBtn>↓ new messages</button>
+<body>
+<div class=app>
+  <aside>
+    <div class=brand>
+      <span class=dot></span>
+      <h1>peer-inbox</h1>
+    </div>
+    <div class=cwd id=cwd>__CWD__</div>
+    <div id=sidebar></div>
+  </aside>
+  <main>
+    <div class=pair-header id=pairHeader>
+      <h2>select a pair</h2>
+      <div class=sub id=pairSub>from the sidebar →</div>
+    </div>
+    <div class=stream id=stream>
+      <div class=empty id=emptyMain>pick a conversation on the left to view its messages</div>
+    </div>
+    <button class=scroll-btn id=scrollBtn>↓ new messages</button>
+  </main>
+</div>
 <script>
 (() => {
-  const log = document.getElementById('log');
-  const empty = document.getElementById('empty');
-  const stats = document.getElementById('stats');
-  const last = document.getElementById('last');
+  const sidebar = document.getElementById('sidebar');
+  const pairHeader = document.getElementById('pairHeader');
+  const pairSub = document.getElementById('pairSub');
+  const stream = document.getElementById('stream');
+  const emptyMain = document.getElementById('emptyMain');
   const scrollBtn = document.getElementById('scrollBtn');
-  let lastId = 0;
-  let total = 0;
-  let prevDay = null;
-  let autoScroll = true;
+
+  const state = {
+    pairs: {},                // key -> metadata
+    selectedKey: null,
+    messagesByPair: {},       // key -> [messages]
+    lastIdByPair: {},         // key -> highest seen id
+    lastSeenIdByPair: {},     // key -> id up to which the viewer has seen
+    autoScroll: true,
+  };
   const originalTitle = document.title;
 
   function hue(label) {
     let h = 0;
-    for (const c of label) h = (h * 31 + c.charCodeAt(0)) % 360;
+    for (const c of label || '') h = (h * 31 + c.charCodeAt(0)) % 360;
     return h;
   }
   function pill(label) {
-    const h = hue(label);
     const el = document.createElement('span');
     el.className = 'pill';
-    el.style.background = `hsl(${h}, 55%, 86%)`;
+    el.style.background = `hsl(${hue(label)}, 55%, 86%)`;
     el.textContent = label;
     return el;
   }
@@ -1315,71 +1518,219 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     return e;
   }
 
-  function render(m) {
-    const day = (m.created_at || '').slice(0, 10);
-    if (day && day !== prevDay) {
-      const d = el('div', 'day', day);
-      log.appendChild(d);
-      prevDay = day;
+  function renderSidebar() {
+    const pairs = Object.values(state.pairs);
+    const byActivity = { active: [], idle: [], stale: [], terminated: [], unknown: [] };
+    for (const p of pairs) (byActivity[p.activity] || byActivity.unknown).push(p);
+
+    const order = ['active', 'idle', 'stale', 'terminated'];
+    sidebar.innerHTML = '';
+    let anyShown = false;
+    for (const section of order) {
+      const items = byActivity[section] || [];
+      if (!items.length) continue;
+      anyShown = true;
+      sidebar.appendChild(el('div', 'section-label', section));
+      for (const p of items) {
+        const item = document.createElement('a');
+        item.className = 'pair-item';
+        item.classList.toggle('selected', p.key === state.selectedKey);
+        if (section === 'terminated') item.classList.add('terminated');
+        const unread = Math.max(0, p.last_id - (state.lastSeenIdByPair[p.key] || 0));
+        if (unread > 0 && p.key !== state.selectedKey) item.classList.add('has-unread');
+        item.href = '#' + p.key;
+
+        const labels = el('div', 'labels');
+        labels.appendChild(pill(p.a));
+        labels.appendChild(el('span', 'sep', '↔'));
+        labels.appendChild(pill(p.b));
+        const badge = el('span', 'unread-badge', unread > 99 ? '99+' : String(unread));
+        labels.appendChild(badge);
+        item.appendChild(labels);
+
+        const metaRow = el('div', 'meta-row');
+        const dot = el('span', 'activity-dot ' + (p.activity || 'unknown'));
+        metaRow.appendChild(dot);
+        metaRow.appendChild(el('span', '', p.total + ' msg · ' + p.turn_count + ' turns'));
+        item.appendChild(metaRow);
+
+        item.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          selectPair(p.key);
+        });
+        sidebar.appendChild(item);
+      }
     }
-    const wrap = el('div', 'msg new');
-    wrap.dataset.id = m.id;
-    const meta = el('div', 'meta');
-    meta.appendChild(pill(m.from || '?'));
-    meta.appendChild(el('span', 'arrow', '→'));
-    meta.appendChild(pill(m.to || '?'));
-    meta.appendChild(el('span', 'time', m.created_at || ''));
-    meta.appendChild(el('span', 'status ' + (m.read ? 'read' : 'unread'),
-                        m.read ? 'read' : 'unread'));
-    meta.appendChild(el('span', 'id', '#' + m.id));
-    wrap.appendChild(meta);
-    wrap.appendChild(el('pre', 'body', m.body || ''));
-    log.appendChild(wrap);
+    if (!anyShown) {
+      sidebar.appendChild(el('div', 'empty', 'no pairs yet'));
+    }
   }
 
-  function maybeScroll() {
-    if (autoScroll) {
-      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-      scrollBtn.classList.remove('show');
-    } else {
-      scrollBtn.classList.add('show');
+  function renderPairHeader(p) {
+    pairHeader.innerHTML = '';
+    if (!p) {
+      pairHeader.appendChild(el('h2', '', 'select a pair'));
+      pairHeader.appendChild(el('div', 'sub', 'from the sidebar →'));
+      return;
+    }
+    const h = document.createElement('h2');
+    h.appendChild(pill(p.a));
+    h.appendChild(el('span', 'arrow', '↔'));
+    h.appendChild(pill(p.b));
+    pairHeader.appendChild(h);
+
+    const sub = el('div', 'sub');
+    const ad = el('span', 'activity-dot ' + (p.activity || 'unknown'));
+    sub.appendChild(ad);
+    sub.appendChild(el('span', '',
+      `${p.activity} · ${p.total} messages · ${p.turn_count} turns`));
+    if (p.terminated_at) {
+      sub.appendChild(el('span', '',
+        `· ended by ${p.terminated_by} at ${p.terminated_at}`));
+    }
+    for (const who of [p.a, p.b]) {
+      const info = p.peers && p.peers[who];
+      if (info) {
+        const tag = el('span', '', who + ': ' + (info.agent || '?') +
+          (info.channel ? ' · channel' : '') +
+          (info.role ? ' · ' + info.role : ''));
+        sub.appendChild(tag);
+      }
+    }
+    pairHeader.appendChild(sub);
+  }
+
+  function renderStream(pairKey) {
+    stream.innerHTML = '';
+    const messages = state.messagesByPair[pairKey] || [];
+    if (!messages.length) {
+      stream.appendChild(el('div', 'empty', 'no messages yet'));
+      return;
+    }
+    let prevDay = null;
+    const p = state.pairs[pairKey];
+    for (const m of messages) {
+      const day = (m.created_at || '').slice(0, 10);
+      if (day && day !== prevDay) {
+        stream.appendChild(el('div', 'day', day));
+        prevDay = day;
+      }
+      const wrap = el('div', 'msg');
+      wrap.dataset.id = m.id;
+      if ((m.body || '').toLowerCase().includes('[[end]]')) wrap.classList.add('end-marker');
+      const meta = el('div', 'meta');
+      meta.appendChild(pill(m.from || '?'));
+      meta.appendChild(el('span', 'arrow', '→'));
+      meta.appendChild(pill(m.to || '?'));
+      meta.appendChild(el('span', 'time', m.created_at || ''));
+      meta.appendChild(el('span', 'id', '#' + m.id));
+      wrap.appendChild(meta);
+      wrap.appendChild(el('pre', 'body', m.body || ''));
+      stream.appendChild(wrap);
+    }
+    if (p && p.terminated_at) {
+      const banner = el('div', 'term-banner',
+        `terminated by ${p.terminated_by} at ${p.terminated_at}`);
+      stream.appendChild(banner);
     }
   }
 
-  window.addEventListener('scroll', () => {
-    const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 10;
-    autoScroll = atBottom;
+  function selectPair(key) {
+    state.selectedKey = key;
+    state.lastSeenIdByPair[key] = state.pairs[key] ? state.pairs[key].last_id : 0;
+    renderSidebar();
+    renderPairHeader(state.pairs[key]);
+    renderStream(key);
+    if (key && !state.messagesByPair[key]) {
+      fetchPairMessages(key);
+    }
+    state.autoScroll = true;
+    requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
+  }
+
+  async function fetchPairs() {
+    try {
+      const r = await fetch('/pairs.json', { cache: 'no-store' });
+      const data = await r.json();
+      const pairs = {};
+      let totalUnread = 0;
+      for (const p of data.pairs || []) {
+        pairs[p.key] = p;
+        const unread = Math.max(0, p.last_id - (state.lastSeenIdByPair[p.key] || 0));
+        if (p.key !== state.selectedKey) totalUnread += unread;
+      }
+      state.pairs = pairs;
+      renderSidebar();
+      if (state.selectedKey && pairs[state.selectedKey]) {
+        renderPairHeader(pairs[state.selectedKey]);
+      }
+      document.title = (totalUnread ? '(' + totalUnread + ') ' : '') + originalTitle;
+    } catch (e) {
+      console.warn('pairs poll failed', e);
+    }
+  }
+
+  async function fetchPairMessages(pairKey, after) {
+    if (!pairKey) return;
+    const since = typeof after === 'number' ? after :
+                  (state.lastIdByPair[pairKey] || 0);
+    const p = state.pairs[pairKey];
+    if (!p) return;
+    try {
+      const r = await fetch('/messages.json?a=' + encodeURIComponent(p.a) +
+                            '&b=' + encodeURIComponent(p.b) +
+                            '&after=' + since, { cache: 'no-store' });
+      const data = await r.json();
+      if (!(data.messages && data.messages.length)) return;
+      const arr = state.messagesByPair[pairKey] || [];
+      let maxId = state.lastIdByPair[pairKey] || 0;
+      const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
+      for (const m of data.messages) {
+        arr.push(m);
+        if (m.id > maxId) maxId = m.id;
+      }
+      state.messagesByPair[pairKey] = arr;
+      state.lastIdByPair[pairKey] = maxId;
+      if (pairKey === state.selectedKey) {
+        renderStream(pairKey);
+        state.lastSeenIdByPair[pairKey] = maxId;
+        if (state.autoScroll || atBottom) {
+          requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
+          scrollBtn.classList.remove('show');
+        } else {
+          scrollBtn.classList.add('show');
+        }
+      }
+    } catch (e) {
+      console.warn('messages poll failed', e);
+    }
+  }
+
+  stream.addEventListener('scroll', () => {
+    const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
+    state.autoScroll = atBottom;
     if (atBottom) scrollBtn.classList.remove('show');
   });
   scrollBtn.addEventListener('click', () => {
-    autoScroll = true;
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    state.autoScroll = true;
+    stream.scrollTop = stream.scrollHeight;
     scrollBtn.classList.remove('show');
   });
 
-  async function poll() {
-    try {
-      const r = await fetch('/messages.json?after=' + lastId, { cache: 'no-store' });
-      const data = await r.json();
-      if (data.messages && data.messages.length) {
-        if (empty) empty.remove();
-        for (const m of data.messages) {
-          render(m);
-          lastId = Math.max(lastId, m.id);
-          total += 1;
-        }
-        stats.textContent = total + ' message' + (total === 1 ? '' : 's');
-        document.title = (total ? '(' + total + ') ' : '') + originalTitle;
-        maybeScroll();
-      }
-      last.textContent = 'updated ' + new Date().toLocaleTimeString();
-    } catch (e) {
-      last.textContent = 'poll failed: ' + e.message;
-    }
+  async function tick() {
+    await fetchPairs();
+    if (state.selectedKey) await fetchPairMessages(state.selectedKey);
   }
 
-  poll();
-  setInterval(poll, 1000);
+  // Support deep-link #a+b to preselect
+  const initialHash = (location.hash || '').replace(/^#/, '');
+
+  tick().then(() => {
+    if (initialHash && state.pairs[initialHash]) {
+      selectPair(initialHash);
+    }
+  });
+  setInterval(tick, 1000);
 })();
 </script>
 """

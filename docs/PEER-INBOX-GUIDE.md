@@ -236,10 +236,25 @@ mark-read. Good for a tmux side-pane.
 --port <n>            default 8787
 ```
 
-Blocks until Ctrl-C. Serves `http://127.0.0.1:<port>` — dark-theme live
-chat log, 1-second polling, auto-scroll with a "↓ new messages" button
-when you're scrolled up, title flash with unread count. Best for
-dashboard use in a browser tab.
+Blocks until Ctrl-C. Serves `http://127.0.0.1:<port>` — Slack-shaped
+two-pane UI:
+
+- **Left sidebar**: every pair (canonical `a < b`) grouped by activity
+  (active / idle / stale / terminated). Unread badge on pairs that
+  aren't currently selected. Click to switch.
+- **Main pane**: selected pair's message stream. Pastel-pill sender
+  labels, day separators, `[[end]]` renders with a warning border plus
+  a "terminated" banner at the bottom.
+- **Header**: peer details (agent type, role, channel pairing), turn
+  count, activity dot.
+- **Title flash** with total unread across non-focused pairs.
+- `#pair=a+b` URL hash preselects a pair on load.
+
+Endpoints (for scripting / dashboards):
+- `GET /pairs.json` — every pair's metadata in this cwd.
+- `GET /messages.json?a=backend&b=frontend&after=<id>` — messages for
+  one pair, with optional delta cursor.
+- `GET /messages.json?after=<id>` — all messages (back-compat with v1.5).
 
 #### `agent-collab peer replay`
 

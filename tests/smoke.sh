@@ -374,7 +374,7 @@ print('replay HTML parses OK')
   local web_pid=$!
   sleep 0.4
 
-  curl -s "http://127.0.0.1:8798/" | grep -q "peer-inbox live view" \
+  curl -s "http://127.0.0.1:8798/" | grep -q "peer-inbox" \
     || { kill $web_pid 2>/dev/null || true; fail "peer web / did not serve the index page"; }
   curl -s "http://127.0.0.1:8798/messages.json?after=0" \
     | python3 -c "
@@ -383,6 +383,29 @@ d = json.load(sys.stdin)
 assert d['messages'], 'no messages in delta'
 assert d['messages'][0]['body'] == 'web view one', f'wrong body: {d}'
 " || { kill $web_pid 2>/dev/null || true; fail "peer web /messages.json shape wrong"; }
+
+  # Pair-scoped endpoints (v1.6 Slack-shaped UI)
+  curl -s "http://127.0.0.1:8798/pairs.json" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['pairs'], 'no pairs in /pairs.json'
+p = d['pairs'][0]
+assert p['key'] == 'wa+wb', f'wrong canonical key: {p[\"key\"]}'
+assert p['total'] >= 1
+" || { kill $web_pid 2>/dev/null || true; fail "peer web /pairs.json shape wrong"; }
+
+  # Pair-filtered messages
+  curl -s "http://127.0.0.1:8798/messages.json?a=wa&b=wb" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['pair'] == 'wa+wb', f'canonical pair not returned: {d[\"pair\"]}'
+assert all(
+  (m['from'] == 'wa' and m['to'] == 'wb') or (m['from'] == 'wb' and m['to'] == 'wa')
+  for m in d['messages']
+), 'cross-pair bleed'
+" || { kill $web_pid 2>/dev/null || true; fail "peer web pair filter wrong"; }
 
   AGENT_COLLAB_INBOX_DB="$web_db" AGENT_COLLAB_SESSION_KEY="wkB" \
     "$agent_collab" peer send --cwd "$web_real" --to wa --message "web view two" >/dev/null
