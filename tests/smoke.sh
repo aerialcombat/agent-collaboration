@@ -242,8 +242,6 @@ EOF
   [[ -f "$replay_out" ]] || fail "peer replay did not produce output file"
   assert_contains "$replay_out" "<!doctype html>"
   assert_contains "$replay_out" 'class="msg"'
-  # Verify HTML escaping: adversarial quotes/semicolons stored earlier should
-  # be present as text without breaking the document.
   python3 -c "
 import html.parser, sys
 class P(html.parser.HTMLParser):
@@ -251,6 +249,111 @@ class P(html.parser.HTMLParser):
 P().feed(open('$replay_out').read())
 print('replay HTML parses OK')
 " || fail "peer replay HTML failed to parse"
+
+  echo "-- peer-inbox: [[end]] terminates pair, peer reset revives --"
+  local pair_db="$TMP_ROOT/peer-inbox-pair.db"
+  local pair_repo="$TMP_ROOT/peer-inbox-pair"
+  mkdir -p "$pair_repo"
+  local pair_real
+  pair_real="$(cd "$pair_repo" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkA" \
+    "$agent_collab" session register --cwd "$pair_real" --label pa --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkB" \
+    "$agent_collab" session register --cwd "$pair_real" --label pb --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkA" \
+    "$agent_collab" peer send --cwd "$pair_real" --to pb --message "shutting down [[end]]" >/dev/null
+  if AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkA" \
+       "$agent_collab" peer send --cwd "$pair_real" --to pb --message "after end" >/dev/null 2>&1; then
+    fail "send after [[end]] was accepted"
+  fi
+  AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkA" \
+    "$agent_collab" peer reset --cwd "$pair_real" --to pb >/dev/null
+  AGENT_COLLAB_INBOX_DB="$pair_db" AGENT_COLLAB_SESSION_KEY="pkA" \
+    "$agent_collab" peer send --cwd "$pair_real" --to pb --message "revived" >/dev/null \
+    || fail "send after peer reset was rejected"
+
+  echo "-- peer-inbox: max-turns cap blocks further sends --"
+  local cap_db="$TMP_ROOT/peer-inbox-cap.db"
+  local cap_repo="$TMP_ROOT/peer-inbox-cap"
+  mkdir -p "$cap_repo"
+  local cap_real
+  cap_real="$(cd "$cap_repo" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$cap_db" AGENT_COLLAB_SESSION_KEY="ckA" \
+    "$agent_collab" session register --cwd "$cap_real" --label ca --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$cap_db" AGENT_COLLAB_SESSION_KEY="ckB" \
+    "$agent_collab" session register --cwd "$cap_real" --label cb --agent claude >/dev/null
+  for i in 1 2 3; do
+    AGENT_COLLAB_INBOX_DB="$cap_db" AGENT_COLLAB_SESSION_KEY="ckA" \
+      AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+      "$agent_collab" peer send --cwd "$cap_real" --to cb --message "t$i" >/dev/null
+  done
+  if AGENT_COLLAB_INBOX_DB="$cap_db" AGENT_COLLAB_SESSION_KEY="ckA" \
+       AGENT_COLLAB_MAX_PAIR_TURNS=3 \
+       "$agent_collab" peer send --cwd "$cap_real" --to cb --message "t4" >/dev/null 2>&1; then
+    fail "send past max-turns cap was accepted"
+  fi
+
+  echo "-- peer-inbox: channel pairing via process-tree walk + socket push --"
+  # Start a channel MCP server; register a session from the same subshell
+  # so process-tree walk finds the pending-channels file keyed by PPID.
+  local ch_db="$TMP_ROOT/peer-inbox-ch.db"
+  local ch_repo="$TMP_ROOT/peer-inbox-ch"
+  # macOS caps AF_UNIX socket paths at ~104 chars, so put the socket dir
+  # in a short /tmp location rather than under $TMP_ROOT (which lives
+  # under /var/folders/...).
+  local ch_sockets="/tmp/peer-inbox-smoke-$$"
+  rm -rf "$ch_sockets"
+  local ch_pending="$TMP_ROOT/peer-inbox-ch-pending"
+  local ch_stdout_log="$TMP_ROOT/peer-inbox-ch-stdout.log"
+  local ch_stderr_log="$TMP_ROOT/peer-inbox-ch-stderr.log"
+  local ch_fifo="$TMP_ROOT/peer-inbox-ch.fifo"
+  mkdir -p "$ch_repo" "$ch_sockets" "$ch_pending"
+  mkfifo "$ch_fifo"
+  local ch_real
+  ch_real="$(cd "$ch_repo" && pwd -P)"
+  (
+    exec 3<>"$ch_fifo"
+    PEER_INBOX_SOCKET_DIR="$ch_sockets" \
+    PEER_INBOX_PENDING_DIR="$ch_pending" \
+      python3 "$PROJECT_ROOT/scripts/peer-inbox-channel.py" <&3 \
+        >"$ch_stdout_log" 2>"$ch_stderr_log" &
+    local chpid=$!
+    sleep 0.3
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' >&3
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}' >&3
+    sleep 0.3
+
+    # Any pending-channels file is fine — the important check is that register
+    # finds it via process-tree walk (which works from inside this subshell).
+    if [[ -z "$(ls "$ch_pending"/*.json 2>/dev/null | head -1)" ]]; then
+      echo "FAIL: no pending file created by channel; contents:" >&2
+      ls -la "$ch_pending/" >&2 2>&1 || true
+      cat "$ch_stderr_log" >&2 || true
+      exit 1
+    fi
+
+    AGENT_COLLAB_INBOX_DB="$ch_db" AGENT_COLLAB_SESSION_KEY="chA" \
+    PEER_INBOX_PENDING_DIR="$ch_pending" \
+      "$agent_collab" session register --cwd "$ch_real" --label cha --agent claude \
+      | grep -q "channel: paired" || { echo "FAIL: channel not paired on register" >&2; kill $chpid; exit 1; }
+
+    AGENT_COLLAB_INBOX_DB="$ch_db" AGENT_COLLAB_SESSION_KEY="chB" \
+      "$agent_collab" session register --cwd "$ch_real" --label chb --agent claude >/dev/null
+
+    AGENT_COLLAB_INBOX_DB="$ch_db" AGENT_COLLAB_SESSION_KEY="chB" \
+      "$agent_collab" peer send --cwd "$ch_real" --as chb --to cha --message "channel push test" \
+      | grep -q "pushed" || { echo "FAIL: channel push did not report success" >&2; kill $chpid; exit 1; }
+    sleep 0.3
+    grep -q '"method":"notifications/claude/channel"' "$ch_stdout_log" \
+      || { echo "FAIL: channel notification not emitted" >&2; kill $chpid; exit 1; }
+    grep -q '"content":"channel push test"' "$ch_stdout_log" \
+      || { echo "FAIL: channel notification missing body" >&2; kill $chpid; exit 1; }
+
+    kill $chpid 2>/dev/null || true
+    wait $chpid 2>/dev/null || true
+    exec 3>&-
+  ) || { rm -rf "$ch_sockets" 2>/dev/null || true; fail "channel pairing/push subtest failed (see $ch_stderr_log)"; }
+  rm -rf "$ch_sockets" 2>/dev/null || true
 
   echo "peer-inbox: all checks PASS"
 }

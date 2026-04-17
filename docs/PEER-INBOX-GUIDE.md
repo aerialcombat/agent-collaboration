@@ -150,6 +150,77 @@ next turn; watching does not mark them read.
 Useful for running in a side terminal or tmux pane to see peer traffic
 flow in real time without switching into the session.
 
+### Real-time channel delivery (opt-in)
+
+By default, peer messages are delivered at the recipient's next turn via
+the `UserPromptSubmit` hook. To get **real-time push** — recipient wakes
+immediately without a user prompt — launch each session with Claude
+Code's Channels feature:
+
+```bash
+cd ~/Development/dj
+claude --dangerously-load-development-channels server:peer-inbox
+```
+
+For `server:peer-inbox` to resolve, your project's `.mcp.json` must
+contain:
+
+```json
+{
+  "mcpServers": {
+    "peer-inbox": {
+      "command": "python3",
+      "args": ["/Users/deeJ/.agent-collab/scripts/peer-inbox-channel.py"]
+    }
+  }
+}
+```
+
+When you run `agent-collab session register --label X` inside such a
+session, register walks its process tree to find Claude's
+`pending-channels/<pid>.json` and binds `(cwd, label) → socket_path` in
+the DB. The register output shows `[channel: paired]` on success.
+
+After that, `peer send` does two things on every message:
+
+1. SQLite write (unchanged — source of truth, audit trail, fallback).
+2. POSTs the message to the recipient's channel Unix socket if bound.
+
+The channel server emits an MCP notification into the recipient's live
+Claude session. No user prompt needed. Conversations self-sustain.
+
+Sessions not launched with `--dangerously-load-development-channels
+server:peer-inbox` still work — their peer sends skip the push and the
+hook path delivers at the next turn. Mixed-mode is fine.
+
+### Bounding a self-sustaining conversation
+
+Once delivery is real-time, two agents can chat until they run out of
+tokens. Two guardrails ship with the default config:
+
+- **Max turns per pair.** The `peer_pairs` table counts every `peer
+  send` between two labels in the same cwd. Default cap is **20** turns
+  total (override via `AGENT_COLLAB_MAX_PAIR_TURNS`). Past the cap,
+  `peer send` errors with a reset hint.
+- **Explicit termination token.** Any `peer send` whose body contains
+  `[[end]]` (case-insensitive) marks the pair as terminated in the DB.
+  Subsequent sends in either direction error with a reset hint.
+
+To revive a pair:
+
+```bash
+agent-collab peer reset --to <other-label>
+```
+
+Clears both the turn counter and termination flag.
+
+Conventions that tend to keep conversations bounded:
+
+- Sender phrases a question with a clear stop condition (*"answer in
+  one paragraph, include `[[end]]`"*).
+- Either side appends `[[end]]` to its final message. The DB records
+  who terminated via `terminated_by`.
+
 ### Generate an HTML transcript
 
 ```bash

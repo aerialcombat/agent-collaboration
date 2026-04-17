@@ -67,6 +67,10 @@ Usage:
                                 Emit self-contained HTML transcript of
                                 messages in the current cwd (or narrowed to
                                 a label's conversations).
+  agent-collab peer reset --to <label>
+                                Clear termination flag + turn counter for
+                                the pair (<self-label>, <label>). Use after
+                                [[end]] or after hitting the max-turns cap.
   agent-collab help
 
 Session-key discovery for peer-inbox (register and self-resolution):

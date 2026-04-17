@@ -24,7 +24,10 @@ from typing import Optional
 
 DEFAULT_DB = Path.home() / ".agent-collab" / "sessions.db"
 DEFAULT_CLAUDE_SESSION_LOG_DIR = Path.home() / ".agent-collab" / "claude-sessions-seen"
+DEFAULT_PENDING_CHANNELS_DIR = Path.home() / ".agent-collab" / "pending-channels"
 SESSIONS_DIR_REL = ".agent-collab/sessions"
+DEFAULT_MAX_PAIR_TURNS = 20
+TERMINATION_TOKEN = "[[end]]"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 VALID_AGENTS = {"claude", "codex", "gemini"}
 MAX_BODY_BYTES = 8 * 1024
@@ -246,6 +249,30 @@ def migrate_sessions_session_key(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(session_key)")
 
 
+def migrate_sessions_channel_socket(conn: sqlite3.Connection) -> None:
+    """Add channel_socket column for sessions paired with a Channels MCP plugin."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "channel_socket" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN channel_socket TEXT")
+
+
+def migrate_peer_pairs(conn: sqlite3.Connection) -> None:
+    """Create peer_pairs table for turn counting + termination tracking."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS peer_pairs (
+          cwd            TEXT NOT NULL,
+          a_label        TEXT NOT NULL,
+          b_label        TEXT NOT NULL,
+          turn_count     INTEGER NOT NULL DEFAULT 0,
+          terminated_at  TEXT,
+          terminated_by  TEXT,
+          PRIMARY KEY (cwd, a_label, b_label)
+        );
+        """
+    )
+
+
 def open_db() -> sqlite3.Connection:
     path = db_path()
     if not path.exists():
@@ -257,7 +284,158 @@ def open_db() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     migrate_sessions_session_key(conn)
+    migrate_sessions_channel_socket(conn)
+    migrate_peer_pairs(conn)
     return conn
+
+
+# ---- Channel pairing --------------------------------------------------------
+
+
+def _ppid_of(pid: int) -> int:
+    """Return the parent PID of `pid`, or 0 if unknown."""
+    proc_status = Path(f"/proc/{pid}/status")
+    if proc_status.is_file():
+        for line in proc_status.read_text().splitlines():
+            if line.startswith("PPid:"):
+                try:
+                    return int(line.split()[1])
+                except (ValueError, IndexError):
+                    return 0
+    # macOS / BSD fallback
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return int(out) if out else 0
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return 0
+
+
+def _pending_channels_dir() -> Path:
+    return Path(
+        os.environ.get("PEER_INBOX_PENDING_DIR", str(DEFAULT_PENDING_CHANNELS_DIR))
+    )
+
+
+def find_pending_channel_for_self(max_depth: int = 12) -> Optional[dict]:
+    """Walk own process tree looking for a pending channel registration.
+
+    The channel MCP server is spawned by Claude at session start and writes
+    `.../<claude-pid>.json`. Bash-tool subprocesses are descendants of
+    Claude, so walking up our own PID chain will cross Claude's PID if we
+    were invoked from inside a Claude session.
+    """
+    pending_dir = _pending_channels_dir()
+    if not pending_dir.is_dir():
+        return None
+    pid = os.getpid()
+    for _ in range(max_depth):
+        if pid <= 1:
+            break
+        candidate = pending_dir / f"{pid}.json"
+        if candidate.is_file():
+            try:
+                data = json.loads(candidate.read_text())
+            except json.JSONDecodeError:
+                return None
+            sock = data.get("socket_path")
+            if not sock or not Path(sock).exists():
+                return None
+            data["pending_file"] = str(candidate)
+            return data
+        pid = _ppid_of(pid)
+    return None
+
+
+def _send_over_unix_socket(socket_path: str, payload: dict, timeout: float = 2.0) -> tuple[int, str]:
+    """POST JSON to a peer channel's Unix socket. Returns (http_status, body)."""
+    import socket as _socket
+    body = json.dumps(payload).encode("utf-8")
+    request = (
+        "POST / HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(socket_path)
+        s.sendall(request)
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+    except (OSError, _socket.timeout) as e:
+        return 0, f"socket error: {e}"
+    head, _, resp_body = data.partition(b"\r\n\r\n")
+    try:
+        status_line = head.decode("ascii", errors="replace").split("\r\n", 1)[0]
+        code = int(status_line.split(" ", 2)[1])
+    except (IndexError, ValueError):
+        code = 0
+    return code, resp_body.decode("utf-8", errors="replace")
+
+
+# ---- Pair state helpers -----------------------------------------------------
+
+
+def _pair_key(a: str, b: str) -> tuple[str, str]:
+    """Canonicalize a pair so (backend, frontend) == (frontend, backend)."""
+    return (a, b) if a <= b else (b, a)
+
+
+def _get_pair(conn: sqlite3.Connection, cwd: str, a: str, b: str) -> Optional[sqlite3.Row]:
+    ka, kb = _pair_key(a, b)
+    return conn.execute(
+        "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
+        "WHERE cwd = ? AND a_label = ? AND b_label = ?",
+        (cwd, ka, kb),
+    ).fetchone()
+
+
+def _bump_pair(conn: sqlite3.Connection, cwd: str, a: str, b: str) -> None:
+    ka, kb = _pair_key(a, b)
+    conn.execute(
+        """
+        INSERT INTO peer_pairs (cwd, a_label, b_label, turn_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(cwd, a_label, b_label) DO UPDATE SET
+          turn_count = turn_count + 1
+        """,
+        (cwd, ka, kb),
+    )
+
+
+def _terminate_pair(
+    conn: sqlite3.Connection, cwd: str, a: str, b: str, by: str
+) -> None:
+    ka, kb = _pair_key(a, b)
+    conn.execute(
+        """
+        INSERT INTO peer_pairs (cwd, a_label, b_label, turn_count, terminated_at, terminated_by)
+        VALUES (?, ?, ?, 0, ?, ?)
+        ON CONFLICT(cwd, a_label, b_label) DO UPDATE SET
+          terminated_at = excluded.terminated_at,
+          terminated_by = excluded.terminated_by
+        """,
+        (cwd, ka, kb, now_iso(), by),
+    )
+
+
+def _max_pair_turns() -> int:
+    try:
+        return int(os.environ.get("AGENT_COLLAB_MAX_PAIR_TURNS", str(DEFAULT_MAX_PAIR_TURNS)))
+    except ValueError:
+        return DEFAULT_MAX_PAIR_TURNS
 
 
 def sessions_dir(cwd: Path) -> Path:
@@ -456,6 +634,12 @@ def cmd_session_register(args: argparse.Namespace) -> int:
             EXIT_CONFIG_ERROR,
         )
 
+    # Attempt to pair with a live channel MCP server (Claude Code spawned it
+    # at session start). Walks our process tree for a claude-pid-keyed
+    # pending-channels registration. Silently no-op if no channel live.
+    pending = find_pending_channel_for_self()
+    channel_socket = pending.get("socket_path") if pending else None
+
     conn = open_db()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -480,25 +664,27 @@ def cmd_session_register(args: argparse.Namespace) -> int:
                 )
         conn.execute(
             """
-            INSERT INTO sessions (cwd, label, agent, role, session_key, started_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, started_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cwd, label) DO UPDATE SET
               agent = excluded.agent,
               role = excluded.role,
               session_key = excluded.session_key,
+              channel_socket = excluded.channel_socket,
               started_at = excluded.started_at,
               last_seen_at = excluded.last_seen_at
             """,
-            (str(cwd), args.label, args.agent, args.role, session_key, now, now),
+            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, now, now),
         )
         conn.execute("COMMIT")
     finally:
         conn.close()
 
     write_marker(cwd, args.label, session_key)
+    channel_note = " [channel: paired]" if channel_socket else " [channel: none]"
     print(
         f"registered: {args.label} ({args.agent}, {args.role or 'peer'}) at {cwd} "
-        f"[session_key={session_key_hash(session_key)}]"
+        f"[session_key={session_key_hash(session_key)}]{channel_note}"
     )
     return EXIT_OK
 
@@ -652,7 +838,7 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     try:
         conn.execute("BEGIN IMMEDIATE")
         target = conn.execute(
-            "SELECT last_seen_at FROM sessions WHERE cwd = ? AND label = ?",
+            "SELECT last_seen_at, channel_socket FROM sessions WHERE cwd = ? AND label = ?",
             (str(to_cwd), args.to),
         ).fetchone()
         if target is None:
@@ -665,6 +851,33 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
                 f"{int(seconds_since(target['last_seen_at']))}s ago)",
                 EXIT_PEER_OFFLINE,
             )
+
+        # Conversation cap + termination guards. Same-cwd pair only — cross-cwd
+        # sends (rare) skip the pair accounting to keep it simple.
+        same_cwd_pair = str(to_cwd) == str(self_cwd)
+        if same_cwd_pair:
+            pair = _get_pair(conn, str(self_cwd), self_label, args.to)
+            if pair and pair["terminated_at"]:
+                conn.execute("ROLLBACK")
+                err(
+                    f"pair ({self_label}, {args.to}) terminated at "
+                    f"{pair['terminated_at']} by {pair['terminated_by']}; "
+                    f"run 'agent-collab peer reset --to {args.to}' to resume",
+                    EXIT_VALIDATION,
+                )
+            current = pair["turn_count"] if pair else 0
+            max_turns = _max_pair_turns()
+            if current >= max_turns:
+                conn.execute("ROLLBACK")
+                err(
+                    f"pair ({self_label}, {args.to}) reached max turns "
+                    f"({current}/{max_turns}); set AGENT_COLLAB_MAX_PAIR_TURNS "
+                    f"or run 'agent-collab peer reset --to {args.to}'",
+                    EXIT_VALIDATION,
+                )
+
+        terminates = TERMINATION_TOKEN.lower() in body.lower()
+
         now = now_iso()
         conn.execute(
             """
@@ -674,12 +887,37 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
             """,
             (str(to_cwd), args.to, str(self_cwd), self_label, body, now),
         )
+        if same_cwd_pair:
+            _bump_pair(conn, str(self_cwd), self_label, args.to)
+            if terminates:
+                _terminate_pair(conn, str(self_cwd), self_label, args.to, self_label)
         bump_last_seen(conn, str(self_cwd), self_label)
         conn.execute("COMMIT")
+
+        recipient_socket = target["channel_socket"]
     finally:
         conn.close()
 
-    print(f"sent to {args.to}")
+    # Best-effort real-time push to the recipient's channel. If no socket
+    # bound or delivery fails, the SQLite write already succeeded and the
+    # hook path will pick the message up on the recipient's next turn.
+    push_status = "no-channel"
+    if recipient_socket and Path(recipient_socket).exists():
+        code, resp = _send_over_unix_socket(
+            recipient_socket,
+            {
+                "from": self_label,
+                "body": body,
+                "meta": {"to": args.to},
+            },
+        )
+        if code == 200:
+            push_status = "pushed"
+        else:
+            push_status = f"push-failed({code})"
+
+    term_note = " [[end]]→pair terminated" if terminates and same_cwd_pair else ""
+    print(f"sent to {args.to} ({push_status}){term_note}")
     return EXIT_OK
 
 
@@ -879,6 +1117,30 @@ def cmd_session_adopt(args: argparse.Namespace) -> int:
         f"adopted: {args.label} at {cwd} "
         f"[session_key={session_key_hash(new_key)}]"
     )
+    return EXIT_OK
+
+
+def cmd_peer_reset(args: argparse.Namespace) -> int:
+    """Clear the termination flag + turn counter for a pair."""
+    validate_label(args.to)
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+    ka, kb = _pair_key(self_label, args.to)
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "DELETE FROM peer_pairs WHERE cwd = ? AND a_label = ? AND b_label = ?",
+            (str(self_cwd), ka, kb),
+        )
+        deleted = cur.rowcount
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    if deleted:
+        print(f"reset: ({self_label}, {args.to}) at {self_cwd}")
+    else:
+        print(f"note: ({self_label}, {args.to}) had no pair state at {self_cwd}")
     return EXIT_OK
 
 
@@ -1219,6 +1481,14 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--since", help="ISO-8601 UTC; skip messages older than this")
     pr.add_argument("--out", help="output path (defaults to .agent-collab/replay-<ts>.html)")
     pr.set_defaults(func=cmd_peer_replay)
+
+    prst = sub.add_parser("peer-reset")
+    prst.add_argument("--cwd")
+    prst.add_argument("--as", dest="as_label")
+    prst.add_argument("--to", required=True,
+                      help="peer label; resets turn count + termination flag "
+                           "for this pair")
+    prst.set_defaults(func=cmd_peer_reset)
 
     return p
 

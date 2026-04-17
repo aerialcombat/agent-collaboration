@@ -15,6 +15,7 @@ PEER_INBOX_HOME="$HOME/.agent-collab"
 PEER_INBOX_SCRIPTS_DIR="$PEER_INBOX_HOME/scripts"
 PEER_INBOX_HOOKS_DIR="$PEER_INBOX_HOME/hooks"
 PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
+PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
@@ -418,8 +419,9 @@ case "$MODE" in
     write_installed_file "$GEMINI_TARGET" "$gemini_block" "$gemini_rendered" "# Global Gemini Collaboration Defaults"
     write_command_file "$COMMAND_TARGET" "$PROJECT_ROOT/scripts/agent-collab"
 
-    # Peer-inbox: install python helper + hook script to stable home paths.
+    # Peer-inbox: install python helper + channel + hook script to stable home paths.
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-db.py" "$PEER_INBOX_DB_SCRIPT"
+    install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-channel.py" "$PEER_INBOX_CHANNEL_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
 
@@ -431,9 +433,10 @@ case "$MODE" in
     echo "global command:"
     echo "  $COMMAND_TARGET"
     echo "peer-inbox:"
-    echo "  helper: $PEER_INBOX_DB_SCRIPT"
-    echo "  hook:   $PEER_INBOX_HOOK_SCRIPT"
-    echo "  db:     $PEER_INBOX_HOME/sessions.db (created on first session register)"
+    echo "  helper:  $PEER_INBOX_DB_SCRIPT"
+    echo "  hook:    $PEER_INBOX_HOOK_SCRIPT"
+    echo "  channel: $PEER_INBOX_CHANNEL_SCRIPT (launch claude with --dangerously-load-development-channels server:peer-inbox)"
+    echo "  db:      $PEER_INBOX_HOME/sessions.db (created on first session register)"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
       echo "warn: $BIN_DIR is not on PATH"
     fi
@@ -445,6 +448,7 @@ case "$MODE" in
     remove_managed_command "$COMMAND_TARGET"
     remove_claude_hook "$CLAUDE_SETTINGS" "$TIMESTAMP"
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
+    remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
     # Intentional: never remove $PEER_INBOX_HOME/sessions.db — user data.
     ;;
