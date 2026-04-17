@@ -561,6 +561,47 @@ def _lookup_pair_peer_cwd(pair_key: str, label: str) -> Optional[str]:
     return row["cwd"]
 
 
+def _infer_peer_label(self_cwd: str, self_label: str, self_pair_key: Optional[str]) -> str:
+    """Return the single peer label in scope (pair or cwd), or error.
+
+    Only active/idle peers are considered. Stale rows are filtered so a
+    long-abandoned session can't steal an inferred send. Errors include
+    the list of candidates so the caller knows what to pass explicitly.
+    """
+    conn = open_db()
+    try:
+        if self_pair_key is not None:
+            rows = conn.execute(
+                "SELECT label, last_seen_at FROM sessions "
+                "WHERE pair_key = ? AND NOT (cwd = ? AND label = ?)",
+                (self_pair_key, self_cwd, self_label),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT label, last_seen_at FROM sessions "
+                "WHERE cwd = ? AND NOT (cwd = ? AND label = ?)",
+                (self_cwd, self_cwd, self_label),
+            ).fetchall()
+    finally:
+        conn.close()
+
+    live = [r["label"] for r in rows if activity_state(r["last_seen_at"]) != "stale"]
+    if len(live) == 1:
+        return live[0]
+    scope = f"pair_key={self_pair_key}" if self_pair_key else f"cwd={self_cwd}"
+    if not live:
+        err(
+            f"no live peer in {scope}; pass --to <label> or register "
+            "another session first",
+            EXIT_NOT_FOUND,
+        )
+    err(
+        f"cannot infer --to: {len(live)} live peers in {scope} "
+        f"({sorted(live)}); pass --to <label> to disambiguate",
+        EXIT_VALIDATION,
+    )
+
+
 def sessions_dir(cwd: Path) -> Path:
     return cwd / SESSIONS_DIR_REL
 
@@ -982,13 +1023,19 @@ def cmd_session_list(args: argparse.Namespace) -> int:
 def cmd_peer_send(args: argparse.Namespace) -> int:
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
+
+    self_pair_key = _get_session_pair_key(str(self_cwd), self_label)
+
+    # Auto-infer --to when there is exactly one peer in the current scope
+    # (pair if set, else cwd). Error clearly when ambiguous or empty.
+    if not args.to:
+        args.to = _infer_peer_label(str(self_cwd), self_label, self_pair_key)
     validate_label(args.to)
 
     # Resolve target cwd. Order of precedence:
     #   1. explicit --to-cwd wins (legacy cross-cwd sends).
     #   2. self has a pair_key → look up (pair_key, to_label) across cwds.
     #   3. fall back to same-cwd resolution (v1.6 behaviour).
-    self_pair_key = _get_session_pair_key(str(self_cwd), self_label)
     if args.to_cwd:
         to_cwd = resolve_cwd(args.to_cwd)
     elif self_pair_key is not None:
@@ -2251,7 +2298,8 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("peer-send")
     ps.add_argument("--cwd")
     ps.add_argument("--as", dest="as_label")
-    ps.add_argument("--to", required=True)
+    ps.add_argument("--to",
+                    help="recipient label (inferred when exactly one peer in scope)")
     ps.add_argument("--to-cwd")
     ps.add_argument("--message")
     ps.add_argument("--message-file")
