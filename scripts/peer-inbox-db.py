@@ -2363,6 +2363,31 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     pairHeader.appendChild(sub);
   }
 
+  function groupRoomMessages(messages) {
+    // Collapse rows that are the same logical send (same sender, same
+    // created_at, same body) into one card with a recipient list.
+    // Broadcasts and multicasts arrive as N inbox rows; this makes one
+    // conceptual message show as one card.
+    const groups = [];
+    let cur = null;
+    for (const m of messages) {
+      if (cur &&
+          cur.from === m.from &&
+          cur.created_at === m.created_at &&
+          cur.body === m.body) {
+        cur.recipients.push(m.to);
+        cur.ids.push(m.id);
+      } else {
+        cur = {
+          from: m.from, body: m.body, created_at: m.created_at,
+          recipients: [m.to], ids: [m.id],
+        };
+        groups.push(cur);
+      }
+    }
+    return groups;
+  }
+
   function renderStream(pairKey) {
     stream.innerHTML = '';
     const messages = state.messagesByPair[pairKey] || [];
@@ -2370,25 +2395,51 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
       stream.appendChild(el('div', 'empty', 'no messages yet'));
       return;
     }
-    let prevDay = null;
     const p = state.pairs[pairKey];
-    for (const m of messages) {
-      const day = (m.created_at || '').slice(0, 10);
+    const isRoom = state.mode === 'pair_key';
+    const groups = isRoom ? groupRoomMessages(messages)
+                          : messages.map(m => ({
+                              from: m.from, body: m.body, created_at: m.created_at,
+                              recipients: [m.to], ids: [m.id],
+                            }));
+    const roomSize = isRoom && p && p.members ? p.members.length : 0;
+
+    let prevDay = null;
+    for (const g of groups) {
+      const day = (g.created_at || '').slice(0, 10);
       if (day && day !== prevDay) {
         stream.appendChild(el('div', 'day', day));
         prevDay = day;
       }
       const wrap = el('div', 'msg');
-      wrap.dataset.id = m.id;
-      if ((m.body || '').toLowerCase().includes('[[end]]')) wrap.classList.add('end-marker');
+      wrap.dataset.id = g.ids[0];
+      if ((g.body || '').toLowerCase().includes('[[end]]')) wrap.classList.add('end-marker');
       const meta = el('div', 'meta');
-      meta.appendChild(pill(m.from || '?'));
+      meta.appendChild(pill(g.from || '?'));
       meta.appendChild(el('span', 'arrow', '→'));
-      meta.appendChild(pill(m.to || '?'));
-      meta.appendChild(el('span', 'time', m.created_at || ''));
-      meta.appendChild(el('span', 'id', '#' + m.id));
+
+      // Recipient rendering:
+      //   1 recipient           → pill(to)
+      //   everyone in room - 1  → "@room" badge
+      //   otherwise             → comma-separated pills (multicast)
+      if (g.recipients.length === 1) {
+        meta.appendChild(pill(g.recipients[0] || '?'));
+      } else if (roomSize && g.recipients.length >= roomSize - 1) {
+        const room = el('span', 'pill');
+        room.style.background = '#6cd9ff';
+        room.textContent = '@room (' + g.recipients.length + ')';
+        meta.appendChild(room);
+      } else {
+        g.recipients.forEach((r, i) => {
+          if (i > 0) meta.appendChild(el('span', 'sep', ','));
+          meta.appendChild(pill(r));
+        });
+      }
+      meta.appendChild(el('span', 'time', g.created_at || ''));
+      meta.appendChild(el('span', 'id', '#' + g.ids[0] +
+        (g.ids.length > 1 ? '+' + (g.ids.length - 1) : '')));
       wrap.appendChild(meta);
-      wrap.appendChild(el('pre', 'body', m.body || ''));
+      wrap.appendChild(el('pre', 'body', g.body || ''));
       stream.appendChild(wrap);
     }
     if (p && p.terminated_at) {
