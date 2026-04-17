@@ -19,7 +19,9 @@ PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"
+CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
 SLASH_COMMANDS=("agent-collab.md" "peer.md")
+SKILLS=("install-agent-collab")
 
 MODE="${1:-install}"
 
@@ -283,6 +285,46 @@ remove_slash_command() {
   echo "uninstalled: $target"
 }
 
+install_skill_dir() {
+  local source_dir="$1"
+  local target_dir="$2"
+  local skill_file="$source_dir/SKILL.md"
+
+  [[ -s "$skill_file" ]] || err "missing SKILL.md in $source_dir"
+
+  mkdir -p "$target_dir"
+
+  if [[ -f "$target_dir/SKILL.md" ]] && cmp -s "$skill_file" "$target_dir/SKILL.md"; then
+    echo "current: $target_dir/SKILL.md"
+    return
+  fi
+
+  if [[ -f "$target_dir/SKILL.md" ]]; then
+    cp "$target_dir/SKILL.md" "$target_dir/SKILL.md.bak.${TIMESTAMP}"
+    echo "backup: $target_dir/SKILL.md.bak.${TIMESTAMP}"
+  fi
+
+  cp "$skill_file" "$target_dir/SKILL.md"
+  echo "installed: $target_dir/SKILL.md"
+}
+
+remove_skill_dir() {
+  local target_dir="$1"
+  local skill_file="$target_dir/SKILL.md"
+
+  if [[ ! -f "$skill_file" ]]; then
+    echo "missing: $skill_file"
+    return
+  fi
+
+  cp "$skill_file" "$skill_file.bak.${TIMESTAMP}"
+  echo "backup: $skill_file.bak.${TIMESTAMP}"
+  rm -f "$skill_file"
+  # Remove the directory only if it is empty after the skill file is gone.
+  rmdir "$target_dir" 2>/dev/null || true
+  echo "uninstalled: $skill_file"
+}
+
 merge_claude_hook() {
   local settings="$1"
   local hook_command="$2"
@@ -468,6 +510,11 @@ case "$MODE" in
       install_slash_command "$PROJECT_ROOT/commands/$cmd" "$CLAUDE_COMMANDS_DIR/$cmd"
     done
 
+    # Skills: natural-language entry points ("install agent-collab").
+    for skill in "${SKILLS[@]}"; do
+      install_skill_dir "$PROJECT_ROOT/skills/$skill" "$CLAUDE_SKILLS_DIR/$skill"
+    done
+
     rm -f "$claude_rendered" "$codex_rendered" "$gemini_rendered" "$claude_block" "$codex_block" "$gemini_block"
 
     echo
@@ -484,6 +531,10 @@ case "$MODE" in
     for cmd in "${SLASH_COMMANDS[@]}"; do
       echo "  $CLAUDE_COMMANDS_DIR/$cmd"
     done
+    echo "skills:"
+    for skill in "${SKILLS[@]}"; do
+      echo "  $CLAUDE_SKILLS_DIR/$skill/SKILL.md"
+    done
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
       echo "warn: $BIN_DIR is not on PATH"
     fi
@@ -499,6 +550,9 @@ case "$MODE" in
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
     for cmd in "${SLASH_COMMANDS[@]}"; do
       remove_slash_command "$CLAUDE_COMMANDS_DIR/$cmd"
+    done
+    for skill in "${SKILLS[@]}"; do
+      remove_skill_dir "$CLAUDE_SKILLS_DIR/$skill"
     done
     # Intentional: never remove $PEER_INBOX_HOME/sessions.db — user data.
     ;;
