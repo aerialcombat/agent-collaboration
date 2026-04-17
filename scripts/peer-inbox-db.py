@@ -1120,6 +1120,271 @@ def cmd_session_adopt(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_peer_web(args: argparse.Namespace) -> int:
+    """Serve a live-updating browser view of the current cwd's messages.
+
+    Browser-side JS polls /messages.json?after=<id> every second and appends
+    new rows. Same chat-log look as peer replay; scope is caller's cwd
+    (narrow to a label's conversations with --as). Blocks until Ctrl-C.
+    """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+    import threading as _threading
+
+    cwd = resolve_cwd(args.cwd)
+    as_label = args.as_label
+    if as_label:
+        validate_label(as_label)
+    port = int(args.port)
+
+    def _fetch(after: int) -> list[sqlite3.Row]:
+        c = open_db()
+        try:
+            if as_label:
+                return c.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE id > ?
+                      AND ((to_cwd = ? AND to_label = ?) OR (from_cwd = ? AND from_label = ?))
+                    ORDER BY id ASC
+                    """,
+                    (after, str(cwd), as_label, str(cwd), as_label),
+                ).fetchall()
+            return c.execute(
+                """
+                SELECT id, from_label, to_label, body, created_at, read_at
+                FROM inbox
+                WHERE id > ? AND (to_cwd = ? OR from_cwd = ?)
+                ORDER BY id ASC
+                """,
+                (after, str(cwd), str(cwd)),
+            ).fetchall()
+        finally:
+            c.close()
+
+    scope = f"conversations involving {as_label}" if as_label else "all cross-session messages"
+    title = f"peer-inbox live — {scope} in {cwd}"
+
+    index_html = _PEER_WEB_HTML_TEMPLATE.replace("__TITLE__", html_lib.escape(title))
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path in ("/", "/index.html"):
+                body = index_html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path == "/messages.json":
+                q = parse_qs(parsed.query)
+                try:
+                    after = int(q.get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                rows = _fetch(after)
+                payload = {
+                    "cwd": str(cwd),
+                    "as_label": as_label,
+                    "messages": [
+                        {
+                            "id": r["id"],
+                            "from": r["from_label"],
+                            "to": r["to_label"],
+                            "body": r["body"],
+                            "created_at": r["created_at"],
+                            "read": r["read_at"] is not None,
+                        }
+                        for r in rows
+                    ],
+                }
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    print(f"peer-inbox live view: http://127.0.0.1:{port}  (Ctrl-C to stop)", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("(stopped)", file=sys.stderr)
+    finally:
+        server.server_close()
+    return EXIT_OK
+
+
+_PEER_WEB_HTML_TEMPLATE = """<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>__TITLE__</title>
+<style>
+  :root {
+    --bg:#0e1015; --fg:#e6e6e6; --muted:#8a8f98; --accent:#6cd9ff;
+    --panel:#181b23; --border:#262a33;
+  }
+  * { box-sizing:border-box }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--border);
+    position:sticky; top:0; background:var(--bg); z-index:1; }
+  header h1 { font-size:15px; margin:0; color:var(--fg); font-weight:500 }
+  header .sub { color:var(--muted); font-size:12px; margin-top:4px;
+    display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
+    box-shadow:0 0 8px var(--accent); animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+  main { padding:16px 24px 120px; max-width:880px }
+  .day { color:var(--muted); text-align:center; margin:24px 0 8px;
+    font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
+  .msg { margin:12px 0; padding:12px 14px; background:var(--panel);
+    border:1px solid var(--border); border-radius:8px; }
+  .msg.new { animation:flash 1.2s ease-out; }
+  @keyframes flash { 0% { background:#2a3340 } 100% { background:var(--panel) } }
+  .meta { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .pill { color:#1a1d24; padding:2px 8px; border-radius:10px;
+    font-weight:500; font-size:11px; }
+  .arrow { color:var(--muted) }
+  .time { margin-left:auto; font-family:SF Mono,Menlo,monospace; }
+  .status.unread { color:var(--accent) }
+  .status.read { color:var(--muted) }
+  .id { font-family:SF Mono,Menlo,monospace; opacity:.5 }
+  .body { margin:0; white-space:pre-wrap; word-wrap:break-word;
+    color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }
+  .empty { color:var(--muted); text-align:center; padding:40px 0; }
+  .scroll-btn { position:fixed; bottom:16px; right:24px; padding:8px 12px;
+    background:var(--panel); color:var(--fg); border:1px solid var(--border);
+    border-radius:6px; cursor:pointer; font-size:12px; display:none; }
+  .scroll-btn.show { display:block }
+</style>
+<header>
+  <h1>peer-inbox live view</h1>
+  <div class=sub>
+    <span class=dot></span>
+    <span id=scope>__TITLE__</span>
+    <span id=stats>0 messages</span>
+    <span id=last>waiting for first poll…</span>
+  </div>
+</header>
+<main id=log><div class=empty id=empty>no messages yet</div></main>
+<button class=scroll-btn id=scrollBtn>↓ new messages</button>
+<script>
+(() => {
+  const log = document.getElementById('log');
+  const empty = document.getElementById('empty');
+  const stats = document.getElementById('stats');
+  const last = document.getElementById('last');
+  const scrollBtn = document.getElementById('scrollBtn');
+  let lastId = 0;
+  let total = 0;
+  let prevDay = null;
+  let autoScroll = true;
+  const originalTitle = document.title;
+
+  function hue(label) {
+    let h = 0;
+    for (const c of label) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return h;
+  }
+  function pill(label) {
+    const h = hue(label);
+    const el = document.createElement('span');
+    el.className = 'pill';
+    el.style.background = `hsl(${h}, 55%, 86%)`;
+    el.textContent = label;
+    return el;
+  }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function render(m) {
+    const day = (m.created_at || '').slice(0, 10);
+    if (day && day !== prevDay) {
+      const d = el('div', 'day', day);
+      log.appendChild(d);
+      prevDay = day;
+    }
+    const wrap = el('div', 'msg new');
+    wrap.dataset.id = m.id;
+    const meta = el('div', 'meta');
+    meta.appendChild(pill(m.from || '?'));
+    meta.appendChild(el('span', 'arrow', '→'));
+    meta.appendChild(pill(m.to || '?'));
+    meta.appendChild(el('span', 'time', m.created_at || ''));
+    meta.appendChild(el('span', 'status ' + (m.read ? 'read' : 'unread'),
+                        m.read ? 'read' : 'unread'));
+    meta.appendChild(el('span', 'id', '#' + m.id));
+    wrap.appendChild(meta);
+    wrap.appendChild(el('pre', 'body', m.body || ''));
+    log.appendChild(wrap);
+  }
+
+  function maybeScroll() {
+    if (autoScroll) {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+      scrollBtn.classList.remove('show');
+    } else {
+      scrollBtn.classList.add('show');
+    }
+  }
+
+  window.addEventListener('scroll', () => {
+    const atBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 10;
+    autoScroll = atBottom;
+    if (atBottom) scrollBtn.classList.remove('show');
+  });
+  scrollBtn.addEventListener('click', () => {
+    autoScroll = true;
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    scrollBtn.classList.remove('show');
+  });
+
+  async function poll() {
+    try {
+      const r = await fetch('/messages.json?after=' + lastId, { cache: 'no-store' });
+      const data = await r.json();
+      if (data.messages && data.messages.length) {
+        if (empty) empty.remove();
+        for (const m of data.messages) {
+          render(m);
+          lastId = Math.max(lastId, m.id);
+          total += 1;
+        }
+        stats.textContent = total + ' message' + (total === 1 ? '' : 's');
+        document.title = (total ? '(' + total + ') ' : '') + originalTitle;
+        maybeScroll();
+      }
+      last.textContent = 'updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      last.textContent = 'poll failed: ' + e.message;
+    }
+  }
+
+  poll();
+  setInterval(poll, 1000);
+})();
+</script>
+"""
+
+
 def cmd_peer_reset(args: argparse.Namespace) -> int:
     """Clear the termination flag + turn counter for a pair."""
     validate_label(args.to)
@@ -1489,6 +1754,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="peer label; resets turn count + termination flag "
                            "for this pair")
     prst.set_defaults(func=cmd_peer_reset)
+
+    pwb = sub.add_parser("peer-web")
+    pwb.add_argument("--cwd")
+    pwb.add_argument("--as", dest="as_label",
+                     help="narrow to conversations involving this label")
+    pwb.add_argument("--port", default="8787",
+                     help="HTTP port to bind (default 8787)")
+    pwb.set_defaults(func=cmd_peer_web)
 
     return p
 

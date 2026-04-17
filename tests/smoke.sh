@@ -355,6 +355,48 @@ print('replay HTML parses OK')
   ) || { rm -rf "$ch_sockets" 2>/dev/null || true; fail "channel pairing/push subtest failed (see $ch_stderr_log)"; }
   rm -rf "$ch_sockets" 2>/dev/null || true
 
+  echo "-- peer-inbox: peer web serves index + live JSON delta --"
+  local web_db="$TMP_ROOT/peer-inbox-web.db"
+  local web_repo="$TMP_ROOT/peer-inbox-web"
+  local web_real
+  mkdir -p "$web_repo"
+  web_real="$(cd "$web_repo" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$web_db" AGENT_COLLAB_SESSION_KEY="wkA" \
+    "$agent_collab" session register --cwd "$web_real" --label wa --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$web_db" AGENT_COLLAB_SESSION_KEY="wkB" \
+    "$agent_collab" session register --cwd "$web_real" --label wb --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$web_db" AGENT_COLLAB_SESSION_KEY="wkA" \
+    "$agent_collab" peer send --cwd "$web_real" --to wb --message "web view one" >/dev/null
+
+  AGENT_COLLAB_INBOX_DB="$web_db" \
+    "$agent_collab" peer web --cwd "$web_real" --port 8798 \
+    >"$TMP_ROOT/peer-inbox-web.log" 2>&1 &
+  local web_pid=$!
+  sleep 0.4
+
+  curl -s "http://127.0.0.1:8798/" | grep -q "peer-inbox live view" \
+    || { kill $web_pid 2>/dev/null || true; fail "peer web / did not serve the index page"; }
+  curl -s "http://127.0.0.1:8798/messages.json?after=0" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['messages'], 'no messages in delta'
+assert d['messages'][0]['body'] == 'web view one', f'wrong body: {d}'
+" || { kill $web_pid 2>/dev/null || true; fail "peer web /messages.json shape wrong"; }
+
+  AGENT_COLLAB_INBOX_DB="$web_db" AGENT_COLLAB_SESSION_KEY="wkB" \
+    "$agent_collab" peer send --cwd "$web_real" --to wa --message "web view two" >/dev/null
+  curl -s "http://127.0.0.1:8798/messages.json?after=1" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert len(d['messages']) == 1, f'expected 1 delta, got {len(d[\"messages\"])}'
+assert d['messages'][0]['body'] == 'web view two'
+" || { kill $web_pid 2>/dev/null || true; fail "peer web delta poll wrong"; }
+
+  kill $web_pid 2>/dev/null || true
+  wait $web_pid 2>/dev/null || true
+
   echo "peer-inbox: all checks PASS"
 }
 

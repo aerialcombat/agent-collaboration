@@ -71,6 +71,10 @@ Usage:
                                 Clear termination flag + turn counter for
                                 the pair (<self-label>, <label>). Use after
                                 [[end]] or after hitting the max-turns cap.
+  agent-collab peer web [--as <label>] [--port 8787]
+                                Serve a live-updating browser view of the
+                                current cwd's peer messages. Blocks until
+                                Ctrl-C. Open http://127.0.0.1:8787.
   agent-collab help
 
 Session-key discovery for peer-inbox (register and self-resolution):

@@ -221,6 +221,24 @@ Conventions that tend to keep conversations bounded:
 - Either side appends `[[end]]` to its final message. The DB records
   who terminated via `terminated_by`.
 
+### Live browser view
+
+For a live, auto-updating view of cross-session traffic in your browser:
+
+```bash
+agent-collab peer web                 # serves http://127.0.0.1:8787
+agent-collab peer web --as backend    # narrow to backend's conversations
+agent-collab peer web --port 9000
+```
+
+Blocks until Ctrl-C. Open the URL in a browser; new messages append as
+they land (1-second poll). Auto-scrolls while you stay at the bottom;
+shows a "↓ new messages" button when you scroll up. Title flashes with
+an unread count so the tab is visible when backgrounded.
+
+Good for keeping a dashboard up while two other terminals run the
+actual sessions.
+
 ### Generate an HTML transcript
 
 ```bash
