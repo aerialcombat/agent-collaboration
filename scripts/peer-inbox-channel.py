@@ -62,19 +62,27 @@ MAX_BODY_BYTES = 8 * 1024
 REPLY_TOOL = {
     "name": "peer_inbox_reply",
     "description": (
-        "Send a message over the peer-inbox channel. Three modes, chosen "
-        "by the `to` argument:\n"
+        "Send a message over the peer-inbox channel. Three delivery modes "
+        "chosen by the `to` argument:\n"
         "  • omit `to`            → broadcast to every live peer in the room\n"
         "  • `to: \"alice\"`       → 1:1 direct message to one peer\n"
         "  • `to: [\"a\", \"b\"]`  → multicast to a named subset\n"
         "\n"
-        "All three count as one room turn against the shared budget. "
-        "Incoming <channel> notifications carry meta.room_size and "
-        "meta.members so you can see the full roster before choosing. "
-        "Pick the mode that matches your intent — group question, side-"
-        "bar, or private handoff. Don't default to 1:1 just because one "
-        "peer spoke last; don't default to broadcast just because you "
-        "can."
+        "Tagging: `mention: \"alice\"` or `mention: [\"a\", \"b\"]` tags a "
+        "peer as the primary responder. Works orthogonally to `to` — you "
+        "can broadcast to the room while pinging alice specifically. "
+        "`@label` tokens in `body` are auto-extracted as mentions too, so "
+        "writing '@alice what do you think?' works without the arg.\n"
+        "\n"
+        "Incoming <channel> notifications carry meta.room_size, "
+        "meta.members, meta.broadcast, meta.cohort (for multicasts), and "
+        "meta.mentions so you can see exactly what you're receiving and "
+        "who's in the room before replying. If meta.mentions includes "
+        "your label, you're the primary responder.\n"
+        "\n"
+        "All three modes count as one room turn against the shared budget. "
+        "Don't default to 1:1 just because one peer spoke last; don't "
+        "default to broadcast just because you can."
     ),
     "inputSchema": {
         "type": "object",
@@ -87,6 +95,16 @@ REPLY_TOOL = {
                 "description": (
                     "Recipient(s). Omit to broadcast, pass a string for "
                     "1:1, or pass an array of labels for multicast."
+                ),
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                ],
+            },
+            "mention": {
+                "description": (
+                    "Tag peer(s) as primary responder. Orthogonal to `to` "
+                    "— broadcast + mention = public @ping."
                 ),
                 "oneOf": [
                     {"type": "string"},
@@ -272,6 +290,7 @@ def _call_peer(
     subcmd: str,
     body: str,
     to: str | list[str] | None = None,
+    mention: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Invoke `agent-collab peer <subcmd>` as a subprocess. Returns (ok, message).
 
@@ -291,6 +310,8 @@ def _call_peer(
     elif subcmd == "broadcast" and isinstance(to, list):
         for t in to:
             cmd.extend(["--to", t])
+    for m in mention or []:
+        cmd.extend(["--mention", m])
     cmd.append("--message-stdin")
     try:
         res = subprocess.run(
@@ -326,6 +347,7 @@ def handle_tools_call(req_id, params: dict) -> None:
 
     body = arguments.get("body")
     to = arguments.get("to")
+    mention = arguments.get("mention")
     if not isinstance(body, str) or not body:
         _tool_error(req_id, "error: `body` is required and must be a non-empty string")
         return
@@ -354,6 +376,22 @@ def handle_tools_call(req_id, params: dict) -> None:
         _tool_error(req_id, "error: `to` must be a string, an array of strings, or omitted")
         return
 
+    # Normalize `mention`: None | str | list[str] → list[str] | None.
+    mention_list: list[str] | None = None
+    if mention is None:
+        pass
+    elif isinstance(mention, str):
+        if mention:
+            mention_list = [mention]
+    elif isinstance(mention, list):
+        if not all(isinstance(m, str) and m for m in mention):
+            _tool_error(req_id, "error: `mention` array must be non-empty strings")
+            return
+        mention_list = list(mention) or None
+    else:
+        _tool_error(req_id, "error: `mention` must be a string, an array, or omitted")
+        return
+
     resolved = _resolve_self_from_socket()
     if resolved is None:
         _tool_error(
@@ -365,11 +403,17 @@ def handle_tools_call(req_id, params: dict) -> None:
     self_cwd, self_label, self_pair_key = resolved
 
     if isinstance(to, str):
-        ok, msg = _call_peer(self_cwd, self_label, "send", body, to=to)
+        ok, msg = _call_peer(
+            self_cwd, self_label, "send", body, to=to, mention=mention_list,
+        )
     elif to_list is not None:
-        ok, msg = _call_peer(self_cwd, self_label, "broadcast", body, to=to_list)
+        ok, msg = _call_peer(
+            self_cwd, self_label, "broadcast", body, to=to_list, mention=mention_list,
+        )
     else:
-        ok, msg = _call_peer(self_cwd, self_label, "broadcast", body)
+        ok, msg = _call_peer(
+            self_cwd, self_label, "broadcast", body, mention=mention_list,
+        )
     reply(req_id, {
         "content": [{"type": "text", "text": msg}],
         "isError": not ok,

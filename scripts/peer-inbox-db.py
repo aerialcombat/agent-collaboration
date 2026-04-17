@@ -567,6 +567,61 @@ def _max_room_turns() -> int:
         return DEFAULT_MAX_PAIR_TURNS
 
 
+# ---- Mention helpers -------------------------------------------------------
+
+_MENTION_RE = re.compile(r"@([a-z0-9][a-z0-9_-]{0,63})")
+
+
+def _room_members(
+    self_cwd: str, self_label: str, pair_key: Optional[str]
+) -> set[str]:
+    """Return the full label roster for the sender's scope (self included)."""
+    conn = open_db()
+    try:
+        if pair_key:
+            rows = conn.execute(
+                "SELECT label FROM sessions WHERE pair_key = ?",
+                (pair_key,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT label FROM sessions WHERE cwd = ?",
+                (self_cwd,),
+            ).fetchall()
+    finally:
+        conn.close()
+    members = {r["label"] for r in rows}
+    members.add(self_label)
+    return members
+
+
+def _resolve_mentions(
+    body: str,
+    explicit: Optional[list[str]],
+    members: set[str],
+    self_label: str,
+) -> list[str]:
+    """Merge explicit --mention args with @label tokens parsed from body.
+
+    Only returns labels that are actual room members and are not the
+    sender (can't mention yourself). Sorted, de-duplicated.
+    """
+    found: set[str] = set()
+    for m in _MENTION_RE.findall(body or ""):
+        if m in members and m != self_label:
+            found.add(m)
+    for m in explicit or []:
+        if not m:
+            continue
+        validate_label(m)
+        if m == self_label:
+            continue
+        if m not in members:
+            err(f"mention target not in room: {m!r}", EXIT_NOT_FOUND)
+        found.add(m)
+    return sorted(found)
+
+
 def _get_session_pair_key(cwd: str, label: str) -> Optional[str]:
     """Return the pair_key stored for (cwd, label), or None."""
     conn = open_db()
@@ -1241,18 +1296,22 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    members = _room_members(str(self_cwd), self_label, self_pair_key)
+    mentions = _resolve_mentions(
+        body, getattr(args, "mention", None), members, self_label,
+    )
+
     # Best-effort real-time push to the recipient's channel. If no socket
     # bound or delivery fails, the SQLite write already succeeded and the
     # hook path will pick the message up on the recipient's next turn.
     push_status = "no-channel"
     if recipient_socket and Path(recipient_socket).exists():
+        push_meta: dict[str, str] = {"to": args.to}
+        if mentions:
+            push_meta["mentions"] = ",".join(mentions)
         code, resp = _send_over_unix_socket(
             recipient_socket,
-            {
-                "from": self_label,
-                "body": body,
-                "meta": {"to": args.to},
-            },
+            {"from": self_label, "body": body, "meta": push_meta},
         )
         if code == 200:
             push_status = "pushed"
@@ -1260,7 +1319,8 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
             push_status = f"push-failed({code})"
 
     term_note = " [[end]]→room terminated" if terminates else ""
-    print(f"sent to {args.to} ({push_status}){term_note}")
+    mention_note = f" @mentions[{','.join(mentions)}]" if mentions else ""
+    print(f"sent to {args.to} ({push_status}){term_note}{mention_note}")
     return EXIT_OK
 
 
@@ -1414,24 +1474,39 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
     finally:
         conn.close()
 
+    members = _room_members(str(self_cwd), self_label, self_pair_key)
+    mentions = _resolve_mentions(
+        body, getattr(args, "mention", None), members, self_label,
+    )
+    cohort_labels = (
+        ",".join(sorted(r["label"] for r in live))
+        if cohort is not None else None
+    )
+
     statuses: list[str] = []
     for r in live:
         sock = r["channel_socket"]
         status = "no-channel"
         if sock and Path(sock).exists():
+            push_meta: dict[str, str] = {
+                "to": r["label"],
+                "broadcast": "1",
+            }
+            if cohort_labels is not None:
+                push_meta["cohort"] = cohort_labels
+            if mentions:
+                push_meta["mentions"] = ",".join(mentions)
             code, _ = _send_over_unix_socket(
                 sock,
-                {
-                    "from": self_label,
-                    "body": body,
-                    "meta": {"to": r["label"], "broadcast": "1"},
-                },
+                {"from": self_label, "body": body, "meta": push_meta},
             )
             status = "pushed" if code == 200 else f"push-failed({code})"
         statuses.append(f"{r['label']} ({status})")
 
     term_note = " [[end]]→room terminated" if terminates else ""
-    print(f"broadcast to {len(live)} peer(s): {', '.join(statuses)}{term_note}")
+    mention_note = f" @mentions[{','.join(mentions)}]" if mentions else ""
+    kind = "multicast" if cohort is not None else "broadcast"
+    print(f"{kind} to {len(live)} peer(s): {', '.join(statuses)}{term_note}{mention_note}")
     return EXIT_OK
 
 
@@ -2936,6 +3011,11 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--to",
                     help="recipient label (inferred when exactly one peer in scope)")
     ps.add_argument("--to-cwd")
+    ps.add_argument(
+        "--mention", action="append", default=[],
+        help="tag a peer as primary responder; surfaces as meta.mentions in "
+             "the channel push. Body @label tokens are auto-detected.",
+    )
     ps.add_argument("--message")
     ps.add_argument("--message-file")
     ps.add_argument("--message-stdin", action="store_true")
@@ -2948,6 +3028,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--to", action="append", default=[],
         help="restrict delivery to a subset (multicast); repeat per label. "
              "omit for room-wide broadcast",
+    )
+    pb.add_argument(
+        "--mention", action="append", default=[],
+        help="tag a peer as primary responder; body @label tokens are "
+             "auto-detected.",
     )
     pb.add_argument("--message")
     pb.add_argument("--message-file")

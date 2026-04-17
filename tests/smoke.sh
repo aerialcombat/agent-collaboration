@@ -807,6 +807,60 @@ assert 'private history two' not in bodies, bodies
   kill $bl_pid 2>/dev/null || true
   wait $bl_pid 2>/dev/null || true
 
+  echo "-- peer-inbox: v2.0 @mention auto-extract + explicit + cohort --"
+  local mn_db="$TMP_ROOT/peer-inbox-mn.db"
+  local mn_a="$TMP_ROOT/peer-inbox-mn-a"
+  local mn_b="$TMP_ROOT/peer-inbox-mn-b"
+  local mn_c="$TMP_ROOT/peer-inbox-mn-c"
+  mkdir -p "$mn_a" "$mn_b" "$mn_c"
+  local mn_a_real mn_b_real mn_c_real
+  mn_a_real="$(cd "$mn_a" && pwd -P)"
+  mn_b_real="$(cd "$mn_b" && pwd -P)"
+  mn_c_real="$(cd "$mn_c" && pwd -P)"
+  local mn_out mn_key
+  mn_out=$(AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+    "$agent_collab" session register --cwd "$mn_a_real" --label alpha --agent claude --new-pair)
+  mn_key=$(printf '%s\n' "$mn_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnB \
+    "$agent_collab" session register --cwd "$mn_b_real" --label beta --agent claude --pair-key "$mn_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnC \
+    "$agent_collab" session register --cwd "$mn_c_real" --label gamma --agent claude --pair-key "$mn_key" >/dev/null
+
+  # Auto-extract @beta from body on a broadcast
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+    "$agent_collab" peer broadcast --cwd "$mn_a_real" --as alpha \
+      --message "@beta what do you think? gamma, listen in." \
+    | grep -q "@mentions\[beta\]" \
+    || fail "auto-extracted @beta mention not surfaced"
+
+  # Unknown @mentions in body must be ignored silently (not errored)
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+    "$agent_collab" peer send --cwd "$mn_a_real" --as alpha --to beta \
+      --message "ping @unknown_peer or @beta" \
+    | grep -q "@mentions\[beta\]" \
+    || fail "unknown @mention contaminated mentions list"
+
+  # Explicit --mention arg outside body
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+    "$agent_collab" peer broadcast --cwd "$mn_a_real" --as alpha \
+      --mention gamma --message "heads up, room" \
+    | grep -q "@mentions\[gamma\]" \
+    || fail "explicit --mention not surfaced"
+
+  # Explicit --mention to unknown label errors out
+  if AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+       "$agent_collab" peer broadcast --cwd "$mn_a_real" --as alpha \
+         --mention nonexistent --message "..." >/dev/null 2>&1; then
+    fail "explicit --mention to unknown label was accepted"
+  fi
+
+  # Multicast prints 'multicast' not 'broadcast'
+  AGENT_COLLAB_INBOX_DB="$mn_db" AGENT_COLLAB_SESSION_KEY=mnA \
+    "$agent_collab" peer broadcast --cwd "$mn_a_real" --as alpha \
+      --to beta --message "subset only" \
+    | grep -q "^multicast to" \
+    || fail "multicast was not labelled as multicast in output"
+
   echo "-- peer-inbox: v2.0 peer broadcast --to multicast (subset) --"
   local mc_db="$TMP_ROOT/peer-inbox-mc.db"
   local mc_a="$TMP_ROOT/peer-inbox-mc-a"
@@ -834,7 +888,7 @@ assert 'private history two' not in bodies, bodies
   AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcA \
     "$agent_collab" peer broadcast --cwd "$mc_a_real" --as alpha \
       --to beta --to gamma --message "hey subset" \
-    | grep -q "broadcast to 2 peer(s)" || fail "multicast did not report 2 recipients"
+    | grep -q "multicast to 2 peer(s)" || fail "multicast did not report 2 recipients"
 
   AGENT_COLLAB_INBOX_DB="$mc_db" AGENT_COLLAB_SESSION_KEY=mcB \
     "$agent_collab" peer receive --cwd "$mc_b_real" --as beta --format plain --mark-read \
