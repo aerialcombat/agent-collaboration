@@ -63,6 +63,11 @@ Usage:
   agent-collab session list [--all-cwds] [--include-stale] [--json]
   agent-collab peer send --to <label> [--as <label>] [--to-cwd <path>]
                          --message <text> | --message-file <path> | --message-stdin
+  agent-collab peer broadcast [--as <label>]
+                         --message <text> | --message-file <path> | --message-stdin
+                                Fan-out to every live peer in the current
+                                room (pair_key if set, else cwd). One
+                                inbox row + channel push per peer.
   agent-collab peer receive [--as <label>] [--mark-read] [--since <iso8601>]
                             [--format hook|hook-json|plain|json]
   agent-collab peer list [--as <label>] [--include-stale] [--json]

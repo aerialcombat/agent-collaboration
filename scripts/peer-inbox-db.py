@@ -1222,6 +1222,138 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_peer_broadcast(args: argparse.Namespace) -> int:
+    """Fan-out send to every live peer in the sender's scope (pair_key or cwd).
+
+    v2.0 step 2: sender-side fan-out. N unicast inbox rows + N best-effort
+    channel pushes, single DB transaction. Per-edge pair accounting mirrors
+    peer send for same-cwd recipients. Step 4 will replace per-edge caps
+    with a unified room counter.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+    self_pair_key = _get_session_pair_key(str(self_cwd), self_label)
+
+    if args.message_stdin:
+        body = sys.stdin.read()
+    elif args.message_file:
+        body = Path(args.message_file).read_text()
+    elif args.message is not None:
+        body = args.message
+    else:
+        err("one of --message, --message-file, --message-stdin required", EXIT_VALIDATION)
+
+    body_bytes = body.encode("utf-8")
+    if len(body_bytes) > MAX_BODY_BYTES:
+        err(
+            f"message too large: {len(body_bytes)} bytes > {MAX_BODY_BYTES} cap",
+            EXIT_VALIDATION,
+        )
+    if len(body_bytes) == 0:
+        err("empty message rejected", EXIT_VALIDATION)
+
+    # Resolve recipients and filter out stale sessions.
+    conn = open_db()
+    try:
+        if self_pair_key is not None:
+            rows = conn.execute(
+                "SELECT cwd, label, last_seen_at, channel_socket "
+                "FROM sessions WHERE pair_key = ? "
+                "AND NOT (cwd = ? AND label = ?)",
+                (self_pair_key, str(self_cwd), self_label),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT cwd, label, last_seen_at, channel_socket "
+                "FROM sessions WHERE cwd = ? "
+                "AND NOT (cwd = ? AND label = ?)",
+                (str(self_cwd), str(self_cwd), self_label),
+            ).fetchall()
+    finally:
+        conn.close()
+
+    live = [
+        r for r in rows
+        if seconds_since(r["last_seen_at"]) <= STALE_THRESHOLD_SECS
+    ]
+    if not live:
+        scope = f"pair_key={self_pair_key}" if self_pair_key else f"cwd={self_cwd}"
+        err(f"no live peers in {scope}", EXIT_NOT_FOUND)
+
+    terminates = TERMINATION_TOKEN.lower() in body.lower()
+    max_turns = _max_pair_turns()
+    now = now_iso()
+
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Pre-check per-edge caps for same-cwd recipients so a partial
+        # failure doesn't leave a half-delivered broadcast.
+        for r in live:
+            if r["cwd"] != str(self_cwd):
+                continue
+            pair = _get_pair(conn, str(self_cwd), self_label, r["label"])
+            if pair and pair["terminated_at"]:
+                conn.execute("ROLLBACK")
+                err(
+                    f"pair ({self_label}, {r['label']}) terminated at "
+                    f"{pair['terminated_at']} by {pair['terminated_by']}; "
+                    f"run 'agent-collab peer reset --to {r['label']}' to resume",
+                    EXIT_VALIDATION,
+                )
+            current = pair["turn_count"] if pair else 0
+            if current >= max_turns:
+                conn.execute("ROLLBACK")
+                err(
+                    f"pair ({self_label}, {r['label']}) reached max turns "
+                    f"({current}/{max_turns}); set AGENT_COLLAB_MAX_PAIR_TURNS "
+                    f"or run 'agent-collab peer reset --to {r['label']}'",
+                    EXIT_VALIDATION,
+                )
+
+        for r in live:
+            conn.execute(
+                """
+                INSERT INTO inbox
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (r["cwd"], r["label"], str(self_cwd), self_label, body, now),
+            )
+            if r["cwd"] == str(self_cwd):
+                _bump_pair(conn, str(self_cwd), self_label, r["label"])
+                if terminates:
+                    _terminate_pair(
+                        conn, str(self_cwd), self_label, r["label"], self_label
+                    )
+
+        bump_last_seen(conn, str(self_cwd), self_label)
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    statuses: list[str] = []
+    for r in live:
+        sock = r["channel_socket"]
+        status = "no-channel"
+        if sock and Path(sock).exists():
+            code, _ = _send_over_unix_socket(
+                sock,
+                {
+                    "from": self_label,
+                    "body": body,
+                    "meta": {"to": r["label"], "broadcast": "1"},
+                },
+            )
+            status = "pushed" if code == 200 else f"push-failed({code})"
+        statuses.append(f"{r['label']} ({status})")
+
+    term_note = " [[end]]→same-cwd pairs terminated" if terminates else ""
+    print(f"broadcast to {len(live)} peer(s): {', '.join(statuses)}{term_note}")
+    return EXIT_OK
+
+
 def format_hook_block(rows: list[sqlite3.Row]) -> str:
     """Compose the <peer-inbox>...</peer-inbox> block, capped at HOOK_BLOCK_BUDGET."""
     if not rows:
@@ -2479,6 +2611,14 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--message-file")
     ps.add_argument("--message-stdin", action="store_true")
     ps.set_defaults(func=cmd_peer_send)
+
+    pb = sub.add_parser("peer-broadcast")
+    pb.add_argument("--cwd")
+    pb.add_argument("--as", dest="as_label")
+    pb.add_argument("--message")
+    pb.add_argument("--message-file")
+    pb.add_argument("--message-stdin", action="store_true")
+    pb.set_defaults(func=cmd_peer_broadcast)
 
     pr = sub.add_parser("peer-receive")
     pr.add_argument("--cwd")

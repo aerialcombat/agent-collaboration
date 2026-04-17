@@ -29,7 +29,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -58,7 +57,6 @@ DB_PATH = Path(os.environ.get(
     "AGENT_COLLAB_INBOX_DB",
     str(Path.home() / ".agent-collab" / "sessions.db"),
 ))
-STALE_THRESHOLD_SECS = 30 * 60
 MAX_BODY_BYTES = 8 * 1024
 
 REPLY_TOOL = {
@@ -209,55 +207,24 @@ def _resolve_self_from_socket() -> tuple[str, str, str | None] | None:
     return row["cwd"], row["label"], row["pair_key"]
 
 
-def _find_live_peers(
-    self_cwd: str, self_label: str, self_pair_key: str | None
-) -> list[str]:
-    """Return labels of non-stale peers in scope (pair_key or cwd), minus self."""
-    try:
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
-        try:
-            if self_pair_key:
-                rows = conn.execute(
-                    "SELECT label, last_seen_at FROM sessions "
-                    "WHERE pair_key = ? AND NOT (cwd = ? AND label = ?)",
-                    (self_pair_key, self_cwd, self_label),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT label, last_seen_at FROM sessions "
-                    "WHERE cwd = ? AND NOT (cwd = ? AND label = ?)",
-                    (self_cwd, self_cwd, self_label),
-                ).fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error as e:
-        stderr(f"[peer-inbox-channel] sqlite error in peers: {e}")
-        return []
-    live: list[str] = []
-    now = datetime.now(timezone.utc)
-    for r in rows:
-        try:
-            ts = datetime.strptime(
-                r["last_seen_at"], "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            continue
-        if (now - ts).total_seconds() <= STALE_THRESHOLD_SECS:
-            live.append(r["label"])
-    return live
+def _call_peer(
+    self_cwd: str, self_label: str, subcmd: str, body: str, to: str | None = None
+) -> tuple[bool, str]:
+    """Invoke `agent-collab peer <subcmd>` as a subprocess. Returns (ok, message).
 
-
-def _send_one(self_cwd: str, self_label: str, to: str, body: str) -> tuple[bool, str]:
-    """Invoke `agent-collab peer send` as a subprocess. Returns (ok, message)."""
+    `subcmd` is "send" (requires `to`) or "broadcast" (ignores `to`).
+    """
     cmd = [
         _agent_collab_bin(),
-        "peer", "send",
+        "peer", subcmd,
         "--as", self_label,
         "--cwd", self_cwd,
-        "--to", to,
-        "--message-stdin",
     ]
+    if subcmd == "send":
+        if to is None:
+            return False, "peer send requires `to`"
+        cmd.extend(["--to", to])
+    cmd.append("--message-stdin")
     try:
         res = subprocess.run(
             cmd, input=body, text=True, capture_output=True, timeout=10,
@@ -265,9 +232,9 @@ def _send_one(self_cwd: str, self_label: str, to: str, body: str) -> tuple[bool,
     except (subprocess.TimeoutExpired, OSError) as e:
         return False, f"subprocess error: {e}"
     if res.returncode == 0:
-        return True, (res.stdout.strip() or f"sent to {to}")
+        return True, (res.stdout.strip() or f"peer {subcmd} ok")
     stderr_text = (res.stderr or res.stdout).strip()
-    return False, stderr_text or f"peer send exit {res.returncode}"
+    return False, stderr_text or f"peer {subcmd} exit {res.returncode}"
 
 
 def _tool_error(req_id, text: str) -> None:
@@ -314,32 +281,12 @@ def handle_tools_call(req_id, params: dict) -> None:
     self_cwd, self_label, self_pair_key = resolved
 
     if to:
-        ok, msg = _send_one(self_cwd, self_label, to, body)
-        reply(req_id, {
-            "content": [{"type": "text", "text": msg}],
-            "isError": not ok,
-        })
-        return
-
-    peers = _find_live_peers(self_cwd, self_label, self_pair_key)
-    if not peers:
-        scope = f"pair_key={self_pair_key}" if self_pair_key else f"cwd={self_cwd}"
-        _tool_error(
-            req_id,
-            f"error: no live peers in {scope}; specify `to` or wait for a peer to register.",
-        )
-        return
-
-    results: list[str] = []
-    any_fail = False
-    for peer in peers:
-        ok, msg = _send_one(self_cwd, self_label, peer, body)
-        results.append(f"{peer}: {msg}")
-        if not ok:
-            any_fail = True
+        ok, msg = _call_peer(self_cwd, self_label, "send", body, to=to)
+    else:
+        ok, msg = _call_peer(self_cwd, self_label, "broadcast", body)
     reply(req_id, {
-        "content": [{"type": "text", "text": "\n".join(results)}],
-        "isError": any_fail,
+        "content": [{"type": "text", "text": msg}],
+        "isError": not ok,
     })
 
 

@@ -611,6 +611,69 @@ PY
     "$agent_collab" peer receive --cwd "$xr_real" --format plain --mark-read \
     | grep -q "codex->claude" || fail "codex->claude message did not reach claude session via CLAUDE_SESSION_ID"
 
+  echo "-- peer-inbox: v2.0 peer broadcast fan-out (3-way room) --"
+  local bc_db="$TMP_ROOT/peer-inbox-bc.db"
+  local bc_a="$TMP_ROOT/peer-inbox-bc-a"
+  local bc_b="$TMP_ROOT/peer-inbox-bc-b"
+  local bc_c="$TMP_ROOT/peer-inbox-bc-c"
+  mkdir -p "$bc_a" "$bc_b" "$bc_c"
+  local bc_a_real bc_b_real bc_c_real
+  bc_a_real="$(cd "$bc_a" && pwd -P)"
+  bc_b_real="$(cd "$bc_b" && pwd -P)"
+  bc_c_real="$(cd "$bc_c" && pwd -P)"
+  local bc_out bc_key
+  bc_out=$(AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcA \
+    "$agent_collab" session register --cwd "$bc_a_real" --label alpha --agent claude --new-pair)
+  bc_key=$(printf '%s\n' "$bc_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  [[ -n "$bc_key" ]] || fail "3-way broadcast: --new-pair did not emit pair_key"
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcB \
+    "$agent_collab" session register --cwd "$bc_b_real" --label beta --agent codex --pair-key "$bc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcC \
+    "$agent_collab" session register --cwd "$bc_c_real" --label gamma --agent gemini --pair-key "$bc_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcA \
+    "$agent_collab" peer broadcast --cwd "$bc_a_real" --as alpha --message "hello room" \
+    | grep -q "broadcast to 2 peer(s)" || fail "broadcast did not report 2 recipients"
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcB \
+    "$agent_collab" peer receive --cwd "$bc_b_real" --as beta --format plain --mark-read \
+    | grep -q "hello room" || fail "broadcast did not reach beta"
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcC \
+    "$agent_collab" peer receive --cwd "$bc_c_real" --as gamma --format plain --mark-read \
+    | grep -q "hello room" || fail "broadcast did not reach gamma"
+
+  echo "-- peer-inbox: v2.0 peer broadcast 4-way stress --"
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcD \
+    "$agent_collab" session register --cwd "$TMP_ROOT/peer-inbox-bc-d" --label delta --agent claude --pair-key "$bc_key" >/dev/null 2>&1 \
+    || { mkdir -p "$TMP_ROOT/peer-inbox-bc-d"; AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcD \
+         "$agent_collab" session register --cwd "$TMP_ROOT/peer-inbox-bc-d" --label delta --agent claude --pair-key "$bc_key" >/dev/null; }
+  AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY=bcA \
+    "$agent_collab" peer broadcast --cwd "$bc_a_real" --as alpha --message "4-way hello" \
+    | grep -q "broadcast to 3 peer(s)" || fail "4-way broadcast did not report 3 recipients"
+  for label in beta gamma delta; do
+    local key_var
+    case "$label" in beta) key_var=bcB;; gamma) key_var=bcC;; delta) key_var=bcD;; esac
+    local cwd_var
+    case "$label" in
+      beta) cwd_var="$bc_b_real";;
+      gamma) cwd_var="$bc_c_real";;
+      delta) cwd_var="$TMP_ROOT/peer-inbox-bc-d";;
+    esac
+    AGENT_COLLAB_INBOX_DB="$bc_db" AGENT_COLLAB_SESSION_KEY="$key_var" \
+      "$agent_collab" peer receive --cwd "$cwd_var" --as "$label" --format plain --mark-read \
+      | grep -q "4-way hello" || fail "4-way broadcast did not reach $label"
+  done
+
+  echo "-- peer-inbox: v2.0 peer broadcast errors when no peers --"
+  local solo_db="$TMP_ROOT/peer-inbox-bc-solo.db"
+  local solo_repo="$TMP_ROOT/peer-inbox-bc-solo"
+  mkdir -p "$solo_repo"
+  local solo_real; solo_real="$(cd "$solo_repo" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$solo_db" AGENT_COLLAB_SESSION_KEY=soloA \
+    "$agent_collab" session register --cwd "$solo_real" --label solo --agent claude >/dev/null
+  if AGENT_COLLAB_INBOX_DB="$solo_db" AGENT_COLLAB_SESSION_KEY=soloA \
+       "$agent_collab" peer broadcast --cwd "$solo_real" --as solo --message "nobody home" >/dev/null 2>&1; then
+    fail "broadcast with no peers should error"
+  fi
+
   echo "peer-inbox: all checks PASS"
 }
 
