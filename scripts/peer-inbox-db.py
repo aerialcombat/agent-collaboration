@@ -1559,16 +1559,16 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
     Scope modes (mutually exclusive):
       - default: current cwd. Shows pairs whose messages stayed within cwd.
       - --pair-key KEY: v1.7 pair key. Shows the cross-cwd conversation
-        between the two (or more) labels that joined that pair key.
-
-    Sidebar lists every pair (canonical a_label < b_label) grouped by
-    activity (active / idle / stale / terminated); clicking a pair shows
-    its message stream in the main pane. Both panes auto-poll at 1s.
+        between every label that joined that pair key as a single room
+        with interleaved messages (v2.0 step 3).
 
     Endpoints:
       GET /                                  → SPA HTML
-      GET /pairs.json                        → pair list + metadata
-      GET /messages.json?pair=a+b&after=N    → messages for one pair
+      GET /scope.json                        → {"mode": "cwd"|"pair_key", ...}
+      GET /pairs.json                        → cwd-mode edge pair list
+      GET /rooms.json                        → pair-key-mode room summary
+      GET /messages.json?pair=a+b&after=N    → one edge pair's stream
+      GET /messages.json?pair_key=K&after=N  → the room's interleaved stream
       GET /messages.json?after=N             → all scoped messages (back-compat)
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1729,6 +1729,87 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         finally:
             c.close()
 
+    def _fetch_rooms() -> list[dict]:
+        """Return one room entry per pair_key. Pair-key mode only.
+
+        A room aggregates every session that joined the pair_key regardless
+        of cwd. The single-process web server is always scoped to one
+        pair_key today, so this list has exactly one entry; the shape is
+        a list to leave room for multi-room dashboards.
+        """
+        if not pair_key:
+            return []
+        c = open_db()
+        try:
+            member_labels = sorted({lbl for (_, lbl) in pair_members})
+            if not member_labels:
+                return []
+            q_marks = ",".join("?" for _ in member_labels)
+            stats = c.execute(
+                f"""
+                SELECT
+                  MAX(id)         AS last_id,
+                  MAX(created_at) AS last_at,
+                  COUNT(*)        AS total,
+                  SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread
+                FROM inbox
+                WHERE from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                """,
+                member_labels + member_labels,
+            ).fetchone()
+
+            members: list[dict] = []
+            best_activity = "unknown"
+            order = {"unknown": -1, "stale": 0, "idle": 1, "active": 2}
+            for lbl in member_labels:
+                s = c.execute(
+                    "SELECT cwd, last_seen_at, agent, role, channel_socket "
+                    "FROM sessions WHERE pair_key = ? AND label = ?",
+                    (pair_key, lbl),
+                ).fetchone()
+                if s is None:
+                    info = {
+                        "label": lbl, "cwd": None, "agent": None,
+                        "role": None, "activity": "unknown",
+                        "last_seen_at": None, "channel": False,
+                    }
+                else:
+                    act = activity_state(s["last_seen_at"])
+                    info = {
+                        "label": lbl,
+                        "cwd": s["cwd"],
+                        "agent": s["agent"],
+                        "role": s["role"],
+                        "activity": act,
+                        "last_seen_at": s["last_seen_at"],
+                        "channel": s["channel_socket"] is not None,
+                    }
+                    if order.get(act, -1) > order.get(best_activity, -1):
+                        best_activity = act
+                members.append(info)
+
+            total = stats["total"] or 0 if stats else 0
+            last_id = stats["last_id"] or 0 if stats else 0
+            last_at = stats["last_at"] if stats else None
+
+            return [{
+                "pair_key": pair_key,
+                "key": pair_key,
+                "activity": best_activity if members else "unknown",
+                "total": total,
+                "last_id": last_id,
+                "last_at": last_at,
+                # Step 4 will populate these from peer_rooms. Until then
+                # the edge peer_pairs table is cwd-keyed and can't give a
+                # meaningful room-level turn count.
+                "turn_count": 0,
+                "terminated_at": None,
+                "terminated_by": None,
+                "members": members,
+            }]
+        finally:
+            c.close()
+
     def _fetch_messages(after: int, pair: Optional[tuple[str, str]]) -> list[sqlite3.Row]:
         c = open_db()
         try:
@@ -1833,8 +1914,29 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
                 self.wfile.write(body)
                 return
 
+            if parsed.path == "/scope.json":
+                _send_json(self, 200, {
+                    "mode": "pair_key" if pair_key else "cwd",
+                    "cwd": str(cwd),
+                    "pair_key": pair_key,
+                    "as_label": as_label,
+                })
+                return
+
             if parsed.path == "/pairs.json":
                 _send_json(self, 200, {"cwd": str(cwd), "pairs": _fetch_pairs()})
+                return
+
+            if parsed.path == "/rooms.json":
+                if not pair_key:
+                    _send_json(self, 400, {
+                        "error": "rooms.json only available in --pair-key mode",
+                    })
+                    return
+                _send_json(self, 200, {
+                    "pair_key": pair_key,
+                    "rooms": _fetch_rooms(),
+                })
                 return
 
             if parsed.path == "/messages.json":
@@ -1846,10 +1948,17 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
                 # Accept two styles for back-compat:
                 # 1. ?a=X&b=Y (preferred; avoids + → space URL-decode trap).
                 # 2. ?pair=X+Y or ?pair=X:Y (for hand-crafted curls).
+                # 3. ?pair_key=KEY selects the whole room (pair-key mode only).
                 a_arg = q.get("a", [None])[0]
                 b_arg = q.get("b", [None])[0]
                 pair_arg = q.get("pair", [None])[0]
+                pk_arg = q.get("pair_key", [None])[0]
                 pair: Optional[tuple[str, str]] = None
+                if pk_arg and pair_key and pk_arg != pair_key:
+                    _send_json(self, 400, {
+                        "error": f"pair_key {pk_arg!r} does not match server scope {pair_key!r}",
+                    })
+                    return
                 if a_arg and b_arg:
                     pair = _canonical_pair(a_arg, b_arg)
                 elif pair_arg:
@@ -1864,6 +1973,7 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
                     200,
                     {
                         "cwd": str(cwd),
+                        "pair_key": pair_key,
                         "pair": f"{pair[0]}+{pair[1]}" if pair else None,
                         "messages": [
                             {
@@ -2024,7 +2134,9 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
   const scrollBtn = document.getElementById('scrollBtn');
 
   const state = {
-    pairs: {},                // key -> metadata
+    mode: null,               // 'cwd' | 'pair_key'
+    pairKey: null,            // scope pair_key in pair_key mode
+    pairs: {},                // key -> metadata (edge pair in cwd mode, room in pair_key mode)
     selectedKey: null,
     messagesByPair: {},       // key -> [messages]
     lastIdByPair: {},         // key -> highest seen id
@@ -2053,19 +2165,20 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
   }
 
   function renderSidebar() {
-    const pairs = Object.values(state.pairs);
+    const items = Object.values(state.pairs);
     const byActivity = { active: [], idle: [], stale: [], terminated: [], unknown: [] };
-    for (const p of pairs) (byActivity[p.activity] || byActivity.unknown).push(p);
+    for (const p of items) (byActivity[p.activity] || byActivity.unknown).push(p);
 
     const order = ['active', 'idle', 'stale', 'terminated'];
     sidebar.innerHTML = '';
     let anyShown = false;
+    const sectionTitle = state.mode === 'pair_key' ? 'room' : null;
     for (const section of order) {
-      const items = byActivity[section] || [];
-      if (!items.length) continue;
+      const group = byActivity[section] || [];
+      if (!group.length) continue;
       anyShown = true;
-      sidebar.appendChild(el('div', 'section-label', section));
-      for (const p of items) {
+      sidebar.appendChild(el('div', 'section-label', sectionTitle || section));
+      for (const p of group) {
         const item = document.createElement('a');
         item.className = 'pair-item';
         item.classList.toggle('selected', p.key === state.selectedKey);
@@ -2075,9 +2188,17 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
         item.href = '#' + p.key;
 
         const labels = el('div', 'labels');
-        labels.appendChild(pill(p.a));
-        labels.appendChild(el('span', 'sep', '↔'));
-        labels.appendChild(pill(p.b));
+        if (state.mode === 'pair_key') {
+          const members = p.members || [];
+          members.forEach((m, i) => {
+            if (i > 0) labels.appendChild(el('span', 'sep', '·'));
+            labels.appendChild(pill(m.label));
+          });
+        } else {
+          labels.appendChild(pill(p.a));
+          labels.appendChild(el('span', 'sep', '↔'));
+          labels.appendChild(pill(p.b));
+        }
         const badge = el('span', 'unread-badge', unread > 99 ? '99+' : String(unread));
         labels.appendChild(badge);
         item.appendChild(labels);
@@ -2085,7 +2206,10 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
         const metaRow = el('div', 'meta-row');
         const dot = el('span', 'activity-dot ' + (p.activity || 'unknown'));
         metaRow.appendChild(dot);
-        metaRow.appendChild(el('span', '', p.total + ' msg · ' + p.turn_count + ' turns'));
+        const turnLabel = state.mode === 'pair_key'
+          ? p.total + ' msg'
+          : p.total + ' msg · ' + p.turn_count + ' turns';
+        metaRow.appendChild(el('span', '', turnLabel));
         item.appendChild(metaRow);
 
         item.addEventListener('click', (ev) => {
@@ -2096,39 +2220,61 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
       }
     }
     if (!anyShown) {
-      sidebar.appendChild(el('div', 'empty', 'no pairs yet'));
+      sidebar.appendChild(el('div', 'empty',
+        state.mode === 'pair_key' ? 'no room members yet' : 'no pairs yet'));
     }
   }
 
   function renderPairHeader(p) {
     pairHeader.innerHTML = '';
     if (!p) {
-      pairHeader.appendChild(el('h2', '', 'select a pair'));
-      pairHeader.appendChild(el('div', 'sub', 'from the sidebar →'));
+      pairHeader.appendChild(el('h2', '',
+        state.mode === 'pair_key' ? 'loading room…' : 'select a pair'));
+      pairHeader.appendChild(el('div', 'sub',
+        state.mode === 'pair_key' ? '' : 'from the sidebar →'));
       return;
     }
     const h = document.createElement('h2');
-    h.appendChild(pill(p.a));
-    h.appendChild(el('span', 'arrow', '↔'));
-    h.appendChild(pill(p.b));
+    if (state.mode === 'pair_key') {
+      const members = p.members || [];
+      members.forEach((m, i) => {
+        if (i > 0) h.appendChild(el('span', 'arrow', '·'));
+        h.appendChild(pill(m.label));
+      });
+    } else {
+      h.appendChild(pill(p.a));
+      h.appendChild(el('span', 'arrow', '↔'));
+      h.appendChild(pill(p.b));
+    }
     pairHeader.appendChild(h);
 
     const sub = el('div', 'sub');
     const ad = el('span', 'activity-dot ' + (p.activity || 'unknown'));
     sub.appendChild(ad);
-    sub.appendChild(el('span', '',
-      `${p.activity} · ${p.total} messages · ${p.turn_count} turns`));
+    const summary = state.mode === 'pair_key'
+      ? `${p.activity} · ${p.total} messages`
+      : `${p.activity} · ${p.total} messages · ${p.turn_count} turns`;
+    sub.appendChild(el('span', '', summary));
     if (p.terminated_at) {
       sub.appendChild(el('span', '',
         `· ended by ${p.terminated_by} at ${p.terminated_at}`));
     }
-    for (const who of [p.a, p.b]) {
-      const info = p.peers && p.peers[who];
-      if (info) {
-        const tag = el('span', '', who + ': ' + (info.agent || '?') +
-          (info.channel ? ' · channel' : '') +
-          (info.role ? ' · ' + info.role : ''));
+    if (state.mode === 'pair_key') {
+      for (const m of p.members || []) {
+        const tag = el('span', '', m.label + ': ' + (m.agent || '?') +
+          (m.channel ? ' · channel' : '') +
+          (m.role ? ' · ' + m.role : ''));
         sub.appendChild(tag);
+      }
+    } else {
+      for (const who of [p.a, p.b]) {
+        const info = p.peers && p.peers[who];
+        if (info) {
+          const tag = el('span', '', who + ': ' + (info.agent || '?') +
+            (info.channel ? ' · channel' : '') +
+            (info.role ? ' · ' + info.role : ''));
+          sub.appendChild(tag);
+        }
       }
     }
     pairHeader.appendChild(sub);
@@ -2182,13 +2328,26 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
   }
 
+  async function fetchScope() {
+    try {
+      const r = await fetch('/scope.json', { cache: 'no-store' });
+      const data = await r.json();
+      state.mode = data.mode;
+      state.pairKey = data.pair_key;
+    } catch (e) {
+      state.mode = 'cwd';  // best-effort fallback; server may be older
+    }
+  }
+
   async function fetchPairs() {
     try {
-      const r = await fetch('/pairs.json', { cache: 'no-store' });
+      const url = state.mode === 'pair_key' ? '/rooms.json' : '/pairs.json';
+      const listKey = state.mode === 'pair_key' ? 'rooms' : 'pairs';
+      const r = await fetch(url, { cache: 'no-store' });
       const data = await r.json();
       const pairs = {};
       let totalUnread = 0;
-      for (const p of data.pairs || []) {
+      for (const p of data[listKey] || []) {
         pairs[p.key] = p;
         const unread = Math.max(0, p.last_id - (state.lastSeenIdByPair[p.key] || 0));
         if (p.key !== state.selectedKey) totalUnread += unread;
@@ -2198,9 +2357,15 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
       if (state.selectedKey && pairs[state.selectedKey]) {
         renderPairHeader(pairs[state.selectedKey]);
       }
+      // Pair-key mode auto-selects the single room so the user lands on
+      // the stream without a click.
+      if (state.mode === 'pair_key' && !state.selectedKey) {
+        const only = Object.keys(pairs)[0];
+        if (only) selectPair(only);
+      }
       document.title = (totalUnread ? '(' + totalUnread + ') ' : '') + originalTitle;
     } catch (e) {
-      console.warn('pairs poll failed', e);
+      console.warn('scope poll failed', e);
     }
   }
 
@@ -2210,10 +2375,17 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
                   (state.lastIdByPair[pairKey] || 0);
     const p = state.pairs[pairKey];
     if (!p) return;
+    let url;
+    if (state.mode === 'pair_key') {
+      url = '/messages.json?pair_key=' + encodeURIComponent(p.pair_key) +
+            '&after=' + since;
+    } else {
+      url = '/messages.json?a=' + encodeURIComponent(p.a) +
+            '&b=' + encodeURIComponent(p.b) +
+            '&after=' + since;
+    }
     try {
-      const r = await fetch('/messages.json?a=' + encodeURIComponent(p.a) +
-                            '&b=' + encodeURIComponent(p.b) +
-                            '&after=' + since, { cache: 'no-store' });
+      const r = await fetch(url, { cache: 'no-store' });
       const data = await r.json();
       if (!(data.messages && data.messages.length)) return;
       const arr = state.messagesByPair[pairKey] || [];
@@ -2259,7 +2431,7 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
   // Support deep-link #a+b to preselect
   const initialHash = (location.hash || '').replace(/^#/, '');
 
-  tick().then(() => {
+  fetchScope().then(() => tick()).then(() => {
     if (initialHash && state.pairs[initialHash]) {
       selectPair(initialHash);
     }

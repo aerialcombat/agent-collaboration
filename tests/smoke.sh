@@ -662,6 +662,83 @@ PY
       | grep -q "4-way hello" || fail "4-way broadcast did not reach $label"
   done
 
+  echo "-- peer-inbox: v2.0 peer web unified room view (--pair-key) --"
+  local rw_db="$TMP_ROOT/peer-inbox-rooms.db"
+  local rw_a="$TMP_ROOT/peer-inbox-rw-a"
+  local rw_b="$TMP_ROOT/peer-inbox-rw-b"
+  local rw_c="$TMP_ROOT/peer-inbox-rw-c"
+  mkdir -p "$rw_a" "$rw_b" "$rw_c"
+  local rw_a_real rw_b_real rw_c_real
+  rw_a_real="$(cd "$rw_a" && pwd -P)"
+  rw_b_real="$(cd "$rw_b" && pwd -P)"
+  rw_c_real="$(cd "$rw_c" && pwd -P)"
+  local rw_out rw_key
+  rw_out=$(AGENT_COLLAB_INBOX_DB="$rw_db" AGENT_COLLAB_SESSION_KEY=rwA \
+    "$agent_collab" session register --cwd "$rw_a_real" --label alpha --agent claude --new-pair)
+  rw_key=$(printf '%s\n' "$rw_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$rw_db" AGENT_COLLAB_SESSION_KEY=rwB \
+    "$agent_collab" session register --cwd "$rw_b_real" --label beta --agent codex --pair-key "$rw_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rw_db" AGENT_COLLAB_SESSION_KEY=rwC \
+    "$agent_collab" session register --cwd "$rw_c_real" --label gamma --agent gemini --pair-key "$rw_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rw_db" AGENT_COLLAB_SESSION_KEY=rwA \
+    "$agent_collab" peer broadcast --cwd "$rw_a_real" --as alpha --message "one" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$rw_db" AGENT_COLLAB_SESSION_KEY=rwB \
+    "$agent_collab" peer send --cwd "$rw_b_real" --as beta --to alpha --message "two" >/dev/null
+
+  AGENT_COLLAB_INBOX_DB="$rw_db" \
+    "$agent_collab" peer web --cwd "$rw_a_real" --pair-key "$rw_key" --port 8799 \
+    >"$TMP_ROOT/peer-inbox-rooms.log" 2>&1 &
+  local rw_pid=$!
+  sleep 0.4
+
+  curl -s "http://127.0.0.1:8799/scope.json" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['mode'] == 'pair_key', d
+assert d['pair_key'] == '$rw_key', d
+" || { kill $rw_pid 2>/dev/null || true; fail "/scope.json shape wrong"; }
+
+  curl -s "http://127.0.0.1:8799/rooms.json" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['pair_key'] == '$rw_key'
+assert len(d['rooms']) == 1, d
+r = d['rooms'][0]
+assert r['key'] == '$rw_key'
+labels = sorted(m['label'] for m in r['members'])
+assert labels == ['alpha', 'beta', 'gamma'], labels
+assert r['total'] >= 3, r
+" || { kill $rw_pid 2>/dev/null || true; fail "/rooms.json shape wrong"; }
+
+  curl -s "http://127.0.0.1:8799/messages.json?pair_key=$rw_key&after=0" \
+    | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['pair_key'] == '$rw_key'
+bodies = [m['body'] for m in d['messages']]
+assert 'one' in bodies and 'two' in bodies, bodies
+" || { kill $rw_pid 2>/dev/null || true; fail "/messages.json?pair_key interleave wrong"; }
+
+  # Mismatched pair_key must 400.
+  local rw_err
+  rw_err=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8799/messages.json?pair_key=bogus-key")
+  [[ "$rw_err" == "400" ]] || { kill $rw_pid 2>/dev/null || true; fail "mismatched pair_key did not 400 (got $rw_err)"; }
+
+  # rooms.json must 400 in cwd-only mode.
+  AGENT_COLLAB_INBOX_DB="$web_db" \
+    "$agent_collab" peer web --cwd "$web_real" --port 8800 \
+    >"$TMP_ROOT/peer-inbox-rooms-cwd.log" 2>&1 &
+  local rw_cwd_pid=$!
+  sleep 0.3
+  local rw_cwd_err
+  rw_cwd_err=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8800/rooms.json")
+  [[ "$rw_cwd_err" == "400" ]] || { kill $rw_pid $rw_cwd_pid 2>/dev/null || true; fail "/rooms.json in cwd mode should 400 (got $rw_cwd_err)"; }
+
+  kill $rw_pid $rw_cwd_pid 2>/dev/null || true
+  wait $rw_pid $rw_cwd_pid 2>/dev/null || true
+
   echo "-- peer-inbox: v2.0 peer broadcast errors when no peers --"
   local solo_db="$TMP_ROOT/peer-inbox-bc-solo.db"
   local solo_repo="$TMP_ROOT/peer-inbox-bc-solo"
