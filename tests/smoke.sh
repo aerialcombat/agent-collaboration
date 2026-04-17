@@ -33,6 +33,18 @@ assert_contains() {
   grep -Fq "$pattern" "$path" || fail "expected '$pattern' in $path"
 }
 
+wait_for_port() {
+  # Poll a localhost port up to ~3s so the test doesn't race a slow start.
+  local port="$1"
+  for _ in $(seq 1 30); do
+    if curl -sf -o /dev/null "http://127.0.0.1:$port/"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 assert_glob_exists() {
   local pattern="$1"
   local matches=()
@@ -184,11 +196,12 @@ assert any('readfile' in b for b in bodies), 'readfile content lost'
       "$agent_collab" peer receive --cwd "$repo_b_real" --format json --mark-read > "$claim_dir/recv-$i.json" &
   done
   wait
-  python3 <<PY || fail "claim atomicity violated"
-import json
+  CLAIM_DIR="$claim_dir" python3 <<'PY' || fail "claim atomicity violated"
+import json, os
+claim_dir = os.environ["CLAIM_DIR"]
 ids = []
 for i in range(1, 6):
-    rows = json.load(open("$claim_dir/recv-$i.json"))
+    rows = json.load(open(f"{claim_dir}/recv-{i}.json"))
     ids.extend(r["id"] for r in rows)
 if len(ids) != len(set(ids)):
     raise SystemExit(f"duplicates: {len(ids)} claimed vs {len(set(ids))} unique")
@@ -394,7 +407,8 @@ print('replay HTML parses OK')
     "$agent_collab" peer web --cwd "$web_real" --port 8798 \
     >"$TMP_ROOT/peer-inbox-web.log" 2>&1 &
   local web_pid=$!
-  sleep 0.4
+  wait_for_port 8798 \
+    || { kill $web_pid 2>/dev/null || true; fail "peer web did not bind 8798"; }
 
   curl -s "http://127.0.0.1:8798/" | grep -q "peer-inbox" \
     || { kill $web_pid 2>/dev/null || true; fail "peer web / did not serve the index page"; }
@@ -689,7 +703,8 @@ PY
     "$agent_collab" peer web --cwd "$rw_a_real" --pair-key "$rw_key" --port 8799 \
     >"$TMP_ROOT/peer-inbox-rooms.log" 2>&1 &
   local rw_pid=$!
-  sleep 0.4
+  wait_for_port 8799 \
+    || { kill $rw_pid 2>/dev/null || true; fail "peer web did not bind 8799"; }
 
   curl -s "http://127.0.0.1:8799/scope.json" \
     | python3 -c "
@@ -731,7 +746,8 @@ assert 'one' in bodies and 'two' in bodies, bodies
     "$agent_collab" peer web --cwd "$web_real" --port 8800 \
     >"$TMP_ROOT/peer-inbox-rooms-cwd.log" 2>&1 &
   local rw_cwd_pid=$!
-  sleep 0.3
+  wait_for_port 8800 \
+    || { kill $rw_pid $rw_cwd_pid 2>/dev/null || true; fail "peer web did not bind 8800"; }
   local rw_cwd_err
   rw_cwd_err=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8800/rooms.json")
   [[ "$rw_cwd_err" == "400" ]] || { kill $rw_pid $rw_cwd_pid 2>/dev/null || true; fail "/rooms.json in cwd mode should 400 (got $rw_cwd_err)"; }
@@ -784,7 +800,8 @@ assert 'one' in bodies and 'two' in bodies, bodies
     "$agent_collab" peer web --cwd "$bl_a_real" --pair-key "$bl_key" --port 8801 \
     >"$TMP_ROOT/peer-inbox-bleed.log" 2>&1 &
   local bl_pid=$!
-  sleep 0.4
+  wait_for_port 8801 \
+    || { kill $bl_pid 2>/dev/null || true; fail "peer web did not bind 8801"; }
 
   curl -s "http://127.0.0.1:8801/rooms.json" | python3 -c "
 import json, sys
