@@ -56,6 +56,20 @@ Commit SHAs reference the `agent-collaboration` repo.
 - Auto-infer `--to` single-peer + ambiguity.
 - Cross-runtime env-var selection (`CLAUDE/CODEX_SESSION_ID`).
 
+### Known gaps
+- **Codex CLI doesn't export `$CODEX_SESSION_ID` to subprocess env.**
+  Claude Code exports `$CLAUDE_SESSION_ID` and logs every seen
+  session via the `UserPromptSubmit` hook, so `session register`
+  resolves a key automatically. Codex and Gemini do neither, so a
+  Codex-driven `agent-collab session register` fails with
+  "no session key available" unless the caller passes one.
+  Workaround: `CODEX_SESSION_ID=$(uuidgen) agent-collab session
+  register …` or `--session-key <k>`. A proper shim would need
+  per-shell session-key persistence (so re-registers stay
+  idempotent) — deferred to a later version. Verified via real
+  `codex exec` round-trip: with the env var set, pair-key
+  registration and bi-directional messaging work end-to-end.
+
 ---
 
 ## v1.5 — 2026-04-17 · [`d8b1139`]
