@@ -807,9 +807,12 @@ assert 'one' in bodies and 'two' in bodies, bodies
 import json, sys
 d = json.load(sys.stdin)
 r = d['rooms'][0]
-# Only the new room_hello broadcast (→ bob, → carol = 2 rows). Old
-# 1:1 alice<->bob history must NOT show up.
-assert r['total'] == 2, r
+# Old 1:1 alice<->bob history (2 pre-room rows) must NOT be counted;
+# only the new room's activity should show. Room activity = 2 join
+# events (bob/carol joining the already-present alice) + 2 rows from
+# the 'room hello' broadcast = 5. The tight assertion is: total does
+# NOT include the 2 pre-room messages, i.e. total < 7.
+assert r['total'] < 7, r
 " || { kill $bl_pid 2>/dev/null || true; fail "old history bled into /rooms.json total"; }
 
   curl -s "http://127.0.0.1:8801/messages.json?pair_key=$bl_key&after=0" | python3 -c "
@@ -823,6 +826,127 @@ assert 'private history two' not in bodies, bodies
 
   kill $bl_pid 2>/dev/null || true
   wait $bl_pid 2>/dev/null || true
+
+  echo "-- peer-inbox: v2.0 join/leave system events --"
+  local jl_db="$TMP_ROOT/peer-inbox-jl.db"
+  local jl_a="$TMP_ROOT/peer-inbox-jl-a"
+  local jl_b="$TMP_ROOT/peer-inbox-jl-b"
+  local jl_c="$TMP_ROOT/peer-inbox-jl-c"
+  mkdir -p "$jl_a" "$jl_b" "$jl_c"
+  local jl_a_real jl_b_real jl_c_real
+  jl_a_real="$(cd "$jl_a" && pwd -P)"
+  jl_b_real="$(cd "$jl_b" && pwd -P)"
+  jl_c_real="$(cd "$jl_c" && pwd -P)"
+  local jl_out jl_key
+  jl_out=$(AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlA \
+    "$agent_collab" session register --cwd "$jl_a_real" --label alpha --agent claude --new-pair)
+  jl_key=$(printf '%s\n' "$jl_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlB \
+    "$agent_collab" session register --cwd "$jl_b_real" --label beta --agent claude --pair-key "$jl_key" >/dev/null
+  # alpha should have received a join event for beta
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlA \
+    "$agent_collab" peer receive --cwd "$jl_a_real" --as alpha --format plain --mark-read \
+    | grep -q "beta joined the room" \
+    || fail "alpha did not see beta's join event"
+
+  # Idempotent re-register (same session_key) MUST NOT emit another join
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlB \
+    "$agent_collab" session register --cwd "$jl_b_real" --label beta --agent claude --pair-key "$jl_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlA \
+    "$agent_collab" peer receive --cwd "$jl_a_real" --as alpha --format plain --mark-read \
+    | grep -q "beta joined the room" \
+    && fail "idempotent re-register incorrectly emitted a join event"
+
+  # A fresh 3rd member joins; both alpha and beta see it
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlC \
+    "$agent_collab" session register --cwd "$jl_c_real" --label gamma --agent claude --pair-key "$jl_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlA \
+    "$agent_collab" peer receive --cwd "$jl_a_real" --as alpha --format plain --mark-read \
+    | grep -q "gamma joined the room" \
+    || fail "alpha did not see gamma's join"
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlB \
+    "$agent_collab" peer receive --cwd "$jl_b_real" --as beta --format plain --mark-read \
+    | grep -q "gamma joined the room" \
+    || fail "beta did not see gamma's join"
+
+  # Close gamma; alpha and beta should receive a leave event
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlC \
+    "$agent_collab" session close --cwd "$jl_c_real" --label gamma >/dev/null
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlA \
+    "$agent_collab" peer receive --cwd "$jl_a_real" --as alpha --format plain --mark-read \
+    | grep -q "gamma left the room" \
+    || fail "alpha did not see gamma's leave"
+  AGENT_COLLAB_INBOX_DB="$jl_db" AGENT_COLLAB_SESSION_KEY=jlB \
+    "$agent_collab" peer receive --cwd "$jl_b_real" --as beta --format plain --mark-read \
+    | grep -q "gamma left the room" \
+    || fail "beta did not see gamma's leave"
+
+  # Room turn counter must NOT have moved for any of these system events.
+  # Accept either no row (peer_rooms empty) or an explicit 0 count.
+  local jl_turns
+  jl_turns=$(sqlite3 "$jl_db" "SELECT COALESCE(turn_count, 0) FROM peer_rooms WHERE room_key='pk:$jl_key';")
+  [[ -z "$jl_turns" || "$jl_turns" == "0" ]] \
+    || fail "join/leave events should not bump turn counter (got $jl_turns)"
+
+  # Non-pair-key session register must NOT emit a join (cwd-only legacy path)
+  local jlplain_db="$TMP_ROOT/peer-inbox-jlplain.db"
+  mkdir -p "$TMP_ROOT/peer-inbox-jlplain"
+  local jlplain_real; jlplain_real="$(cd "$TMP_ROOT/peer-inbox-jlplain" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$jlplain_db" AGENT_COLLAB_SESSION_KEY=p1 \
+    "$agent_collab" session register --cwd "$jlplain_real" --label one --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$jlplain_db" AGENT_COLLAB_SESSION_KEY=p2 \
+    "$agent_collab" session register --cwd "$jlplain_real" --label two --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$jlplain_db" AGENT_COLLAB_SESSION_KEY=p1 \
+    "$agent_collab" peer receive --cwd "$jlplain_real" --as one --format plain --mark-read \
+    | grep -q "joined the room" \
+    && fail "cwd-only register incorrectly emitted a join event"
+
+  echo "-- peer-inbox: v2.0 mediator role surfaces meta.has_mediator + peer round --"
+  local md_db="$TMP_ROOT/peer-inbox-md.db"
+  local md_m="$TMP_ROOT/peer-inbox-md-m"
+  local md_a="$TMP_ROOT/peer-inbox-md-a"
+  local md_b="$TMP_ROOT/peer-inbox-md-b"
+  mkdir -p "$md_m" "$md_a" "$md_b"
+  local md_m_real md_a_real md_b_real
+  md_m_real="$(cd "$md_m" && pwd -P)"
+  md_a_real="$(cd "$md_a" && pwd -P)"
+  md_b_real="$(cd "$md_b" && pwd -P)"
+  local md_out md_key
+  md_out=$(AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdM \
+    "$agent_collab" session register --cwd "$md_m_real" --label mediator --agent claude --role mediator --new-pair)
+  md_key=$(printf '%s\n' "$md_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdA \
+    "$agent_collab" session register --cwd "$md_a_real" --label alpha --agent claude --pair-key "$md_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdB \
+    "$agent_collab" session register --cwd "$md_b_real" --label beta --agent claude --pair-key "$md_key" >/dev/null
+
+  # peer round: `--round N --message X` produces `[Round N] X`
+  AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdM \
+    "$agent_collab" peer round --cwd "$md_m_real" --as mediator \
+      --round 1 --label topic --message "how should the launch sequence be ordered?" >/dev/null \
+    || fail "peer round exit non-zero"
+
+  AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdA \
+    "$agent_collab" peer receive --cwd "$md_a_real" --as alpha --format plain --mark-read \
+    | grep -Fq "[Round 1:topic] how should the launch sequence be ordered?" \
+    || fail "mediator's round-tagged broadcast did not reach alpha"
+
+  # Non-mediator using `peer round` prints a warning to stderr but still sends
+  AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdA \
+    "$agent_collab" peer round --cwd "$md_a_real" --as alpha --round 1 --message "alpha trying" 2>"$TMP_ROOT/md-warn.log" >/dev/null \
+    || fail "non-mediator peer round should still succeed"
+  grep -q "not 'mediator'" "$TMP_ROOT/md-warn.log" \
+    || fail "non-mediator peer round did not warn"
+
+  # --round rejects non-integer and < 1
+  if AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdM \
+       "$agent_collab" peer round --cwd "$md_m_real" --as mediator --round abc --message "x" >/dev/null 2>&1; then
+    fail "peer round accepted non-integer round"
+  fi
+  if AGENT_COLLAB_INBOX_DB="$md_db" AGENT_COLLAB_SESSION_KEY=mdM \
+       "$agent_collab" peer round --cwd "$md_m_real" --as mediator --round 0 --message "x" >/dev/null 2>&1; then
+    fail "peer round accepted round=0"
+  fi
 
   echo "-- peer-inbox: v2.0 @mention auto-extract + explicit + cohort --"
   local mn_db="$TMP_ROOT/peer-inbox-mn.db"

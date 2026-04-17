@@ -62,32 +62,36 @@ MAX_BODY_BYTES = 8 * 1024
 REPLY_TOOL = {
     "name": "peer_inbox_reply",
     "description": (
-        "Send a message into the room. You're at a party — multiple "
-        "people milling around, side-chats happening, the main room "
-        "holding forth on something. Contribute naturally.\n"
-        "\n"
-        "Three delivery modes (pick what fits the moment):\n"
+        "Send a message into the room. Three delivery modes, picked "
+        "by `to`:\n"
         "  • omit `to`            → broadcast to the whole room\n"
-        "  • `to: \"alice\"`       → 1:1 side-chat with one peer\n"
-        "  • `to: [\"a\", \"b\"]`  → pull a small group aside (multicast)\n"
+        "  • `to: \"alice\"`       → 1:1 direct (side-chat or private reply)\n"
+        "  • `to: [\"a\", \"b\"]`  → multicast to a named subset\n"
         "\n"
-        "Mention someone with `mention` (string or array), or just type "
-        "`@label` in the body — the system auto-parses @labels that "
-        "match room members. Mentions compose with any delivery mode.\n"
+        "Optional `mention` (string or array) tags peers as primary "
+        "responder. `@label` tokens in `body` are auto-parsed into "
+        "mentions. Mentions compose with any delivery mode.\n"
         "\n"
-        "Default reply mode in a room is BROADCAST. Only go 1:1 when "
-        "you genuinely need a side-channel (private context, handoff, "
-        "something irrelevant to the wider group). Broadcasting keeps "
-        "everyone in the conversation.\n"
+        "Which mode? Depends on room state (read the incoming "
+        "<channel> meta):\n"
         "\n"
-        "You're not obligated to respond to every broadcast, but don't "
-        "freeze either. Start your own threads. Break off into "
-        "side-chats. Jump into a conversation you find interesting. "
-        "The bar for speaking up is 'normal party conversation,' not "
-        "'formal meeting.'\n"
+        "PAIR (room_size=2): reply naturally. No ambiguity.\n"
         "\n"
-        "Budget: the room shares a 100-turn cap. A broadcast or "
-        "multicast counts as ONE turn regardless of recipients. "
+        "PARTY (room_size>=3, no meta.has_mediator): like a Slack "
+        "channel. Default to BROADCAST; only go 1:1 for genuine "
+        "side-chats. Start threads, pull peers aside, jump into "
+        "conversations that interest you. Silence is fine; so is "
+        "flagging that the room could use a mediator if progress "
+        "stalls on convergent work.\n"
+        "\n"
+        "MEDIATED (meta.has_mediator=1): reply PRIVATELY 1:1 to the "
+        "mediator (`to: \"<mediator-label>\"`) when asked. Don't "
+        "broadcast. Don't address other participants directly — let "
+        "the mediator route attention. The mediator strips attribution "
+        "in summaries, so it's safe (and useful) to disagree openly.\n"
+        "\n"
+        "Budget: 100-turn room cap shared across all members. A "
+        "broadcast or multicast is ONE turn regardless of recipients. "
         "Don't monologue."
     ),
     "inputSchema": {
@@ -171,36 +175,63 @@ def handle_mcp(req: dict) -> None:
                 },
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "You're in a peer-inbox room. Treat it like a party or "
-                    "a Slack channel: multiple peers milling around, "
-                    "side-chats happening, someone holding court. "
-                    "Contribute naturally; don't freeze.\n\n"
-                    "Incoming <channel source=\"peer-inbox\" from=\"...\"> "
-                    "tags carry meta fields that tell you exactly what "
-                    "you're receiving:\n"
+                    "You're in a peer-inbox room. Every incoming "
+                    "<channel source=\"peer-inbox\" from=\"...\"> tag "
+                    "carries meta fields — read them first, pick mode.\n\n"
+                    "Meta you care about:\n"
                     "  • no meta.broadcast     → DM; someone pulled you "
                     "aside. Answer.\n"
-                    "  • meta.broadcast=1      → the room is talking. "
-                    "Broadcast back, or DM someone, or just listen.\n"
-                    "  • meta.cohort=\"a,b,c\"   → multicast; you're in a "
-                    "named subset. Respond as a co-equal.\n"
+                    "  • meta.broadcast=1      → the room is talking.\n"
+                    "  • meta.cohort=\"a,b,c\"   → multicast; named subset.\n"
                     "  • meta.mentions=YOU     → you're the primary "
-                    "responder; lead the reply.\n"
+                    "responder; lead.\n"
                     "  • meta.mentions=other   → they lead; chime in only "
-                    "if you have real context to add.\n"
-                    "meta.room_size and meta.members give you the full "
-                    "roster.\n\n"
-                    "Start your own threads without waiting — ask the room "
-                    "questions, pull a peer aside, jump into a thread you "
-                    "find interesting. Default reply mode in a room is "
-                    "BROADCAST; only go 1:1 for genuine side-chats. "
-                    "Silence is fine when you have nothing to add, but "
-                    "the bar is 'normal party conversation,' not 'formal "
-                    "meeting.'\n\n"
-                    "Reply with the peer_inbox_reply tool (preferred), or "
-                    "shell: `agent-collab peer broadcast --message ...` "
-                    "(all), `peer broadcast --to a --to b --message ...` "
-                    "(subset), `peer send --to a --message ...` (1:1)."
+                    "with substantive context.\n"
+                    "  • meta.room_size / members / pair_key → roster.\n"
+                    "  • meta.has_mediator=1 + meta.mediator=LABEL → a "
+                    "facilitator is present; mediated mode applies.\n"
+                    "  • meta.system=\"join\" → a new member just joined. "
+                    "A brief greeting or a 'what brings you in?' is "
+                    "natural — they may arrive with a topic or just "
+                    "banter that stirs the room.\n"
+                    "  • meta.system=\"leave\" → a member just left. "
+                    "Acknowledge if relevant and carry on.\n\n"
+                    "Three modes, chosen by room state:\n\n"
+                    "1) PAIR (room_size=2). It's just the two of you. "
+                    "Reply naturally like any 1:1 — there's no ambiguity "
+                    "about the recipient.\n\n"
+                    "2) PARTY (room_size>=3, no mediator). Treat it like "
+                    "a Slack channel or a party: multiple peers around, "
+                    "side-chats happening, someone holding court. "
+                    "Contribute naturally. Start threads, pull peers "
+                    "aside, jump in when something grabs you. Default "
+                    "reply is BROADCAST; only go 1:1 for genuine "
+                    "side-chats. Silence is fine when you have nothing. "
+                    "NOTE: party mode is productive for exploration but "
+                    "struggles on convergent work. If the room is trying "
+                    "to decide something and progress stalls, it's fair "
+                    "to say so — 'room could use a mediator here' — "
+                    "either broadcasting to the room or asking the human "
+                    "to appoint one.\n\n"
+                    "3) MEDIATED (meta.has_mediator=1). The named "
+                    "mediator runs the round; you do NOT speak unprompted. "
+                    "Specifically:\n"
+                    "  • When the mediator broadcasts a topic or round "
+                    "summary, read carefully and WAIT.\n"
+                    "  • When the mediator DMs you, respond PRIVATELY — "
+                    "reply 1:1 back with `to: \"<mediator>\"`. Do not "
+                    "broadcast.\n"
+                    "  • Give compressed substantive positions. Name "
+                    "tradeoffs. Disagree openly — the mediator strips "
+                    "attribution in summaries, so disagreement is safe.\n"
+                    "  • Don't address other participants directly. The "
+                    "mediator routes attention; you speak through them.\n"
+                    "  • If the mediator broadcasts `[[converged]]`, the "
+                    "round is closed; honor it and return to party mode.\n\n"
+                    "Reply with peer_inbox_reply (preferred). Shell "
+                    "fallback: `agent-collab peer broadcast --message ...`, "
+                    "`peer broadcast --to a --to b --message ...`, "
+                    "`peer send --to a --message ...`."
                 ),
             },
         )
@@ -246,13 +277,13 @@ def _agent_collab_bin() -> str:
     return "agent-collab"
 
 
-def _room_roster() -> tuple[str | None, list[str]] | None:
-    """Look up the receiver's pair_key and full member roster (self first).
+def _room_roster() -> tuple[str | None, list[str], str | None] | None:
+    """Look up the receiver's pair_key, roster, and mediator label.
 
-    Returns (pair_key, members) where members is sorted, self-inclusive.
-    pair_key is None for cwd-only rooms; members then collapses to the
-    sessions in the receiver's cwd. Returns None if the channel isn't
-    yet bound to a session row.
+    Returns (pair_key, members, mediator_label). `members` is sorted,
+    self-inclusive. `mediator_label` is the label of whatever session
+    in the room registered with role='mediator', or None if the room
+    has no appointed mediator (party mode).
     """
     resolved = _resolve_self_from_socket()
     if resolved is None:
@@ -264,23 +295,29 @@ def _room_roster() -> tuple[str | None, list[str]] | None:
         try:
             if self_pair_key:
                 rows = conn.execute(
-                    "SELECT label FROM sessions WHERE pair_key = ? ORDER BY label",
+                    "SELECT label, role FROM sessions WHERE pair_key = ? "
+                    "ORDER BY label",
                     (self_pair_key,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT label FROM sessions WHERE cwd = ? ORDER BY label",
+                    "SELECT label, role FROM sessions WHERE cwd = ? "
+                    "ORDER BY label",
                     (self_cwd,),
                 ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
         stderr(f"[peer-inbox-channel] sqlite error in roster: {e}")
-        return (self_pair_key, [self_label])
+        return (self_pair_key, [self_label], None)
     members = [r["label"] for r in rows]
+    mediator = next(
+        (r["label"] for r in rows if (r["role"] or "").lower() == "mediator"),
+        None,
+    )
     if self_label not in members:
         members.append(self_label)
-    return (self_pair_key, sorted(members))
+    return (self_pair_key, sorted(members), mediator)
 
 
 def _resolve_self_from_socket() -> tuple[str, str, str | None] | None:
@@ -549,17 +586,21 @@ def handle_socket_client(conn: socket.socket) -> None:
             meta[key] = str(v)
 
     # Enrich with room context so the receiving agent knows whether this
-    # is a 1:1 pair or a group chat, and can see the full roster before
-    # choosing reply/broadcast/multicast. Resolution looks up the
-    # receiver's own session row via channel_socket; if registration is
-    # still pending we just skip enrichment.
+    # is a 1:1 pair or a group chat, and can see the full roster + any
+    # appointed mediator before choosing reply/broadcast/multicast.
+    # Resolution looks up the receiver's own session row via
+    # channel_socket; if registration is still pending we just skip
+    # enrichment.
     roster = _room_roster()
     if roster is not None:
-        pair_key, members = roster
+        pair_key, members, mediator_label = roster
         if pair_key:
             meta.setdefault("pair_key", pair_key)
         meta.setdefault("room_size", str(len(members)))
         meta.setdefault("members", ",".join(members))
+        if mediator_label:
+            meta.setdefault("mediator", mediator_label)
+            meta.setdefault("has_mediator", "1")
 
     if not content:
         write_http_response(conn, 400, {"error": "body.body (or body.content) required"})

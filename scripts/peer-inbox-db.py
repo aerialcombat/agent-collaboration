@@ -879,6 +879,76 @@ def bump_last_seen(conn: sqlite3.Connection, cwd: str, label: str) -> None:
     )
 
 
+def emit_system_event(
+    self_cwd: str,
+    self_label: str,
+    pair_key: str,
+    kind: str,
+    body: str,
+    extra_meta: Optional[dict[str, str]] = None,
+) -> None:
+    """Fan-out a system-flavored message to every other live peer in a room.
+
+    Writes inbox rows (so non-channel peers see it via the hook) and
+    pushes to channel sockets for live peers. Sets meta.system=kind so
+    receivers can distinguish join/leave/etc from regular messages.
+    Does NOT bump the room turn counter — system events are free.
+    """
+    room_key = f"pk:{pair_key}"
+    now = now_iso()
+
+    conn = open_db()
+    try:
+        rows = conn.execute(
+            "SELECT cwd, label, last_seen_at, channel_socket "
+            "FROM sessions WHERE pair_key = ? "
+            "AND NOT (cwd = ? AND label = ?)",
+            (pair_key, self_cwd, self_label),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    live = [
+        r for r in rows
+        if seconds_since(r["last_seen_at"]) <= STALE_THRESHOLD_SECS
+    ]
+    if not live:
+        return
+
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for r in live:
+            conn.execute(
+                """
+                INSERT INTO inbox
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (r["cwd"], r["label"], self_cwd, self_label, body, now, room_key),
+            )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    push_meta_base: dict[str, str] = {"system": kind}
+    if extra_meta:
+        for k, v in extra_meta.items():
+            if all(c.isalnum() or c == "_" for c in k):
+                push_meta_base[k] = str(v)
+
+    for r in live:
+        sock = r["channel_socket"]
+        if not sock or not Path(sock).exists():
+            continue
+        push_meta = dict(push_meta_base)
+        push_meta["to"] = r["label"]
+        _send_over_unix_socket(
+            sock,
+            {"from": self_label, "body": body, "meta": push_meta},
+        )
+
+
 # ---- Subcommands ----
 
 
@@ -1014,6 +1084,18 @@ def cmd_session_register(args: argparse.Namespace) -> int:
                     EXIT_LABEL_COLLISION,
                 )
 
+        # Decide if this is a genuine join event worth announcing. A
+        # join = (first time this label exists in this pair_key) OR
+        # (a different session took over the seat). Idempotent refreshes
+        # from the same session_key into the same pair stay silent.
+        is_new_join = (
+            pair_key is not None and (
+                row is None
+                or (row["pair_key"] or "") != pair_key
+                or row["session_key"] != session_key
+            )
+        )
+
         conn.execute(
             """
             INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at)
@@ -1032,6 +1114,18 @@ def cmd_session_register(args: argparse.Namespace) -> int:
         conn.execute("COMMIT")
     finally:
         conn.close()
+
+    if is_new_join:
+        role_tag = f", role={args.role}" if args.role else ""
+        body = f"[system] {args.label} joined the room (agent={args.agent}{role_tag})"
+        emit_system_event(
+            self_cwd=str(cwd),
+            self_label=args.label,
+            pair_key=pair_key,
+            kind="join",
+            body=body,
+            extra_meta={"agent": args.agent, "role": args.role or ""},
+        )
 
     write_marker(cwd, args.label, session_key)
     sweep_stale_markers_for_label(cwd, args.label, session_key)
@@ -1092,6 +1186,29 @@ def cmd_session_close(args: argparse.Namespace) -> int:
         marker_file, data = found
         label = data["label"]
         target_cwd = marker_file.parent.parent.parent.resolve(strict=True)
+
+    # Capture pair_key BEFORE delete so we can announce the leave to peers.
+    conn = open_db()
+    try:
+        pre_row = conn.execute(
+            "SELECT pair_key FROM sessions WHERE cwd = ? AND label = ?",
+            (str(target_cwd), label),
+        ).fetchone()
+    finally:
+        conn.close()
+    leaving_pair_key = pre_row["pair_key"] if pre_row else None
+
+    # Emit leave event FIRST (while self still in sessions so meta.members
+    # lists the leaver on this last push) when the session was part of a
+    # pair_key room.
+    if leaving_pair_key:
+        emit_system_event(
+            self_cwd=str(target_cwd),
+            self_label=label,
+            pair_key=leaving_pair_key,
+            kind="leave",
+            body=f"[system] {label} left the room",
+        )
 
     conn = open_db()
     try:
@@ -2698,6 +2815,76 @@ def cmd_peer_reset(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_peer_round(args: argparse.Namespace) -> int:
+    """Mediator-facing sugar: broadcast `[Round N] <message>` to the room.
+
+    Thin wrapper — validates that the caller is registered with
+    role='mediator' (warns if not), formats the message with the round
+    prefix, and invokes the normal broadcast path. State (current round,
+    topic) lives entirely in messages; nothing persists in the DB.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT role FROM sessions WHERE cwd = ? AND label = ?",
+            (str(self_cwd), self_label),
+        ).fetchone()
+    finally:
+        conn.close()
+    role = (row["role"] if row else None) or ""
+    if role.lower() != "mediator":
+        print(
+            f"warning: {self_label} is registered with role={role!r}, not "
+            "'mediator'. Broadcasting anyway — but consider re-registering "
+            "with --role mediator so participants see meta.has_mediator=1.",
+            file=sys.stderr,
+        )
+
+    if args.round is None:
+        err("--round is required (mediator tracks the round number)", EXIT_VALIDATION)
+    try:
+        round_n = int(args.round)
+    except (TypeError, ValueError):
+        err(f"--round must be an integer, got {args.round!r}", EXIT_VALIDATION)
+    if round_n < 1:
+        err("--round must be >= 1", EXIT_VALIDATION)
+
+    if args.message_stdin:
+        raw = sys.stdin.read()
+    elif args.message_file:
+        raw = Path(args.message_file).read_text()
+    elif args.message is not None:
+        raw = args.message
+    else:
+        err("one of --message, --message-file, --message-stdin required", EXIT_VALIDATION)
+
+    prefix = f"[Round {round_n}] "
+    if args.label:
+        if not re.fullmatch(r"[a-z0-9_-]{1,32}", args.label):
+            err(
+                "--label must be 1-32 chars of [a-z0-9_-]",
+                EXIT_VALIDATION,
+            )
+        prefix = f"[Round {round_n}:{args.label}] "
+    body = prefix + raw
+
+    # Dispatch through the normal broadcast path by overriding the args
+    # object — no code duplication.
+    broadcast_args = argparse.Namespace(
+        cwd=args.cwd,
+        as_label=args.as_label,
+        to=[],  # room-wide
+        mention=list(getattr(args, "mention", []) or []),
+        message=body,
+        message_file=None,
+        message_stdin=False,
+    )
+    return cmd_peer_broadcast(broadcast_args)
+
+
 def cmd_peer_watch(args: argparse.Namespace) -> int:
     """Tail new inbox rows addressed to self. Blocks until Ctrl-C.
 
@@ -3038,6 +3225,26 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--message-file")
     pb.add_argument("--message-stdin", action="store_true")
     pb.set_defaults(func=cmd_peer_broadcast)
+
+    pro = sub.add_parser(
+        "peer-round",
+        help="(mediator) broadcast a round-tagged message",
+    )
+    pro.add_argument("--cwd")
+    pro.add_argument("--as", dest="as_label")
+    pro.add_argument(
+        "--round", required=True,
+        help="round number (integer >= 1; mediator tracks)",
+    )
+    pro.add_argument(
+        "--label",
+        help="optional phase label, e.g. 'topic', 'summary', 'converged'",
+    )
+    pro.add_argument("--mention", action="append", default=[])
+    pro.add_argument("--message")
+    pro.add_argument("--message-file")
+    pro.add_argument("--message-stdin", action="store_true")
+    pro.set_defaults(func=cmd_peer_round)
 
     pr = sub.add_parser("peer-receive")
     pr.add_argument("--cwd")
