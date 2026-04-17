@@ -7,6 +7,60 @@ Commit SHAs reference the `agent-collaboration` repo.
 
 ---
 
+## v2.0 — 2026-04-17
+
+**Group chats + reply tool.** Peer-inbox becomes a room transport
+instead of a 2-person pair transport. Channels-enabled Claude sessions
+reply as a first-class MCP tool call.
+
+### Added
+- `peer_inbox_reply` MCP tool on the peer-inbox channel server.
+  Advertised in `tools/list`; accepts `body` and optional `to`. Omit
+  `to` to broadcast to every live peer in the current room. The tool
+  resolves the calling session via the channel_socket → sessions row
+  binding. (`aceeb13`)
+- `agent-collab peer broadcast` subcommand. Sender-side fan-out:
+  inserts N inbox rows and pushes to every channel socket in one
+  transaction; pre-checks the room cap so a partial failure can't
+  half-deliver. (`f3d3a95`)
+- `peer web --pair-key KEY` serves the conversation as a single room:
+  `/scope.json`, `/rooms.json`, and `/messages.json?pair_key=KEY`
+  expose the room summary and the interleaved stream. Frontend
+  auto-selects the single room and renders member-pill headers +
+  sender pills per message. cwd-mode edge view unchanged. (`b2233df`)
+- `peer_rooms` table + `_room_key_for()` unify turn accounting.
+  pair_key-scoped rooms share one counter (`pk:<key>`); cwd-only
+  pairs synthesize `cwd:<cwd>#<a>+<b>` so the degenerate N=2 room
+  keeps the v1.7 per-edge budget. `[[end]]` terminates the whole
+  room. `peer reset --pair-key KEY` revives a pair_key room;
+  `peer reset --to LABEL` still resets a cwd edge.
+  `peer reset --room-key` is the raw escape hatch. (`52985d6`)
+- `/peer broadcast` slash verb and documentation guidance that the
+  `peer_inbox_reply` MCP tool is the preferred send path when
+  channels are loaded. (`c127dce`)
+
+### Changed
+- Broadcast counts as ONE room turn regardless of recipient count
+  when a `pair_key` is set, matching the group-chat semantics spec.
+  cwd-only broadcasts still bump each synthesized edge independently.
+- `peer_inbox_reply` routes through `peer broadcast` when `to` is
+  omitted, giving Claude a single atomic tool call instead of N
+  subprocess forks.
+
+### Removed
+- v1.7 `peer_pairs` table — `peer_rooms` handles both cases and
+  keeping both paths would diverge behaviour.
+
+### Smoke
+Seven new scenarios on top of the 30 v1.7 baselines: reply tool
+directed + broadcast, 3-way broadcast, 4-way broadcast stress,
+broadcast-with-no-peers error, pair-key room view over HTTP,
+room-level turn cap (blocks every sender, blocks broadcast),
+`[[end]]` terminates the whole room + `peer reset --pair-key`
+revives.
+
+---
+
 ## v1.7 — 2026-04-17
 
 **One-sentence install: `install agent-collab` → `/agent-collab` → `/peer`.**
