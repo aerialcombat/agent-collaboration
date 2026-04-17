@@ -27,7 +27,9 @@ Use a challenge pass by default for:
 - changes to `docs/GLOBAL-PROTOCOL.md`
 - changes to `scripts/install-global-protocol`
 - changes to `scripts/agent-collab`
+- changes to `scripts/peer-inbox-db.py`
 - changes to `scripts/doctor-global-protocol`
+- changes to `hooks/peer-inbox-inject.sh`
 - changes that blur the global/local boundary
 - changes that alter default trigger rules or escalation behavior
 

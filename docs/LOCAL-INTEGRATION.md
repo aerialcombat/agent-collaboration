@@ -25,8 +25,24 @@ The repo may also provide:
 - helper scripts such as `infra/agent`
 - a data-only `.agent-collab.env` file for the global `agent-collab` runner
 - dashboards, logs, or hooks
+- a `.agent-collab/my-label` marker (gitignored) set by
+  `agent-collab session register` when using the cross-session peer inbox
 
 Those are recommended, not globally required.
+
+### Peer inbox (cross-session)
+
+The peer inbox is a machine-global feature — the SQLite file lives at
+`~/.agent-collab/sessions.db` and is shared across all repos on the host,
+scoped by canonical cwd so labels in one project don't collide with those
+in another. Repos don't need to configure anything beyond optionally
+adding `.agent-collab/my-label` to `.gitignore` (the register command does
+this automatically when a `.gitignore` already exists).
+
+Override the DB path per-machine with `AGENT_COLLAB_INBOX_DB` if you want
+a non-default location. Override the helper script path with
+`AGENT_COLLAB_PEER_INBOX_DB_SCRIPT` only for development against an
+uninstalled source tree.
 
 What matters is that the local implementation is explicit and repo-visible.
 

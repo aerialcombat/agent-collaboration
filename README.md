@@ -8,6 +8,12 @@ This project separates:
 
 The goal is to make the three agents behave consistently across repos without forcing every repo to use the same file paths or helper scripts.
 
+## Peer Inbox (Cross-Session Coordination)
+
+Agents in separate sessions can exchange messages via a labeled peer inbox.
+For install, daily use, and troubleshooting, see the
+[Peer Inbox Guide](docs/PEER-INBOX-GUIDE.md).
+
 ## What This Project Contains
 
 - `docs/GLOBAL-PROTOCOL.md`

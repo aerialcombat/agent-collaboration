@@ -8,6 +8,13 @@ GEMINI_TARGET="$HOME/.gemini/GEMINI.md"
 BIN_DIR="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
 COMMAND_TARGET="$BIN_DIR/agent-collab"
 START_MARKER="<!-- BEGIN agent-collaboration -->"
+
+PEER_INBOX_HOME="$HOME/.agent-collab"
+PEER_INBOX_DB_SCRIPT="$PEER_INBOX_HOME/scripts/peer-inbox-db.py"
+PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOME/hooks/peer-inbox-inject.sh"
+PEER_INBOX_DB_PATH="${AGENT_COLLAB_INBOX_DB:-$PEER_INBOX_HOME/sessions.db}"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+PEER_INBOX_SQLITE_MIN="3.35.0"
 TESTED_CLAUDE_VERSION="2.1.78 (Claude Code)"
 TESTED_CODEX_VERSION="codex-cli 0.115.0"
 TESTED_GEMINI_VERSION="@google/gemini-cli 0.38.1"
@@ -274,6 +281,89 @@ check_project() {
   fi
 }
 
+check_peer_inbox() {
+  echo
+  echo "peer-inbox checks:"
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    block "python3 not on PATH (required by peer-inbox)"
+    return
+  fi
+  pass "python3 found: $(command -v python3)"
+
+  local py_version py_sqlite
+  py_version="$(python3 -c 'import sys; print(".".join(str(x) for x in sys.version_info[:3]))' 2>/dev/null || echo unknown)"
+  if python3 -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 9) else 1)"; then
+    pass "python version $py_version meets peer-inbox minimum 3.9"
+  else
+    block "python version $py_version below peer-inbox minimum 3.9"
+    return
+  fi
+
+  py_sqlite="$(python3 -c 'import sqlite3; print(sqlite3.sqlite_version)' 2>/dev/null || echo unknown)"
+  if [[ "$py_sqlite" == "unknown" ]]; then
+    block "python3 sqlite3 module is not usable"
+    return
+  fi
+
+  # Version gate: need >= 3.35.0 for UPDATE ... RETURNING
+  if python3 -c "
+import sys
+cur = tuple(int(p) for p in '$py_sqlite'.split('.'))
+need = tuple(int(p) for p in '$PEER_INBOX_SQLITE_MIN'.split('.'))
+sys.exit(0 if cur >= need else 1)
+"; then
+    pass "python-linked sqlite $py_sqlite meets peer-inbox minimum $PEER_INBOX_SQLITE_MIN"
+  else
+    block "python-linked sqlite $py_sqlite below minimum $PEER_INBOX_SQLITE_MIN (needed for UPDATE...RETURNING)"
+  fi
+
+  if [[ -r "$PEER_INBOX_DB_SCRIPT" ]]; then
+    pass "peer-inbox helper installed: $PEER_INBOX_DB_SCRIPT"
+  else
+    warn "peer-inbox helper not installed at $PEER_INBOX_DB_SCRIPT (run install-global-protocol)"
+  fi
+
+  if [[ -x "$PEER_INBOX_HOOK_SCRIPT" ]]; then
+    pass "peer-inbox hook installed and executable: $PEER_INBOX_HOOK_SCRIPT"
+  else
+    warn "peer-inbox hook not installed/executable at $PEER_INBOX_HOOK_SCRIPT"
+  fi
+
+  local db_parent
+  db_parent="$(dirname "$PEER_INBOX_DB_PATH")"
+  if [[ -d "$db_parent" && -w "$db_parent" ]]; then
+    pass "peer-inbox DB parent dir writable: $db_parent"
+  elif [[ ! -d "$db_parent" ]]; then
+    warn "peer-inbox DB parent dir missing: $db_parent (created on first session register)"
+  else
+    block "peer-inbox DB parent dir not writable: $db_parent"
+  fi
+
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    warn "Claude settings.json not found at $CLAUDE_SETTINGS — UserPromptSubmit hook cannot be registered"
+  else
+    if python3 -c "
+import json, sys
+try:
+    d = json.load(open('$CLAUDE_SETTINGS'))
+except Exception as e:
+    print(e, file=sys.stderr); sys.exit(2)
+ups = (d.get('hooks') or {}).get('UserPromptSubmit') or []
+found = any(
+    'peer-inbox-inject.sh' in (h.get('command') or '')
+    for m in ups if isinstance(m, dict)
+    for h in (m.get('hooks') or []) if isinstance(h, dict)
+)
+sys.exit(0 if found else 1)
+" 2>/dev/null; then
+      pass "peer-inbox UserPromptSubmit hook registered in $CLAUDE_SETTINGS"
+    else
+      warn "peer-inbox UserPromptSubmit hook not registered in $CLAUDE_SETTINGS (run install-global-protocol)"
+    fi
+  fi
+}
+
 check_project
 check_temp_dir
 check_target "Claude" "$CLAUDE_TARGET"
@@ -284,6 +374,7 @@ check_claude_cli
 check_codex_cli
 check_target "Gemini" "$GEMINI_TARGET"
 check_gemini_cli
+check_peer_inbox
 
 echo
 echo "Summary: $PASSES PASS, $WARNINGS WARN, $FAILURES BLOCK"

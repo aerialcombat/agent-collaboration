@@ -90,6 +90,77 @@ Use this only when:
 
 Never do concurrent same-file editing by default.
 
+## Cross-Session Coordination (Peer Inbox)
+
+When two or more sessions are live on the same machine — e.g. one session
+editing the backend and another editing the frontend — they can exchange
+messages via a labeled peer inbox. This is complementary to lead/challenger;
+the difference is that both peers are already contextful, so fidelity is
+high and bloat stays low (each peer answers from its own live context;
+only distilled answers cross the wire).
+
+### Identity and discovery
+
+Each session registers once with a human-meaningful label scoped to its
+canonical repo root:
+
+```bash
+agent-collab session register --label backend --agent claude --role lead
+agent-collab session register --label frontend --agent codex --role peer
+```
+
+Sessions are identified by `(canonical-cwd, label)`. Subdir invocations
+resolve to the session's root via a walk-parents marker discovery.
+Worktrees and symlinks resolve to distinct canonical paths, so labels
+never collide across worktrees of the same repo.
+
+`agent-collab peer list` shows active peers in the caller's repo. Activity
+is derived from `last_seen_at`: active (< 5 min), idle (5-30 min), stale
+(> 30 min; excluded from list by default, sends return `peer offline`).
+
+### Message exchange
+
+```bash
+agent-collab peer send --to <label> --message "<text>"
+agent-collab peer receive [--mark-read]
+```
+
+Claims under `--mark-read` are atomic: `UPDATE ... RETURNING` in a single
+`BEGIN IMMEDIATE` transaction against a WAL-mode SQLite file. Two parallel
+receivers cannot claim the same message.
+
+### Per-runtime hook status
+
+| Runtime | Auto-inject on turn start | Install |
+|---|---|---|
+| Claude Code | yes, via `UserPromptSubmit` hook emitting `hookSpecificOutput.additionalContext` JSON | automated by `install-global-protocol` |
+| Gemini CLI | yes, via `BeforeAgent` hook (same script) | **manual in v1**, automated in v1.1 |
+| Codex CLI | no documented turn-start hook as of codex-cli 0.115.0 | explicit `peer receive` at turn start, or optional session-start wrapper |
+
+### Bloat discipline
+
+- Per-message cap: 8 KB (rejected beyond).
+- Per-turn hook injection cap: 4 KB (overflow replaced with hint).
+- Hook fails open on any error — a broken inbox never blocks a turn.
+  Failures log to `~/.agent-collab/hook.log`.
+- V1 retains all messages in the inbox indefinitely; no archive table
+  until v2 pins retention + retrieval semantics.
+
+### Lead/challenger applicability
+
+The two-round cap, evidence-first disagreement rules, and escalation still
+apply when lead and challenger coordinate via the inbox. A `peer send`
+carrying a review acts like a challenge pass; the lead records it and
+applies the same accept/reject logic.
+
+### Fit: replace, extend, or complement?
+
+The peer inbox does not replace `agent-collab challenge`. Stateless
+challenger passes (fresh perspective on a bounded scope) remain the right
+tool for most reviews. The peer inbox is the right tool when two
+already-contextful sessions need to merge work without losing what each
+has accumulated.
+
 ## Review Rules
 
 Challenge reviews should focus on:

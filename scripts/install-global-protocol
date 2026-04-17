@@ -10,6 +10,14 @@ COMMAND_TARGET="$BIN_DIR/agent-collab"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)-$$"
 START_MARKER="<!-- BEGIN agent-collaboration -->"
 END_MARKER="<!-- END agent-collaboration -->"
+
+PEER_INBOX_HOME="$HOME/.agent-collab"
+PEER_INBOX_SCRIPTS_DIR="$PEER_INBOX_HOME/scripts"
+PEER_INBOX_HOOKS_DIR="$PEER_INBOX_HOME/hooks"
+PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
+PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+
 MODE="${1:-install}"
 
 err() {
@@ -197,6 +205,194 @@ remove_managed_command() {
   echo "uninstalled: $target"
 }
 
+install_peer_inbox_file() {
+  local source="$1"
+  local target="$2"
+  local target_dir
+
+  [[ -s "$source" ]] || err "missing or empty source: $source"
+
+  target_dir="$(dirname "$target")"
+  mkdir -p "$target_dir"
+
+  if [[ -f "$target" ]] && cmp -s "$source" "$target"; then
+    echo "current: $target"
+    return
+  fi
+
+  if [[ -f "$target" ]]; then
+    cp "$target" "${target}.bak.${TIMESTAMP}"
+    echo "backup: ${target}.bak.${TIMESTAMP}"
+  fi
+
+  cp "$source" "$target"
+  chmod +x "$target"
+  echo "installed: $target"
+}
+
+remove_peer_inbox_file() {
+  local target="$1"
+
+  if [[ ! -f "$target" ]]; then
+    echo "missing: $target"
+    return
+  fi
+
+  cp "$target" "${target}.bak.${TIMESTAMP}"
+  echo "backup: ${target}.bak.${TIMESTAMP}"
+  rm -f "$target"
+  echo "uninstalled: $target"
+}
+
+merge_claude_hook() {
+  local settings="$1"
+  local hook_command="$2"
+  local timestamp="$3"
+
+  mkdir -p "$(dirname "$settings")"
+
+  if [[ -f "$settings" ]]; then
+    cp "$settings" "${settings}.bak.${timestamp}"
+  fi
+
+  HOOK_COMMAND="$hook_command" SETTINGS_PATH="$settings" python3 <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+settings_path = Path(os.environ["SETTINGS_PATH"])
+hook_command = os.environ["HOOK_COMMAND"]
+
+if settings_path.exists() and settings_path.stat().st_size > 0:
+    try:
+        data = json.loads(settings_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"error: {settings_path} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(data, dict):
+        print(f"error: {settings_path} root is not a JSON object", file=sys.stderr)
+        sys.exit(1)
+else:
+    data = {}
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    print("error: settings.hooks is not an object", file=sys.stderr)
+    sys.exit(1)
+
+ups = hooks.setdefault("UserPromptSubmit", [])
+if not isinstance(ups, list):
+    print("error: settings.hooks.UserPromptSubmit is not a list", file=sys.stderr)
+    sys.exit(1)
+
+def matcher_has_our_command(matcher):
+    if not isinstance(matcher, dict):
+        return False
+    for h in matcher.get("hooks", []) or []:
+        if isinstance(h, dict) and "peer-inbox-inject.sh" in (h.get("command") or ""):
+            return True
+    return False
+
+our_block = {
+    "hooks": [
+        {"type": "command", "command": hook_command, "timeout": 5}
+    ]
+}
+
+# Surgical install: if any matcher already references our command, leave
+# it unchanged (respect user customizations such as adjusted timeout or a
+# matcher field). Only append a fresh block if no matcher references us.
+already_installed = any(matcher_has_our_command(m) for m in ups)
+changed = False
+if already_installed:
+    pass
+else:
+    ups.append(our_block)
+    changed = True
+
+hooks["UserPromptSubmit"] = ups
+
+if not changed:
+    print(f"current: {settings_path}")
+else:
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"installed: {settings_path} (UserPromptSubmit hook)")
+PY
+}
+
+remove_claude_hook() {
+  local settings="$1"
+  local timestamp="$2"
+
+  if [[ ! -f "$settings" ]]; then
+    echo "missing: $settings"
+    return
+  fi
+
+  cp "$settings" "${settings}.bak.${timestamp}"
+
+  SETTINGS_PATH="$settings" python3 <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+settings_path = Path(os.environ["SETTINGS_PATH"])
+try:
+    data = json.loads(settings_path.read_text())
+except json.JSONDecodeError as e:
+    print(f"error: {settings_path} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+hooks = data.get("hooks") or {}
+ups = hooks.get("UserPromptSubmit") or []
+if not isinstance(ups, list):
+    print(f"warn: UserPromptSubmit is not a list; skipping")
+    sys.exit(0)
+
+def is_our_hook(h):
+    return isinstance(h, dict) and "peer-inbox-inject.sh" in (h.get("command") or "")
+
+touched = False
+new_ups = []
+for matcher in ups:
+    if not isinstance(matcher, dict):
+        new_ups.append(matcher)
+        continue
+    inner = matcher.get("hooks") or []
+    if not isinstance(inner, list):
+        new_ups.append(matcher)
+        continue
+    kept_inner = [h for h in inner if not is_our_hook(h)]
+    if len(kept_inner) == len(inner):
+        new_ups.append(matcher)
+        continue
+    touched = True
+    # Only our hook in this matcher — drop the whole matcher block so we
+    # don't leave a stub behind. Otherwise keep the matcher with sibling
+    # hooks intact.
+    if kept_inner:
+        new_matcher = dict(matcher)
+        new_matcher["hooks"] = kept_inner
+        new_ups.append(new_matcher)
+
+if not touched:
+    print(f"no managed block: {settings_path}")
+    sys.exit(0)
+
+if new_ups:
+    hooks["UserPromptSubmit"] = new_ups
+else:
+    hooks.pop("UserPromptSubmit", None)
+    if not hooks:
+        data.pop("hooks", None)
+
+settings_path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"uninstalled: {settings_path} (UserPromptSubmit hook)")
+PY
+}
+
 mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
 
 case "$MODE" in
@@ -222,6 +418,11 @@ case "$MODE" in
     write_installed_file "$GEMINI_TARGET" "$gemini_block" "$gemini_rendered" "# Global Gemini Collaboration Defaults"
     write_command_file "$COMMAND_TARGET" "$PROJECT_ROOT/scripts/agent-collab"
 
+    # Peer-inbox: install python helper + hook script to stable home paths.
+    install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-db.py" "$PEER_INBOX_DB_SCRIPT"
+    install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
+    merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+
     rm -f "$claude_rendered" "$codex_rendered" "$gemini_rendered" "$claude_block" "$codex_block" "$gemini_block"
 
     echo
@@ -229,6 +430,10 @@ case "$MODE" in
     echo "  $PROJECT_ROOT/docs/GLOBAL-PROTOCOL.md"
     echo "global command:"
     echo "  $COMMAND_TARGET"
+    echo "peer-inbox:"
+    echo "  helper: $PEER_INBOX_DB_SCRIPT"
+    echo "  hook:   $PEER_INBOX_HOOK_SCRIPT"
+    echo "  db:     $PEER_INBOX_HOME/sessions.db (created on first session register)"
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
       echo "warn: $BIN_DIR is not on PATH"
     fi
@@ -238,6 +443,10 @@ case "$MODE" in
     remove_installed_block "$CODEX_TARGET"
     remove_installed_block "$GEMINI_TARGET"
     remove_managed_command "$COMMAND_TARGET"
+    remove_claude_hook "$CLAUDE_SETTINGS" "$TIMESTAMP"
+    remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
+    remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
+    # Intentional: never remove $PEER_INBOX_HOME/sessions.db — user data.
     ;;
   *)
     err "usage: $(basename "$0") [install|uninstall|--uninstall]"

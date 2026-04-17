@@ -53,6 +53,54 @@ agent-collab challenge --challenger gemini --scope AGENT-COLLABORATION.md
 agent-collab verify --challenger gemini --scope AGENT-COLLABORATION.md
 ```
 
+## Cross-Session Coordination (peer inbox)
+
+You can exchange messages with peer sessions (Claude, Codex, or Gemini) on
+the same machine via the peer inbox. Codex does not have an automatic
+turn-start hook in codex-cli 0.115.0, so peer messages are **not auto-
+injected**. Call `peer receive` explicitly at the start of turns where
+cross-session context may matter, or when the user says "check peer inbox".
+
+Register this session once at the start. Codex does not auto-export a
+session ID, so set `AGENT_COLLAB_SESSION_KEY` to any unique string before
+registering (e.g., a short UUID). This keys your per-session marker so
+two Codex sessions in the same repo don't collide:
+
+```bash
+export AGENT_COLLAB_SESSION_KEY="codex-$(date +%s)-$RANDOM"
+agent-collab session register --label <your-label> --agent codex --role <your-role>
+```
+
+Alternative: pass `--session-key <k>` explicitly to every peer command.
+
+Check for unread peer messages (manual poll):
+
+```bash
+agent-collab peer receive --mark-read
+```
+
+Send a message to a peer session:
+
+```bash
+agent-collab peer send --to <peer-label> --message "<text>"
+```
+
+List live peers in this repo:
+
+```bash
+agent-collab peer list
+```
+
+Per-message cap is 8 KB. Message bodies round-trip safely (parameterized
+SQL, no shell interpretation). Fidelity stays high because peers answer
+from their own live context; only distilled answers cross the wire.
+
+Close the session when done:
+
+```bash
+agent-collab session close
+```
+
 ## Scope Of This File
 
 This file defines global behavior only.

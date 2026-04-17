@@ -21,6 +21,7 @@ CONFIG_CLAUDE_TIMEOUT_SECONDS=""
 CONFIG_CODEX_TIMEOUT_SECONDS=""
 CONFIG_GEMINI_TIMEOUT_SECONDS=""
 CONFIG_CLAUDE_EFFORT=""
+CONFIG_INBOX_DB=""
 
 REPO_ROOT=""
 GUIDE_PATH=""
@@ -48,7 +49,25 @@ usage() {
 Usage:
   agent-collab challenge --challenger claude|codex|gemini [options]
   agent-collab verify --challenger claude|codex|gemini [options]
+  agent-collab session register --label <l> --agent claude|codex|gemini
+                                [--role <r>] [--session-key <k>] [--force]
+  agent-collab session close [--label <l>] [--session-key <k>]
+  agent-collab session list [--all-cwds] [--include-stale] [--json]
+  agent-collab peer send --to <label> [--as <label>] [--to-cwd <path>]
+                         --message <text> | --message-file <path> | --message-stdin
+  agent-collab peer receive [--as <label>] [--mark-read] [--since <iso8601>]
+                            [--format hook|hook-json|plain|json]
+  agent-collab peer list [--as <label>] [--include-stale] [--json]
   agent-collab help
+
+Session-key discovery for peer-inbox (register and self-resolution):
+  Register reads a session key from, in priority order:
+    1. --session-key <k>
+    2. $AGENT_COLLAB_SESSION_KEY
+    3. $CLAUDE_SESSION_ID / $CODEX_SESSION_ID / $GEMINI_SESSION_ID
+  If none are set, register errors. Claude hooks set $CLAUDE_SESSION_ID
+  automatically via stdin JSON; other agents should export
+  $AGENT_COLLAB_SESSION_KEY or pass --session-key.
 
 Options:
   --challenger <claude|codex|gemini>  Agent to invoke for the review pass.
@@ -168,6 +187,9 @@ load_config() {
         ;;
       AGENT_COLLAB_CLAUDE_EFFORT)
         CONFIG_CLAUDE_EFFORT="$value"
+        ;;
+      AGENT_COLLAB_INBOX_DB)
+        CONFIG_INBOX_DB="$value"
         ;;
       *)
         warn "ignoring unknown config key in $file: $key"
@@ -677,12 +699,65 @@ if [[ $# -gt 0 ]]; then
   shift
 fi
 
+resolve_peer_inbox_script() {
+  if [[ -n "${AGENT_COLLAB_PEER_INBOX_DB_SCRIPT:-}" ]]; then
+    printf '%s\n' "$AGENT_COLLAB_PEER_INBOX_DB_SCRIPT"
+    return
+  fi
+
+  local self_dir
+  self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  if [[ -f "$self_dir/peer-inbox-db.py" ]]; then
+    printf '%s\n' "$self_dir/peer-inbox-db.py"
+    return
+  fi
+
+  if [[ -f "$HOME/.agent-collab/scripts/peer-inbox-db.py" ]]; then
+    printf '%s\n' "$HOME/.agent-collab/scripts/peer-inbox-db.py"
+    return
+  fi
+
+  err "peer-inbox-db.py not found (checked: AGENT_COLLAB_PEER_INBOX_DB_SCRIPT, $self_dir, ~/.agent-collab/scripts/)"
+}
+
+dispatch_peer_inbox() {
+  local top_mode="$1"
+  shift
+
+  [[ $# -ge 1 ]] || err "missing subcommand for '$top_mode' (try: register, close, list, send, receive)"
+  local sub="$1"
+  shift
+
+  local python_cmd
+  if command -v python3 >/dev/null 2>&1; then
+    python_cmd="python3"
+  else
+    err "python3 not on PATH; peer-inbox requires python3"
+  fi
+
+  local script
+  script="$(resolve_peer_inbox_script)"
+
+  # Load repo-local config so AGENT_COLLAB_INBOX_DB flows through, but
+  # prefer caller's existing env var (explicit wins over file).
+  REPO_ROOT="$(detect_repo_root)"
+  load_config "$REPO_ROOT/.agent-collab.env"
+  if [[ -n "$CONFIG_INBOX_DB" && -z "${AGENT_COLLAB_INBOX_DB:-}" ]]; then
+    export AGENT_COLLAB_INBOX_DB="$CONFIG_INBOX_DB"
+  fi
+
+  exec "$python_cmd" "$script" "${top_mode}-${sub}" "$@"
+}
+
 case "$MODE" in
   help|-h|--help)
     usage
     exit 0
     ;;
   challenge|verify) ;;
+  session|peer)
+    dispatch_peer_inbox "$MODE" "$@"
+    ;;
   *)
     err "unknown subcommand: $MODE"
     ;;

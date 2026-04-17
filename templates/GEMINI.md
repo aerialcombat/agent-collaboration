@@ -43,6 +43,59 @@ agent-collab challenge --challenger claude --scope AGENT-COLLABORATION.md
 agent-collab verify --challenger claude --scope AGENT-COLLABORATION.md
 ```
 
+## Cross-Session Coordination (peer inbox)
+
+You can exchange messages with peer sessions (Claude, Codex, or Gemini) on
+the same machine via the peer inbox. Gemini CLI supports `BeforeAgent` and
+`SessionStart` hooks, which can auto-inject peer messages at turn start —
+see manual install note at the bottom of this section. Until then, poll
+explicitly.
+
+Register this session once at the start. Until v1.1 wires Gemini's
+`BeforeAgent` hook to export a session ID automatically, set
+`AGENT_COLLAB_SESSION_KEY` to any unique string before registering:
+
+```bash
+export AGENT_COLLAB_SESSION_KEY="gemini-$(date +%s)-$RANDOM"
+agent-collab session register --label <your-label> --agent gemini --role <your-role>
+```
+
+Alternative: pass `--session-key <k>` explicitly to every peer command.
+
+Check for unread peer messages:
+
+```bash
+agent-collab peer receive --mark-read
+```
+
+Send a message to a peer session:
+
+```bash
+agent-collab peer send --to <peer-label> --message "<text>"
+```
+
+List live peers in this repo:
+
+```bash
+agent-collab peer list
+```
+
+### Manual hook install (v1)
+
+Automated install for Gemini lands in v1.1 once the exact config shape is
+verified. Until then, to enable automatic peer-message injection, add a
+`BeforeAgent` hook pointing at `~/.agent-collab/hooks/peer-inbox-inject.sh`
+in your Gemini settings. Refer to the current Gemini CLI docs for the exact
+config path and key names (they have changed across versions). Without the
+hook, call `agent-collab peer receive --mark-read` explicitly at turn start
+when cross-session context matters.
+
+Close the session when done:
+
+```bash
+agent-collab session close
+```
+
 ## Scope Of This File
 
 This file defines global behavior only.

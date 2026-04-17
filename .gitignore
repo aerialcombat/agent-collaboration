@@ -1,3 +1,5 @@
 .DS_Store
 .agent-collab/reviews/
 docs/superpowers/
+scripts/__pycache__/
+**/__pycache__/

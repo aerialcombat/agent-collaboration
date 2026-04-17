@@ -46,6 +46,185 @@ assert_glob_exists() {
 
 trap cleanup EXIT
 
+run_peer_inbox_tests() {
+  local inbox_home="$TMP_ROOT/peer-inbox-home"
+  local db="$inbox_home/sessions.db"
+  local agent_collab="$PROJECT_ROOT/scripts/agent-collab"
+  local repo_a="$TMP_ROOT/peer-inbox-a"
+  local repo_b="$TMP_ROOT/peer-inbox-b"
+  local key_a="session-key-A-abc123"
+  local key_b="session-key-B-def456"
+
+  mkdir -p "$repo_a/sub/nested" "$repo_b" "$inbox_home"
+  local repo_a_real repo_b_real
+  repo_a_real="$(cd "$repo_a" && pwd -P)"
+  repo_b_real="$(cd "$repo_b" && pwd -P)"
+
+  echo "-- peer-inbox: basic register/send/receive --"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" AGENT_COLLAB_HOOK_LOG="$inbox_home/hook.log" \
+    "$agent_collab" session register --cwd "$repo_a_real" --label backend --agent claude --role lead >/dev/null
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" session register --cwd "$repo_b_real" --label frontend --agent codex >/dev/null
+
+  local marker_a="$repo_a_real/.agent-collab/sessions"
+  [[ -d "$marker_a" ]] || fail "sessions dir not created for repo_a"
+  local marker_file
+  marker_file="$(ls "$marker_a"/*.json | head -1)"
+  [[ -f "$marker_file" ]] || fail "per-session marker not written for repo_a"
+  python3 -c "
+import json, sys
+d = json.load(open('$marker_file'))
+assert d['cwd'] == '$repo_a_real', f\"marker cwd wrong: {d['cwd']}\"
+assert d['label'] == 'backend', f\"marker label wrong: {d['label']}\"
+assert d['session_key'] == '$key_a', f\"session_key wrong: {d['session_key']}\"
+" || fail "marker JSON shape wrong"
+
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" peer send --cwd "$repo_a_real" --to frontend --to-cwd "$repo_b_real" --message "hello, testing 123" >/dev/null
+
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer receive --cwd "$repo_b_real" --format plain \
+    | grep -q "hello, testing 123" || fail "message not received"
+
+  echo "-- peer-inbox: two-sessions-same-cwd (canonical use case) --"
+  local shared_repo="$TMP_ROOT/peer-inbox-shared"
+  mkdir -p "$shared_repo"
+  local shared_real
+  shared_real="$(cd "$shared_repo" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" session register --cwd "$shared_real" --label be --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" session register --cwd "$shared_real" --label fe --agent codex >/dev/null
+  local shared_marker_count
+  shared_marker_count=$(ls "$shared_real/.agent-collab/sessions/"*.json 2>/dev/null | wc -l | tr -d ' ')
+  [[ "$shared_marker_count" == "2" ]] || fail "expected 2 per-session markers in shared repo, got $shared_marker_count"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" peer send --cwd "$shared_real" --to fe --message "same-cwd message" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer receive --cwd "$shared_real" --format plain --mark-read \
+    | grep -q "same-cwd message" || fail "same-cwd message not delivered"
+
+  echo "-- peer-inbox: disambiguation error when multiple sessions, no key, no --as --"
+  if AGENT_COLLAB_INBOX_DB="$db" \
+       "$agent_collab" peer receive --cwd "$shared_real" >/dev/null 2>&1; then
+    fail "expected error for ambiguous self-resolution"
+  fi
+
+  echo "-- peer-inbox: adversarial content round-trip --"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" peer send --cwd "$repo_a_real" --to frontend --to-cwd "$repo_b_real" \
+      --message "'; DROP TABLE inbox; --
+quote \"double\" newline
+semicolon; and readfile('/etc/passwd')" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer receive --cwd "$repo_b_real" --format json --mark-read \
+    | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+bodies = [r['body'] for r in rows]
+assert any('DROP TABLE' in b for b in bodies), 'adversarial SQL content lost'
+assert any('readfile' in b for b in bodies), 'readfile content lost'
+" || fail "adversarial content did not round-trip"
+
+  echo "-- peer-inbox: oversize rejection --"
+  local big
+  big="$(python3 -c 'print("x" * 9000)')"
+  if AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+       "$agent_collab" peer send --cwd "$repo_a_real" --to frontend --to-cwd "$repo_b_real" --message "$big" >/dev/null 2>&1; then
+    fail "oversize message was accepted"
+  fi
+
+  echo "-- peer-inbox: label collision from different session key rejected --"
+  if AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="different-key-xyz" \
+       "$agent_collab" session register --cwd "$repo_a_real" --label backend --agent claude >/dev/null 2>&1; then
+    fail "duplicate label from different session key was accepted"
+  fi
+  echo "-- peer-inbox: same session key re-registering is idempotent --"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" session register --cwd "$repo_a_real" --label backend --agent claude >/dev/null \
+    || fail "idempotent re-register by same session key failed"
+
+  echo "-- peer-inbox: walk-parents marker discovery from subdir --"
+  (
+    cd "$repo_a_real/sub/nested"
+    AGENT_COLLAB_INBOX_DB="$db" "$agent_collab" session list | grep -q backend \
+      || fail "walk-parents discovery failed from subdir"
+  )
+
+  echo "-- peer-inbox: path drift detection --"
+  local fake_repo="$TMP_ROOT/peer-inbox-fake"
+  mkdir -p "$fake_repo/.agent-collab/sessions"
+  cp "$marker_file" "$fake_repo/.agent-collab/sessions/"
+  if AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+       "$agent_collab" peer list --cwd "$(cd "$fake_repo" && pwd -P)" >/dev/null 2>&1; then
+    fail "path drift was not detected on copied marker"
+  fi
+
+  echo "-- peer-inbox: concurrent send hammer --"
+  local before_count
+  before_count=$(AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer receive --cwd "$repo_b_real" --format json \
+    | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+  for i in $(seq 1 15); do
+    AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+      "$agent_collab" peer send --cwd "$repo_a_real" --to frontend --to-cwd "$repo_b_real" --message "hammer-$i" >/dev/null &
+  done
+  wait
+  local total
+  total=$(AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer receive --cwd "$repo_b_real" --format json \
+    | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
+  [[ $((total - before_count)) -eq 15 ]] || fail "concurrent sends lost messages (got $((total - before_count)))"
+
+  echo "-- peer-inbox: concurrent mark-read claim atomicity --"
+  local claim_dir="$TMP_ROOT/peer-inbox-claims"
+  mkdir -p "$claim_dir"
+  for i in 1 2 3 4 5; do
+    AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+      "$agent_collab" peer receive --cwd "$repo_b_real" --format json --mark-read > "$claim_dir/recv-$i.json" &
+  done
+  wait
+  python3 <<PY || fail "claim atomicity violated"
+import json
+ids = []
+for i in range(1, 6):
+    rows = json.load(open("$claim_dir/recv-$i.json"))
+    ids.extend(r["id"] for r in rows)
+if len(ids) != len(set(ids)):
+    raise SystemExit(f"duplicates: {len(ids)} claimed vs {len(set(ids))} unique")
+PY
+
+  echo "-- peer-inbox: hook emits valid JSON and passes session_id through --"
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+    "$agent_collab" peer send --cwd "$repo_a_real" --to frontend --to-cwd "$repo_b_real" --message "hook test" >/dev/null
+  (
+    cd "$repo_b_real"
+    PATH="$PROJECT_ROOT/scripts:$PATH" \
+    AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_HOOK_LOG="$inbox_home/hook.log" \
+      "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" <<EOF \
+      | python3 -c "
+import json, sys
+out = sys.stdin.read()
+if not out:
+    raise SystemExit('hook produced empty output despite unread message')
+d = json.loads(out)
+assert d['hookSpecificOutput']['hookEventName'] == 'UserPromptSubmit'
+assert '<peer-inbox' in d['hookSpecificOutput']['additionalContext']
+"
+{"session_id": "$key_b", "other": "stuff"}
+EOF
+  ) || fail "hook JSON invalid or missing peer-inbox block"
+
+  echo "-- peer-inbox: cwd newline rejected --"
+  # Create a cwd with a newline name to test rejection
+  if AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="temp-key-newline" \
+       "$agent_collab" session register --cwd $'/tmp/newline\ndir' --label x --agent claude >/dev/null 2>&1; then
+    fail "cwd with newline was accepted"
+  fi
+
+  echo "peer-inbox: all checks PASS"
+}
+
 mkdir -p "$TEST_HOME/.claude" "$TEST_HOME/.codex" "$TEST_HOME/.gemini" "$TEST_BIN" "$SAMPLE_REPO/docs"
 SAMPLE_REPO_REAL="$(cd "$SAMPLE_REPO" && pwd -P)"
 mkdir -p "$PYTHON_ONLY_BIN"
@@ -588,5 +767,7 @@ if grep -Fq "<!-- BEGIN agent-collaboration -->" "$TEST_HOME/.gemini/GEMINI.md";
 fi
 [[ ! -e "$TEST_BIN/agent-collab" ]] || fail "agent-collab command still present after uninstall"
 assert_glob_exists "$TEST_BIN/agent-collab.bak.*"
+
+run_peer_inbox_tests
 
 echo "PASS: smoke"
