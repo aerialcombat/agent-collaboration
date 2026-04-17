@@ -187,18 +187,34 @@ challenge passes.
 
 ### "no session key available"
 
-Register refused because none of the session-key discovery paths found
-a key. Claude Code exports `CLAUDE_SESSION_ID` automatically to
-subprocesses; if you're not seeing it:
+Register refused because no session-key source was found. Claude Code
+2.1.78 does **not** export `CLAUDE_SESSION_ID` to Bash-tool subprocesses,
+but the installed `UserPromptSubmit` hook records session_ids to
+`~/.agent-collab/claude-sessions-seen/` on every prompt. If register
+still fails:
+
+1. Type any prompt first (even "hi") so the hook logs the session_id,
+   then retry register.
+2. Or set `AGENT_COLLAB_SESSION_KEY` explicitly:
+
+   ```bash
+   export AGENT_COLLAB_SESSION_KEY="$(uuidgen)"
+   ```
+
+3. Or pass `--session-key <k>` to register.
+
+### Existing registration's session_key doesn't match Claude's session_id
+
+Symptom: hook fires (visible in `~/.agent-collab/hook.log`) but fails
+with "multiple sessions registered; pass --as". Cause: the session
+registered with a random key before the hook logged the real session_id.
+
+Fix: tell your Claude session its real session_id (grep the most recent
+`session_id=` line in `/tmp/peer-inbox-hook-debug.log` during instrumentation,
+or inspect `~/.agent-collab/claude-sessions-seen/`) then adopt it:
 
 ```bash
-echo "$CLAUDE_SESSION_ID"  # should be a UUID
-```
-
-If empty, set one manually:
-
-```bash
-export AGENT_COLLAB_SESSION_KEY="$(uuidgen)"
+agent-collab session adopt --label <your-label> --session-id <claude-uuid>
 ```
 
 ### "multiple sessions registered in <path>; pass --as <label>"

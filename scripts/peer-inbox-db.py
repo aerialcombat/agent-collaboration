@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 DEFAULT_DB = Path.home() / ".agent-collab" / "sessions.db"
+DEFAULT_CLAUDE_SESSION_LOG_DIR = Path.home() / ".agent-collab" / "claude-sessions-seen"
 SESSIONS_DIR_REL = ".agent-collab/sessions"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 VALID_AGENTS = {"claude", "codex", "gemini"}
@@ -104,6 +105,62 @@ def discover_session_key() -> Optional[str]:
         if val:
             return val
     return None
+
+
+def cwd_log_path(cwd: Path) -> Path:
+    """Path where the hook logs recent Claude session_ids seen in a cwd."""
+    cwd_hash = hashlib.sha256(str(cwd).encode("utf-8")).hexdigest()[:16]
+    return DEFAULT_CLAUDE_SESSION_LOG_DIR / f"{cwd_hash}.log"
+
+
+def log_seen_session(cwd: Path, session_id: str) -> None:
+    """Append (timestamp, session_id) to the per-cwd seen log.
+
+    Called by the hook on every UserPromptSubmit so `session register` and
+    `session adopt` can match a Claude session that never exported
+    $CLAUDE_SESSION_ID to the agent's Bash-tool subprocess.
+    """
+    if not session_id:
+        return
+    log = cwd_log_path(cwd)
+    log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        log.parent.chmod(0o700)
+    except OSError:
+        pass
+    # Append only — easy to audit, no races beyond standard O_APPEND guarantees.
+    with log.open("a", encoding="utf-8") as f:
+        f.write(f"{now_iso()}\t{session_id}\n")
+    try:
+        log.chmod(0o600)
+    except OSError:
+        pass
+
+
+def recent_seen_sessions(cwd: Path, limit: int = 20) -> list[str]:
+    """Return the most recent Claude session_ids seen in this cwd, newest first,
+    deduplicated."""
+    log = cwd_log_path(cwd)
+    if not log.is_file():
+        return []
+    seen: list[str] = []
+    dedupe: set[str] = set()
+    with log.open("r", encoding="utf-8") as f:
+        for line in reversed(f.readlines()):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            sid = parts[1].strip()
+            if not sid or sid in dedupe:
+                continue
+            dedupe.add(sid)
+            seen.append(sid)
+            if len(seen) >= limit:
+                break
+    return seen
 
 
 def session_key_hash(key: str) -> str:
@@ -365,11 +422,35 @@ def cmd_session_register(args: argparse.Namespace) -> int:
 
     session_key = args.session_key or discover_session_key()
     if session_key is None:
+        # Fallback: consult the hook-seen-sessions log. The UserPromptSubmit
+        # hook records each Claude session_id it sees in this cwd, so after
+        # any user prompt we can match an unregistered session_id to this
+        # registration. Pick the most recent session_id not yet registered.
+        seen = recent_seen_sessions(cwd)
+        if seen:
+            conn = open_db()
+            try:
+                already = {
+                    r["session_key"]
+                    for r in conn.execute(
+                        "SELECT session_key FROM sessions WHERE cwd = ? AND session_key IS NOT NULL",
+                        (str(cwd),),
+                    ).fetchall()
+                }
+            finally:
+                conn.close()
+            for sid in seen:
+                if sid not in already:
+                    session_key = sid
+                    break
+    if session_key is None:
         err(
-            "no session key available. Set AGENT_COLLAB_SESSION_KEY, or "
-            "CLAUDE_SESSION_ID/CODEX_SESSION_ID/GEMINI_SESSION_ID, or pass "
-            "--session-key explicitly. This keys the per-session marker "
-            "so two sessions in the same repo don't overwrite each other.",
+            "no session key available. This session's runtime did not export "
+            "a session ID env var, and the UserPromptSubmit hook has not yet "
+            "logged one for this cwd. Either (a) type any prompt in this "
+            "Claude session first so the hook logs its session_id, then retry "
+            "register, or (b) set AGENT_COLLAB_SESSION_KEY explicitly, or "
+            "(c) pass --session-key <key>.",
             EXIT_CONFIG_ERROR,
         )
 
@@ -736,6 +817,69 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_hook_log_session(args: argparse.Namespace) -> int:
+    """Hook-only helper: record a Claude session_id seen in this cwd."""
+    cwd = resolve_cwd(args.cwd)
+    sid = args.session_id.strip()
+    if not sid:
+        return EXIT_OK  # silent no-op on empty input
+    log_seen_session(cwd, sid)
+    return EXIT_OK
+
+
+def cmd_session_adopt(args: argparse.Namespace) -> int:
+    """Re-key an existing registration to a known Claude session_id.
+
+    Used to reconcile sessions that registered with a random key before the
+    hook started logging session_ids. Rewrites the DB row's session_key and
+    renames the marker file.
+    """
+    validate_label(args.label)
+    cwd = resolve_cwd(args.cwd)
+    new_key = args.session_id.strip()
+    if not new_key:
+        err("--session-id is empty", EXIT_VALIDATION)
+
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT session_key FROM sessions WHERE cwd = ? AND label = ?",
+            (str(cwd), args.label),
+        ).fetchone()
+        if row is None:
+            err(
+                f"no registered session for label {args.label!r} in {cwd}",
+                EXIT_NOT_FOUND,
+            )
+        old_key = row["session_key"]
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE sessions SET session_key = ? WHERE cwd = ? AND label = ?",
+            (new_key, str(cwd), args.label),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    if old_key:
+        old_marker = marker_path_for(cwd, old_key)
+        if old_marker.is_file():
+            old_marker.unlink()
+    new_marker = marker_path_for(cwd, new_key)
+    new_marker.parent.mkdir(mode=0o755, exist_ok=True, parents=True)
+    new_marker.write_text(
+        json.dumps(
+            {"cwd": str(cwd), "label": args.label, "session_key": new_key},
+            ensure_ascii=False,
+        )
+    )
+    print(
+        f"adopted: {args.label} at {cwd} "
+        f"[session_key={session_key_hash(new_key)}]"
+    )
+    return EXIT_OK
+
+
 def cmd_peer_list(args: argparse.Namespace) -> int:
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
@@ -796,6 +940,18 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--session-key", dest="session_key")
     sr.add_argument("--force", action="store_true")
     sr.set_defaults(func=cmd_session_register)
+
+    hl = sub.add_parser("hook-log-session")
+    hl.add_argument("--cwd", required=True)
+    hl.add_argument("--session-id", required=True, dest="session_id")
+    hl.set_defaults(func=cmd_hook_log_session)
+
+    ad = sub.add_parser("session-adopt")
+    ad.add_argument("--cwd")
+    ad.add_argument("--label", required=True)
+    ad.add_argument("--session-id", required=True, dest="session_id",
+                    help="Claude session_id to adopt as the registered session's session_key")
+    ad.set_defaults(func=cmd_session_adopt)
 
     sc = sub.add_parser("session-close")
     sc.add_argument("--cwd")

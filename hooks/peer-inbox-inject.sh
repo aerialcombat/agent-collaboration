@@ -1,64 +1,68 @@
 #!/usr/bin/env bash
-# peer-inbox-inject.sh — Claude Code UserPromptSubmit hook (also works for
-# Gemini BeforeAgent once install is wired in v1.1).
+# peer-inbox-inject.sh — Claude UserPromptSubmit hook.
 #
-# Contract: emits JSON on stdout with hookSpecificOutput.additionalContext
-# containing unread peer-inbox messages, or empty output when there are none.
-# Fails open on every error — a broken inbox must never block the user's turn.
+# Two jobs:
+#   1. Log the Claude session_id seen in this cwd to
+#      ~/.agent-collab/claude-sessions-seen/<cwd-hash>.log so that
+#      `agent-collab session register` can later adopt it — needed when the
+#      runtime (Claude Code 2.1.78) doesn't export $CLAUDE_SESSION_ID to
+#      Bash-tool subprocesses.
+#   2. Fetch unread peer messages as hookSpecificOutput.additionalContext
+#      JSON and emit to stdout.
 #
-# Installed to: ~/.agent-collab/hooks/peer-inbox-inject.sh
-# Logs failures to: ~/.agent-collab/hook.log (override via AGENT_COLLAB_HOOK_LOG)
+# Fail-open on every error path: the user's turn must never be blocked.
 
 set -uo pipefail
-
 LOG="${AGENT_COLLAB_HOOK_LOG:-$HOME/.agent-collab/hook.log}"
-
 log() {
-  # best-effort logging; never fail the hook over a log write
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
   printf '[%s] peer-inbox-inject: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
     >>"$LOG" 2>/dev/null || true
 }
-
-# Fail open on every exit path.
 trap 'rc=$?; [[ $rc -ne 0 ]] && log "failed at line $LINENO exit $rc"; exit 0' ERR EXIT
 
-if ! command -v agent-collab >/dev/null 2>&1; then
-  log "agent-collab not on PATH; skipping"
-  exit 0
-fi
-
-# Claude Code passes hook metadata as JSON on stdin. Extract session_id and
-# export as CLAUDE_SESSION_ID so peer-inbox can resolve self-identity when
-# multiple sessions share a cwd. Fail open if stdin or parsing fails.
-if ! command -v python3 >/dev/null 2>&1; then
-  log "python3 not on PATH; skipping"
-  exit 0
-fi
+command -v agent-collab >/dev/null 2>&1 || { log "agent-collab not on PATH"; exit 0; }
+command -v python3 >/dev/null 2>&1 || { log "python3 not on PATH"; exit 0; }
 
 hook_stdin="$(cat 2>/dev/null || true)"
+
+# Extract session_id and the Claude-reported cwd from the stdin JSON.
 if [[ -n "$hook_stdin" ]]; then
-  extracted="$(HOOK_STDIN="$hook_stdin" python3 -c '
+  parsed="$(HOOK_STDIN="$hook_stdin" python3 -c '
 import json, os, sys
 try:
     d = json.loads(os.environ.get("HOOK_STDIN", ""))
-    print(d.get("session_id", ""))
+    if isinstance(d, dict):
+        print(d.get("session_id", ""))
+        print(d.get("cwd", ""))
 except Exception:
-    pass
+    print("")
+    print("")
 ' 2>/dev/null || true)"
-  if [[ -n "$extracted" ]]; then
-    export CLAUDE_SESSION_ID="$extracted"
-  fi
+  session_id="$(printf '%s' "$parsed" | sed -n '1p')"
+  hook_cwd="$(printf '%s' "$parsed" | sed -n '2p')"
+else
+  session_id=""
+  hook_cwd=""
+fi
+
+# Use hook-reported cwd when present (Claude is authoritative about where
+# the session is running); fall back to shell $PWD otherwise.
+use_cwd="${hook_cwd:-$PWD}"
+
+if [[ -n "$session_id" ]]; then
+  export CLAUDE_SESSION_ID="$session_id"
+  # Record seen session_id so future `session register` calls can find it.
+  agent-collab hook-log-session --cwd "$use_cwd" --session-id "$session_id" \
+    >/dev/null 2>>"$LOG" || log "hook-log-session failed"
 fi
 
 # peer receive --format hook-json emits the full Claude UserPromptSubmit
 # envelope. Empty output (no unread messages) means no injection.
-if ! output="$(agent-collab peer receive --format hook-json --mark-read 2>>"$LOG")"; then
-  log "peer receive failed; skipping"
+if ! output="$(agent-collab peer receive --cwd "$use_cwd" --format hook-json --mark-read 2>>"$LOG")"; then
+  log "peer receive failed"
   exit 0
 fi
 
-if [[ -n "$output" ]]; then
-  printf '%s' "$output"
-fi
+[[ -n "$output" ]] && printf '%s' "$output"
 exit 0

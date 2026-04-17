@@ -51,6 +51,9 @@ Usage:
   agent-collab verify --challenger claude|codex|gemini [options]
   agent-collab session register --label <l> --agent claude|codex|gemini
                                 [--role <r>] [--session-key <k>] [--force]
+  agent-collab session adopt --label <l> --session-id <claude-uuid>
+                                Re-key an existing registration to a real
+                                Claude session_id so the hook can resolve.
   agent-collab session close [--label <l>] [--session-key <k>]
   agent-collab session list [--all-cwds] [--include-stale] [--json]
   agent-collab peer send --to <label> [--as <label>] [--to-cwd <path>]
@@ -755,7 +758,7 @@ case "$MODE" in
     exit 0
     ;;
   challenge|verify) ;;
-  session|peer)
+  session|peer|hook)
     dispatch_peer_inbox "$MODE" "$@"
     ;;
   *)
