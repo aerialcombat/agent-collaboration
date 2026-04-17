@@ -61,6 +61,13 @@ Skip if `command -v agent-collab` already succeeds AND `~/Development/agent-coll
    ✓ agent-collab installed
    ✓ slash commands: /agent-collab, /peer
    ✓ UserPromptSubmit hook installed in ~/.claude/settings.json
+   ✓ peer-inbox MCP registered in ~/.claude.json (user scope)
+
+   Default delivery: UserPromptSubmit hook — messages arrive on next prompt.
+   Real-time delivery (optional): launch Claude with
+       claude --dangerously-load-development-channels server:peer-inbox
+   and then run /agent-collab. The flag is a Claude Code preview feature;
+   without it, `/peer check` reads the inbox on demand.
 
    Restart Claude Code (or run /agent-collab now) to register this session.
    In another terminal, run /agent-collab there too and join with the pair key.

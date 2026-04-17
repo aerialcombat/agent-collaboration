@@ -325,6 +325,82 @@ remove_skill_dir() {
   echo "uninstalled: $skill_file"
 }
 
+merge_user_mcp_server() {
+  # Ensure ~/.claude.json has a user-level mcpServers.peer-inbox entry so
+  # that `claude --dangerously-load-development-channels server:peer-inbox`
+  # resolves in any cwd, not only repos that happen to declare it locally.
+  local channel_script="$1"
+  local claude_config="$HOME/.claude.json"
+  local timestamp="$2"
+
+  CHANNEL_SCRIPT="$channel_script" CLAUDE_CONFIG="$claude_config" TS="$timestamp" python3 <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+config_path = Path(os.environ["CLAUDE_CONFIG"])
+channel = os.environ["CHANNEL_SCRIPT"]
+
+if config_path.exists() and config_path.stat().st_size > 0:
+    data = json.loads(config_path.read_text())
+else:
+    data = {}
+
+if not isinstance(data, dict):
+    print(f"error: {config_path} root is not a JSON object")
+    raise SystemExit(1)
+
+servers = data.setdefault("mcpServers", {})
+if not isinstance(servers, dict):
+    print(f"error: {config_path}:mcpServers is not an object")
+    raise SystemExit(1)
+
+desired = {"command": "python3", "args": [channel]}
+if servers.get("peer-inbox") == desired:
+    print(f"current: {config_path} (peer-inbox mcpServers)")
+    raise SystemExit(0)
+
+if config_path.exists():
+    shutil.copy2(config_path, f"{config_path}.bak.{os.environ['TS']}")
+
+servers["peer-inbox"] = desired
+data["mcpServers"] = servers
+config_path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"installed: {config_path} (peer-inbox mcpServers)")
+PY
+}
+
+remove_user_mcp_server() {
+  local claude_config="$HOME/.claude.json"
+  local timestamp="$1"
+
+  CLAUDE_CONFIG="$claude_config" TS="$timestamp" python3 <<'PY'
+import json
+import os
+import shutil
+from pathlib import Path
+
+config_path = Path(os.environ["CLAUDE_CONFIG"])
+if not config_path.exists():
+    print(f"missing: {config_path}")
+    raise SystemExit(0)
+
+data = json.loads(config_path.read_text())
+servers = data.get("mcpServers") or {}
+if "peer-inbox" not in servers:
+    print(f"no managed entry: {config_path} (peer-inbox mcpServers)")
+    raise SystemExit(0)
+
+shutil.copy2(config_path, f"{config_path}.bak.{os.environ['TS']}")
+del servers["peer-inbox"]
+if not servers:
+    data.pop("mcpServers", None)
+config_path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"uninstalled: {config_path} (peer-inbox mcpServers)")
+PY
+}
+
 merge_claude_hook() {
   local settings="$1"
   local hook_command="$2"
@@ -504,6 +580,7 @@ case "$MODE" in
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-channel.py" "$PEER_INBOX_CHANNEL_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+    merge_user_mcp_server "$PEER_INBOX_CHANNEL_SCRIPT" "$TIMESTAMP"
 
     # Slash commands: /agent-collab and /peer in Claude Code.
     for cmd in "${SLASH_COMMANDS[@]}"; do
@@ -545,6 +622,7 @@ case "$MODE" in
     remove_installed_block "$GEMINI_TARGET"
     remove_managed_command "$COMMAND_TARGET"
     remove_claude_hook "$CLAUDE_SETTINGS" "$TIMESTAMP"
+    remove_user_mcp_server "$TIMESTAMP"
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"

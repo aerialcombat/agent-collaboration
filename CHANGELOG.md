@@ -56,6 +56,19 @@ Commit SHAs reference the `agent-collaboration` repo.
 - Auto-infer `--to` single-peer + ambiguity.
 - Cross-runtime env-var selection (`CLAUDE/CODEX_SESSION_ID`).
 
+### Packaging
+- **peer-inbox MCP server auto-registered at user scope** in
+  `~/.claude.json` by `install-global-protocol`. Previously the
+  MCP declaration had to live in each repo's `.mcp.json`, so
+  `claude --dangerously-load-development-channels server:peer-inbox`
+  only worked in repos that happened to have the entry. Now any
+  cwd works. Removed on uninstall; existing `mcpServers` entries
+  (e.g. `playwright`) are preserved.
+- Install skill and `/agent-collab` slash command now document
+  both delivery modes clearly: hook (default, zero-config,
+  arrives on next prompt) and MCP channels (real-time mid-turn,
+  requires the preview flag per session).
+
 ### Codex/Gemini zero-config
 - `session register --agent codex|gemini` auto-mints a session key
   when no env var is available. Re-register in the same `(cwd,

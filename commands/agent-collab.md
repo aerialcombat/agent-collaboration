@@ -1,5 +1,17 @@
 Register this Claude Code session for peer-inbox collaboration with another agent session (Claude, Codex, or Gemini) on the same machine.
 
+### Delivery modes
+
+By default, messages arrive via the `UserPromptSubmit` hook — they land in the LLM's context the next time the user submits a prompt. This is zero-config and always works.
+
+For **real-time mid-turn delivery**, launch Claude with:
+
+```
+claude --dangerously-load-development-channels server:peer-inbox
+```
+
+The MCP channel then pushes messages into the active context without waiting for a user prompt. The flag is required per-session (it's a Claude Code preview feature), and `install-global-protocol` registers `peer-inbox` at user scope so any session can load it. Without the flag, `/peer check` reads the inbox on demand.
+
 User-provided arguments: $ARGUMENTS
 
 ## What to do
