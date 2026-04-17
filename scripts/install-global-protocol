@@ -18,6 +18,8 @@ PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
 PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"
+SLASH_COMMANDS=("agent-collab.md" "peer.md")
 
 MODE="${1:-install}"
 
@@ -245,6 +247,42 @@ remove_peer_inbox_file() {
   echo "uninstalled: $target"
 }
 
+install_slash_command() {
+  local source="$1"
+  local target="$2"
+
+  [[ -s "$source" ]] || err "missing or empty slash command: $source"
+
+  mkdir -p "$(dirname "$target")"
+
+  if [[ -f "$target" ]] && cmp -s "$source" "$target"; then
+    echo "current: $target"
+    return
+  fi
+
+  if [[ -f "$target" ]]; then
+    cp "$target" "${target}.bak.${TIMESTAMP}"
+    echo "backup: ${target}.bak.${TIMESTAMP}"
+  fi
+
+  cp "$source" "$target"
+  echo "installed: $target"
+}
+
+remove_slash_command() {
+  local target="$1"
+
+  if [[ ! -f "$target" ]]; then
+    echo "missing: $target"
+    return
+  fi
+
+  cp "$target" "${target}.bak.${TIMESTAMP}"
+  echo "backup: ${target}.bak.${TIMESTAMP}"
+  rm -f "$target"
+  echo "uninstalled: $target"
+}
+
 merge_claude_hook() {
   local settings="$1"
   local hook_command="$2"
@@ -425,6 +463,11 @@ case "$MODE" in
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
 
+    # Slash commands: /agent-collab and /peer in Claude Code.
+    for cmd in "${SLASH_COMMANDS[@]}"; do
+      install_slash_command "$PROJECT_ROOT/commands/$cmd" "$CLAUDE_COMMANDS_DIR/$cmd"
+    done
+
     rm -f "$claude_rendered" "$codex_rendered" "$gemini_rendered" "$claude_block" "$codex_block" "$gemini_block"
 
     echo
@@ -437,6 +480,10 @@ case "$MODE" in
     echo "  hook:    $PEER_INBOX_HOOK_SCRIPT"
     echo "  channel: $PEER_INBOX_CHANNEL_SCRIPT (launch claude with --dangerously-load-development-channels server:peer-inbox)"
     echo "  db:      $PEER_INBOX_HOME/sessions.db (created on first session register)"
+    echo "slash commands:"
+    for cmd in "${SLASH_COMMANDS[@]}"; do
+      echo "  $CLAUDE_COMMANDS_DIR/$cmd"
+    done
     if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
       echo "warn: $BIN_DIR is not on PATH"
     fi
@@ -450,6 +497,9 @@ case "$MODE" in
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
+    for cmd in "${SLASH_COMMANDS[@]}"; do
+      remove_slash_command "$CLAUDE_COMMANDS_DIR/$cmd"
+    done
     # Intentional: never remove $PEER_INBOX_HOME/sessions.db — user data.
     ;;
   *)
