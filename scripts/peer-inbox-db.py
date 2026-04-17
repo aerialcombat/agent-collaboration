@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html as html_lib
 import json
 import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -880,6 +882,212 @@ def cmd_session_adopt(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_peer_watch(args: argparse.Namespace) -> int:
+    """Tail new inbox rows addressed to self. Blocks until Ctrl-C.
+
+    Read-only: does not mark messages read. The UserPromptSubmit hook still
+    consumes them on the next real turn.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+    interval = max(0.5, float(args.interval))
+
+    conn = open_db()
+    try:
+        last_id_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS mx FROM inbox "
+            "WHERE to_cwd = ? AND to_label = ?",
+            (str(self_cwd), self_label),
+        ).fetchone()
+    finally:
+        conn.close()
+    last_id = last_id_row["mx"] if args.only_new else 0
+    if args.since_id is not None:
+        last_id = max(last_id, args.since_id)
+
+    header = f"watching inbox for {self_label} at {self_cwd} (Ctrl-C to stop)"
+    print(header, file=sys.stderr)
+    if not args.only_new and last_id == 0:
+        print("showing all history, then new messages as they arrive:",
+              file=sys.stderr)
+
+    try:
+        while True:
+            conn = open_db()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id, from_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE to_cwd = ? AND to_label = ? AND id > ?
+                    ORDER BY id ASC
+                    """,
+                    (str(self_cwd), self_label, last_id),
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                marker = " " if r["read_at"] else "*"  # * = unread
+                print(
+                    f"[{r['created_at']}] {marker} {r['from_label']} → {self_label}:"
+                )
+                for line in str(r["body"]).splitlines() or [""]:
+                    print(f"  {line}")
+                print()
+                last_id = r["id"]
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("(stopped)", file=sys.stderr)
+        return EXIT_OK
+
+
+def cmd_peer_replay(args: argparse.Namespace) -> int:
+    """Emit a self-contained HTML transcript of messages in this cwd.
+
+    Scope: all messages where to_cwd OR from_cwd equals the caller's cwd.
+    If --as is given, narrow to conversations involving that label.
+    """
+    cwd = resolve_cwd(args.cwd)
+    conn = open_db()
+    try:
+        if args.as_label:
+            validate_label(args.as_label)
+            if args.since:
+                rows = conn.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE ((to_cwd = ? AND to_label = ?) OR (from_cwd = ? AND from_label = ?))
+                      AND created_at >= ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (str(cwd), args.as_label, str(cwd), args.as_label, args.since),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE (to_cwd = ? AND to_label = ?) OR (from_cwd = ? AND from_label = ?)
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (str(cwd), args.as_label, str(cwd), args.as_label),
+                ).fetchall()
+        else:
+            if args.since:
+                rows = conn.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE (to_cwd = ? OR from_cwd = ?) AND created_at >= ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (str(cwd), str(cwd), args.since),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE to_cwd = ? OR from_cwd = ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (str(cwd), str(cwd)),
+                ).fetchall()
+    finally:
+        conn.close()
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else cwd / ".agent-collab" / f"replay-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.html"
+    )
+    html = _render_replay_html(rows, cwd, args.as_label)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+    print(f"replay: {out_path} ({len(rows)} messages)")
+    return EXIT_OK
+
+
+def _color_for(label: str) -> str:
+    """Deterministic pastel hue per label."""
+    h = int(hashlib.sha256(label.encode("utf-8")).hexdigest()[:8], 16) % 360
+    return f"hsl({h}, 55%, 86%)"
+
+
+def _render_replay_html(rows, cwd: Path, as_label: Optional[str]) -> str:
+    e = html_lib.escape
+    scope = f"conversations involving {e(as_label)}" if as_label else "all cross-session messages"
+    title = f"peer-inbox replay — {scope} in {e(str(cwd))}"
+    body_rows = []
+    prev_date = None
+    for r in rows:
+        date = r["created_at"][:10]
+        if date != prev_date:
+            body_rows.append(f'<div class="day">{e(date)}</div>')
+            prev_date = date
+        bg = _color_for(str(r["from_label"]))
+        read = "read" if r["read_at"] else "unread"
+        body_rows.append(
+            f'<div class="msg">'
+            f'  <div class="meta">'
+            f'    <span class="pill" style="background:{bg}">{e(str(r["from_label"]))}</span>'
+            f'    <span class="arrow">→</span>'
+            f'    <span class="pill" style="background:{_color_for(str(r["to_label"]))}">{e(str(r["to_label"]))}</span>'
+            f'    <span class="time">{e(r["created_at"])}</span>'
+            f'    <span class="status {read}">{read}</span>'
+            f'    <span class="id">#{r["id"]}</span>'
+            f'  </div>'
+            f'  <pre class="body">{e(str(r["body"]))}</pre>'
+            f'</div>'
+        )
+    if not rows:
+        body_rows.append('<div class="empty">no messages in scope</div>')
+    return f"""<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>{e(title)}</title>
+<style>
+  :root {{
+    --bg:#0e1015; --fg:#e6e6e6; --muted:#8a8f98; --accent:#6cd9ff;
+    --panel:#181b23; --border:#262a33;
+  }}
+  * {{ box-sizing:border-box }}
+  html,body {{ margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif; }}
+  header {{ padding:16px 24px; border-bottom:1px solid var(--border);
+    position:sticky; top:0; background:var(--bg); z-index:1; }}
+  header h1 {{ font-size:15px; margin:0; color:var(--fg); font-weight:500 }}
+  header .sub {{ color:var(--muted); font-size:12px; margin-top:4px }}
+  main {{ padding:16px 24px; max-width:880px }}
+  .day {{ color:var(--muted); text-align:center; margin:24px 0 8px;
+    font-size:11px; letter-spacing:.15em; text-transform:uppercase; }}
+  .msg {{ margin:12px 0; padding:12px 14px; background:var(--panel);
+    border:1px solid var(--border); border-radius:8px; }}
+  .meta {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    font-size:12px; color:var(--muted); margin-bottom:6px; }}
+  .pill {{ color:#1a1d24; padding:2px 8px; border-radius:10px;
+    font-weight:500; font-size:11px; }}
+  .arrow {{ color:var(--muted) }}
+  .time {{ margin-left:auto; font-family:SF Mono,Menlo,monospace; }}
+  .status.unread {{ color:var(--accent) }}
+  .status.read {{ color:var(--muted) }}
+  .id {{ font-family:SF Mono,Menlo,monospace; opacity:.5 }}
+  .body {{ margin:0; white-space:pre-wrap; word-wrap:break-word;
+    color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }}
+  .empty {{ color:var(--muted); text-align:center; padding:40px 0; }}
+</style>
+<header>
+  <h1>peer-inbox replay</h1>
+  <div class=sub>{e(scope)} · {e(str(cwd))} · {len(rows)} messages · generated {e(now_iso())}</div>
+</header>
+<main>
+  {''.join(body_rows)}
+</main>
+"""
+
+
 def cmd_peer_list(args: argparse.Namespace) -> int:
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
@@ -994,6 +1202,23 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--include-stale", action="store_true")
     pl.add_argument("--json", action="store_true")
     pl.set_defaults(func=cmd_peer_list)
+
+    pw = sub.add_parser("peer-watch")
+    pw.add_argument("--cwd")
+    pw.add_argument("--as", dest="as_label")
+    pw.add_argument("--interval", type=float, default=1.0)
+    pw.add_argument("--only-new", action="store_true",
+                    help="skip history; print only messages arriving after launch")
+    pw.add_argument("--since-id", type=int)
+    pw.set_defaults(func=cmd_peer_watch)
+
+    pr = sub.add_parser("peer-replay")
+    pr.add_argument("--cwd")
+    pr.add_argument("--as", dest="as_label",
+                    help="narrow to conversations involving this label")
+    pr.add_argument("--since", help="ISO-8601 UTC; skip messages older than this")
+    pr.add_argument("--out", help="output path (defaults to .agent-collab/replay-<ts>.html)")
+    pr.set_defaults(func=cmd_peer_replay)
 
     return p
 

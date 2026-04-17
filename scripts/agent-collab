@@ -61,6 +61,12 @@ Usage:
   agent-collab peer receive [--as <label>] [--mark-read] [--since <iso8601>]
                             [--format hook|hook-json|plain|json]
   agent-collab peer list [--as <label>] [--include-stale] [--json]
+  agent-collab peer watch [--as <label>] [--interval <sec>] [--only-new]
+                                Live-tail inbox; blocks until Ctrl-C.
+  agent-collab peer replay [--as <label>] [--since <iso>] [--out <path>]
+                                Emit self-contained HTML transcript of
+                                messages in the current cwd (or narrowed to
+                                a label's conversations).
   agent-collab help
 
 Session-key discovery for peer-inbox (register and self-resolution):

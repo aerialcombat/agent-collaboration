@@ -216,11 +216,41 @@ EOF
   ) || fail "hook JSON invalid or missing peer-inbox block"
 
   echo "-- peer-inbox: cwd newline rejected --"
-  # Create a cwd with a newline name to test rejection
   if AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="temp-key-newline" \
        "$agent_collab" session register --cwd $'/tmp/newline\ndir' --label x --agent claude >/dev/null 2>&1; then
     fail "cwd with newline was accepted"
   fi
+
+  echo "-- peer-inbox: peer watch picks up live messages --"
+  local watch_out="$TMP_ROOT/peer-inbox-watch.out"
+  # Backend session watches its inbox; frontend sends a message during the window.
+  (
+    AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_a" \
+      timeout 3 "$agent_collab" peer watch --cwd "$repo_a_real" --interval 0.3 --only-new > "$watch_out" 2>&1
+  ) &
+  local watch_pid=$!
+  sleep 0.8
+  AGENT_COLLAB_INBOX_DB="$db" AGENT_COLLAB_SESSION_KEY="$key_b" \
+    "$agent_collab" peer send --cwd "$repo_b_real" --to backend --to-cwd "$repo_a_real" --message "watch-test-payload" >/dev/null
+  wait $watch_pid 2>/dev/null || true
+  grep -q "watch-test-payload" "$watch_out" || fail "peer watch did not pick up live message (saw: $(cat "$watch_out"))"
+
+  echo "-- peer-inbox: peer replay generates valid HTML --"
+  local replay_out="$TMP_ROOT/peer-inbox-replay.html"
+  AGENT_COLLAB_INBOX_DB="$db" \
+    "$agent_collab" peer replay --cwd "$repo_a_real" --out "$replay_out" >/dev/null
+  [[ -f "$replay_out" ]] || fail "peer replay did not produce output file"
+  assert_contains "$replay_out" "<!doctype html>"
+  assert_contains "$replay_out" 'class="msg"'
+  # Verify HTML escaping: adversarial quotes/semicolons stored earlier should
+  # be present as text without breaking the document.
+  python3 -c "
+import html.parser, sys
+class P(html.parser.HTMLParser):
+    def error(self, msg): raise SystemExit('HTML parse error: ' + msg)
+P().feed(open('$replay_out').read())
+print('replay HTML parses OK')
+" || fail "peer replay HTML failed to parse"
 
   echo "peer-inbox: all checks PASS"
 }

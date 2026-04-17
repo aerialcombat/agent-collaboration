@@ -133,6 +133,40 @@ agent-collab session close      # closes the current session's registration
 Removes the DB row and marker file; inbox messages sent to/from the
 session are preserved in the DB for audit.
 
+### Watch an inbox in real time
+
+```bash
+agent-collab peer watch                    # tail my inbox, history + new
+agent-collab peer watch --only-new         # skip history; only new messages
+agent-collab peer watch --as backend       # watch a specific label
+agent-collab peer watch --interval 0.3     # custom poll interval (seconds)
+```
+
+Blocks until Ctrl-C. Prints each message as it arrives with sender label,
+timestamp, and read/unread marker (`*` = unread). Read-only — the
+`UserPromptSubmit` hook still consumes unread messages at the agent's
+next turn; watching does not mark them read.
+
+Useful for running in a side terminal or tmux pane to see peer traffic
+flow in real time without switching into the session.
+
+### Generate an HTML transcript
+
+```bash
+agent-collab peer replay                            # all traffic in this cwd
+agent-collab peer replay --as backend               # conversations involving backend
+agent-collab peer replay --since 2026-04-17T12:00:00Z
+agent-collab peer replay --out ~/Desktop/call.html  # custom output path
+```
+
+Emits a self-contained HTML file (default location:
+`<cwd>/.agent-collab/replay-<timestamp>.html`) — inline CSS, no external
+assets, opens in any browser. Each sender gets a deterministic pastel
+color pill; bodies preserve newlines; messages are grouped by day.
+
+Good for sharing a conversation post-mortem or archiving a handoff
+session.
+
 ## Cheatsheet by runtime
 
 | Need to... | Claude | Codex | Gemini |
