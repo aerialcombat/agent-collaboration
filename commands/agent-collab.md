@@ -19,15 +19,18 @@ If the user passed flags in $ARGUMENTS (e.g. `--label backend --new` or `--label
 ### Interactive flow
 
 Ask the user (in one terse message):
-1. **Label** — what should this session be called? (short, lowercase, e.g. `backend`, `frontend`, `alpha`). If they don't care, suggest one based on the repo name or their current task.
+1. **Label** — what should this session be called? (short, lowercase, e.g. `backend`, `frontend`, `alpha`). If they don't care or say "auto", omit `--label` and the helper will mint one (`adjective-noun`). Echo the generated label back so they know how the peer will address them.
 2. **New pair or join?** — "new" mints a fresh pair key for the user to share with the other session; "join" accepts a pair key someone else already has.
 3. If **join**, also ask for the pair key.
 
 Once you have the answers, run:
 
 ```bash
-# new pair
+# new pair, explicit label
 agent-collab session register --label "<label>" --agent claude --new-pair
+
+# new pair, auto-label (omit --label)
+agent-collab session register --agent claude --new-pair
 
 # join existing pair
 agent-collab session register --label "<label>" --agent claude --pair-key "<KEY>"

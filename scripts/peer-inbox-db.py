@@ -32,22 +32,47 @@ LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PAIR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 VALID_AGENTS = {"claude", "codex", "gemini"}
 
-# Small wordlist seeds for pair-key slugs (adjective-noun-XXXX). Step 4 of
-# v1.7 expands these; 40*40*65536 ≈ 100M combos is already far beyond
-# collision risk for simultaneous live pairs.
+# Wordlists for pair-key slugs (adjective-noun-XXXX) and auto-generated
+# labels (adjective-noun). 128 × 128 × 65536 ≈ 1 billion pair-key combos
+# and 16384 label combos — comfortable for any realistic number of live
+# pairs on one machine.
 PAIR_KEY_ADJECTIVES = (
-    "amber", "brave", "brisk", "calm", "clever", "crisp", "dusty", "eager",
-    "fancy", "fluffy", "gentle", "happy", "jolly", "keen", "lively", "lucky",
-    "merry", "misty", "nimble", "plucky", "polite", "proud", "quiet", "quick",
-    "rapid", "rugged", "silent", "silky", "snowy", "sunny", "swift", "tidy",
-    "warm", "witty", "zany", "azure", "clear", "cosmic", "dewy", "soft",
+    "amber", "ancient", "arctic", "azure", "bold", "brave", "brisk", "bright",
+    "bronze", "busy", "calm", "candid", "chilly", "chipper", "clear", "clever",
+    "cosmic", "crimson", "crisp", "curious", "dainty", "daring", "dashing",
+    "deft", "dewy", "dusty", "eager", "earnest", "easy", "ebon", "eerie",
+    "elated", "electric", "emerald", "epic", "fancy", "fearless", "fertile",
+    "fierce", "fleet", "floral", "fluffy", "fond", "fresh", "frosty", "furry",
+    "gentle", "glad", "gleaming", "glowing", "golden", "gracious", "grand",
+    "happy", "hardy", "hazy", "hearty", "honest", "humble", "idle", "inky",
+    "jade", "jazzy", "jolly", "jovial", "keen", "kind", "lavender", "lean",
+    "lively", "lucky", "lush", "magnetic", "merry", "mindful", "misty",
+    "modest", "noble", "nimble", "ochre", "peaceful", "perky", "placid",
+    "playful", "plucky", "polite", "proud", "quick", "quiet", "radiant",
+    "rapid", "rosy", "royal", "rugged", "sage", "serene", "silent", "silky",
+    "silver", "snowy", "soft", "solar", "solemn", "sparkly", "spry", "stellar",
+    "sturdy", "sunny", "swift", "tangy", "tender", "tidy", "tranquil",
+    "trusty", "upbeat", "urban", "valiant", "velvet", "vibrant", "vivid",
+    "warm", "wild", "windy", "witty", "woodland", "zany", "zealous", "zesty",
 )
 PAIR_KEY_NOUNS = (
-    "anchor", "arrow", "beacon", "breeze", "canyon", "cedar", "cliff", "comet",
-    "crest", "delta", "ember", "falcon", "forest", "glade", "glow", "harbor",
-    "haven", "heron", "island", "lagoon", "lark", "meadow", "nebula", "orchid",
-    "owl", "peak", "pine", "plum", "quartz", "river", "slate", "spruce",
-    "stream", "summit", "thistle", "tide", "valley", "willow", "wren", "zephyr",
+    "acorn", "anchor", "archer", "arrow", "aspen", "badger", "basalt", "beacon",
+    "beaver", "birch", "bison", "bluff", "boulder", "breeze", "brook", "canyon",
+    "cedar", "chestnut", "cliff", "clover", "comet", "compass", "coral",
+    "cove", "creek", "crest", "crystal", "cypress", "daisy", "delta", "dove",
+    "eagle", "ember", "fable", "falcon", "feather", "fern", "fjord", "flame",
+    "forest", "fox", "galaxy", "glade", "glow", "goose", "grove", "gull",
+    "harbor", "harvest", "haven", "hazel", "heath", "hedge", "heron", "hill",
+    "holly", "horizon", "island", "ivy", "jaguar", "juniper", "kestrel",
+    "lagoon", "lake", "lantern", "lark", "laurel", "lilac", "lion", "lotus",
+    "lynx", "maple", "meadow", "mesa", "monsoon", "moon", "moss", "mountain",
+    "nebula", "oak", "oasis", "orchid", "otter", "owl", "palm", "peak",
+    "peony", "pine", "plum", "poppy", "prairie", "quartz", "quail", "rainbow",
+    "ranger", "raven", "reef", "ridge", "river", "robin", "sable", "saffron",
+    "salmon", "sequoia", "shore", "slate", "sparrow", "spring", "spruce",
+    "star", "storm", "stream", "summit", "swallow", "thicket", "thistle",
+    "tide", "tiger", "trail", "tulip", "valley", "vista", "willow", "wolf",
+    "wren", "zebra", "zenith", "zephyr",
 )
 MAX_BODY_BYTES = 8 * 1024
 HOOK_BLOCK_BUDGET = 4 * 1024
@@ -215,6 +240,14 @@ def generate_pair_key() -> str:
     noun = secrets.choice(PAIR_KEY_NOUNS)
     suffix = secrets.token_hex(2)  # 4 hex chars
     return f"{adj}-{noun}-{suffix}"
+
+
+def generate_label() -> str:
+    """Return a fresh memorable session label (adjective-noun)."""
+    import secrets
+    adj = secrets.choice(PAIR_KEY_ADJECTIVES)
+    noun = secrets.choice(PAIR_KEY_NOUNS)
+    return f"{adj}-{noun}"
 
 
 def validate_agent(agent: str) -> None:
@@ -685,15 +718,23 @@ def bump_last_seen(conn: sqlite3.Connection, cwd: str, label: str) -> None:
 
 
 def cmd_session_register(args: argparse.Namespace) -> int:
-    validate_label(args.label)
-    validate_agent(args.agent)
-    cwd = resolve_cwd(args.cwd)
-    now = now_iso()
-
     if args.pair_key and args.new_pair:
         err("--pair-key and --new-pair are mutually exclusive", EXIT_VALIDATION)
     if args.pair_key:
         validate_pair_key(args.pair_key)
+
+    # Auto-generate a label if the caller didn't provide one. Slash commands
+    # prompt the user to confirm before invoking; direct CLI callers see the
+    # generated label printed below so they know what to reference.
+    if args.label:
+        validate_label(args.label)
+    else:
+        args.label = generate_label()
+        validate_label(args.label)
+
+    validate_agent(args.agent)
+    cwd = resolve_cwd(args.cwd)
+    now = now_iso()
 
     session_key = args.session_key or discover_session_key()
     if session_key is None:
@@ -2170,7 +2211,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sr = sub.add_parser("session-register")
     sr.add_argument("--cwd")
-    sr.add_argument("--label", required=True)
+    sr.add_argument("--label",
+                    help="session label (generated if omitted)")
     sr.add_argument("--agent", required=True)
     sr.add_argument("--role")
     sr.add_argument("--session-key", dest="session_key")

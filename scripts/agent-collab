@@ -49,9 +49,11 @@ usage() {
 Usage:
   agent-collab challenge --challenger claude|codex|gemini [options]
   agent-collab verify --challenger claude|codex|gemini [options]
-  agent-collab session register --label <l> --agent claude|codex|gemini
+  agent-collab session register [--label <l>] --agent claude|codex|gemini
                                 [--role <r>] [--session-key <k>]
                                 [--pair-key <k> | --new-pair] [--force]
+                                --label is optional — a memorable slug is
+                                generated when omitted and printed on success.
                                 --pair-key joins the room identified by <k>.
                                 --new-pair mints a fresh room key and prints it.
   agent-collab session adopt --label <l> --session-id <claude-uuid>
