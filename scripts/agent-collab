@@ -50,7 +50,10 @@ Usage:
   agent-collab challenge --challenger claude|codex|gemini [options]
   agent-collab verify --challenger claude|codex|gemini [options]
   agent-collab session register --label <l> --agent claude|codex|gemini
-                                [--role <r>] [--session-key <k>] [--force]
+                                [--role <r>] [--session-key <k>]
+                                [--pair-key <k> | --new-pair] [--force]
+                                --pair-key joins the room identified by <k>.
+                                --new-pair mints a fresh room key and prints it.
   agent-collab session adopt --label <l> --session-id <claude-uuid>
                                 Re-key an existing registration to a real
                                 Claude session_id so the hook can resolve.

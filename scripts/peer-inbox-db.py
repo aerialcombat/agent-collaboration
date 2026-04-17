@@ -29,7 +29,26 @@ SESSIONS_DIR_REL = ".agent-collab/sessions"
 DEFAULT_MAX_PAIR_TURNS = 20
 TERMINATION_TOKEN = "[[end]]"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+PAIR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 VALID_AGENTS = {"claude", "codex", "gemini"}
+
+# Small wordlist seeds for pair-key slugs (adjective-noun-XXXX). Step 4 of
+# v1.7 expands these; 40*40*65536 ≈ 100M combos is already far beyond
+# collision risk for simultaneous live pairs.
+PAIR_KEY_ADJECTIVES = (
+    "amber", "brave", "brisk", "calm", "clever", "crisp", "dusty", "eager",
+    "fancy", "fluffy", "gentle", "happy", "jolly", "keen", "lively", "lucky",
+    "merry", "misty", "nimble", "plucky", "polite", "proud", "quiet", "quick",
+    "rapid", "rugged", "silent", "silky", "snowy", "sunny", "swift", "tidy",
+    "warm", "witty", "zany", "azure", "clear", "cosmic", "dewy", "soft",
+)
+PAIR_KEY_NOUNS = (
+    "anchor", "arrow", "beacon", "breeze", "canyon", "cedar", "cliff", "comet",
+    "crest", "delta", "ember", "falcon", "forest", "glade", "glow", "harbor",
+    "haven", "heron", "island", "lagoon", "lark", "meadow", "nebula", "orchid",
+    "owl", "peak", "pine", "plum", "quartz", "river", "slate", "spruce",
+    "stream", "summit", "thistle", "tide", "valley", "willow", "wren", "zephyr",
+)
 MAX_BODY_BYTES = 8 * 1024
 HOOK_BLOCK_BUDGET = 4 * 1024
 STALE_THRESHOLD_SECS = 30 * 60
@@ -181,6 +200,23 @@ def validate_label(label: str) -> None:
         )
 
 
+def validate_pair_key(key: str) -> None:
+    if not PAIR_KEY_RE.match(key):
+        err(
+            f"invalid pair key {key!r} (allowed: [a-z0-9][a-z0-9-]{{1,63}})",
+            EXIT_VALIDATION,
+        )
+
+
+def generate_pair_key() -> str:
+    """Return a fresh memorable pair key (adjective-noun-XXXX)."""
+    import secrets
+    adj = secrets.choice(PAIR_KEY_ADJECTIVES)
+    noun = secrets.choice(PAIR_KEY_NOUNS)
+    suffix = secrets.token_hex(2)  # 4 hex chars
+    return f"{adj}-{noun}-{suffix}"
+
+
 def validate_agent(agent: str) -> None:
     if agent not in VALID_AGENTS:
         err(
@@ -256,6 +292,24 @@ def migrate_sessions_channel_socket(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN channel_socket TEXT")
 
 
+def migrate_sessions_pair_key(conn: sqlite3.Connection) -> None:
+    """Add pair_key column + lookup index. Pair keys scope peer resolution
+    across cwds so two sessions in different directories can share a room."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "pair_key" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN pair_key TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_pair_key "
+        "ON sessions(pair_key) WHERE pair_key IS NOT NULL"
+    )
+    # (pair_key, label) must be unique when pair_key is set — a pair has
+    # exactly one session per label.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_pair_key_label "
+        "ON sessions(pair_key, label) WHERE pair_key IS NOT NULL"
+    )
+
+
 def migrate_peer_pairs(conn: sqlite3.Connection) -> None:
     """Create peer_pairs table for turn counting + termination tracking."""
     conn.executescript(
@@ -285,6 +339,7 @@ def open_db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     migrate_sessions_session_key(conn)
     migrate_sessions_channel_socket(conn)
+    migrate_sessions_pair_key(conn)
     migrate_peer_pairs(conn)
     return conn
 
@@ -436,6 +491,41 @@ def _max_pair_turns() -> int:
         return int(os.environ.get("AGENT_COLLAB_MAX_PAIR_TURNS", str(DEFAULT_MAX_PAIR_TURNS)))
     except ValueError:
         return DEFAULT_MAX_PAIR_TURNS
+
+
+def _get_session_pair_key(cwd: str, label: str) -> Optional[str]:
+    """Return the pair_key stored for (cwd, label), or None."""
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT pair_key FROM sessions WHERE cwd = ? AND label = ?",
+            (cwd, label),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return row["pair_key"]
+
+
+def _lookup_pair_peer_cwd(pair_key: str, label: str) -> Optional[str]:
+    """Return the cwd of the session registered under (pair_key, label).
+
+    Uses the unique (pair_key, label) index from migrate_sessions_pair_key,
+    so there is at most one row. Missing entry returns None and lets the
+    caller fall back to same-cwd lookup with a clearer error downstream.
+    """
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT cwd FROM sessions WHERE pair_key = ? AND label = ?",
+            (pair_key, label),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return row["cwd"]
 
 
 def sessions_dir(cwd: Path) -> Path:
@@ -600,6 +690,11 @@ def cmd_session_register(args: argparse.Namespace) -> int:
     cwd = resolve_cwd(args.cwd)
     now = now_iso()
 
+    if args.pair_key and args.new_pair:
+        err("--pair-key and --new-pair are mutually exclusive", EXIT_VALIDATION)
+    if args.pair_key:
+        validate_pair_key(args.pair_key)
+
     session_key = args.session_key or discover_session_key()
     if session_key is None:
         # Fallback: consult the hook-seen-sessions log. The UserPromptSubmit
@@ -644,7 +739,7 @@ def cmd_session_register(args: argparse.Namespace) -> int:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT agent, role, last_seen_at, session_key FROM sessions "
+            "SELECT agent, role, last_seen_at, session_key, pair_key FROM sessions "
             "WHERE cwd = ? AND label = ?",
             (str(cwd), args.label),
         ).fetchone()
@@ -662,19 +757,52 @@ def cmd_session_register(args: argparse.Namespace) -> int:
                     "use --force or a different label",
                     EXIT_LABEL_COLLISION,
                 )
+
+        # Pair-key resolution:
+        #   --pair-key KEY  → use KEY (join the room)
+        #   --new-pair      → mint a fresh slug
+        #   neither + existing row has a pair_key → preserve it (idempotent refresh)
+        #   otherwise → NULL (legacy cwd-only scope)
+        if args.pair_key:
+            pair_key = args.pair_key
+        elif args.new_pair:
+            pair_key = generate_pair_key()
+        elif row is not None and row["pair_key"]:
+            pair_key = row["pair_key"]
+        else:
+            pair_key = None
+
+        # If joining an existing pair, ensure no different session already
+        # holds this label in that pair (the unique index will catch it too,
+        # but a pre-check yields a friendlier error).
+        if pair_key is not None:
+            dup = conn.execute(
+                "SELECT cwd FROM sessions WHERE pair_key = ? AND label = ? "
+                "AND NOT (cwd = ? AND label = ?)",
+                (pair_key, args.label, str(cwd), args.label),
+            ).fetchone()
+            if dup is not None:
+                conn.execute("ROLLBACK")
+                err(
+                    f"pair key {pair_key!r} already has a session labeled "
+                    f"{args.label!r} in {dup['cwd']}; choose a different label",
+                    EXIT_LABEL_COLLISION,
+                )
+
         conn.execute(
             """
-            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, started_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cwd, label) DO UPDATE SET
               agent = excluded.agent,
               role = excluded.role,
               session_key = excluded.session_key,
               channel_socket = excluded.channel_socket,
+              pair_key = excluded.pair_key,
               started_at = excluded.started_at,
               last_seen_at = excluded.last_seen_at
             """,
-            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, now, now),
+            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now),
         )
         conn.execute("COMMIT")
     finally:
@@ -682,9 +810,10 @@ def cmd_session_register(args: argparse.Namespace) -> int:
 
     write_marker(cwd, args.label, session_key)
     channel_note = " [channel: paired]" if channel_socket else " [channel: none]"
+    pair_note = f" [pair_key={pair_key}]" if pair_key else ""
     print(
         f"registered: {args.label} ({args.agent}, {args.role or 'peer'}) at {cwd} "
-        f"[session_key={session_key_hash(session_key)}]{channel_note}"
+        f"[session_key={session_key_hash(session_key)}]{channel_note}{pair_note}"
     )
     return EXIT_OK
 
@@ -814,7 +943,18 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     self_cwd, self_label = resolve_self(args.as_label, cwd)
     validate_label(args.to)
 
-    to_cwd = resolve_cwd(args.to_cwd) if args.to_cwd else self_cwd
+    # Resolve target cwd. Order of precedence:
+    #   1. explicit --to-cwd wins (legacy cross-cwd sends).
+    #   2. self has a pair_key → look up (pair_key, to_label) across cwds.
+    #   3. fall back to same-cwd resolution (v1.6 behaviour).
+    self_pair_key = _get_session_pair_key(str(self_cwd), self_label)
+    if args.to_cwd:
+        to_cwd = resolve_cwd(args.to_cwd)
+    elif self_pair_key is not None:
+        resolved_cwd = _lookup_pair_peer_cwd(self_pair_key, args.to)
+        to_cwd = Path(resolved_cwd) if resolved_cwd else self_cwd
+    else:
+        to_cwd = self_cwd
 
     if args.message_stdin:
         body = sys.stdin.read()
@@ -1970,14 +2110,24 @@ def cmd_peer_list(args: argparse.Namespace) -> int:
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
 
+    self_pair_key = _get_session_pair_key(str(self_cwd), self_label)
+
     conn = open_db()
     try:
-        rows = conn.execute(
-            "SELECT cwd, label, agent, role, last_seen_at FROM sessions "
-            "WHERE cwd = ? AND NOT (cwd = ? AND label = ?) "
-            "ORDER BY last_seen_at DESC",
-            (str(self_cwd), str(self_cwd), self_label),
-        ).fetchall()
+        if self_pair_key is not None:
+            rows = conn.execute(
+                "SELECT cwd, label, agent, role, last_seen_at FROM sessions "
+                "WHERE pair_key = ? AND NOT (cwd = ? AND label = ?) "
+                "ORDER BY last_seen_at DESC",
+                (self_pair_key, str(self_cwd), self_label),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT cwd, label, agent, role, last_seen_at FROM sessions "
+                "WHERE cwd = ? AND NOT (cwd = ? AND label = ?) "
+                "ORDER BY last_seen_at DESC",
+                (str(self_cwd), str(self_cwd), self_label),
+            ).fetchall()
     finally:
         conn.close()
 
@@ -2024,6 +2174,10 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--agent", required=True)
     sr.add_argument("--role")
     sr.add_argument("--session-key", dest="session_key")
+    sr.add_argument("--pair-key", dest="pair_key",
+                    help="join the pair identified by KEY (share with another session)")
+    sr.add_argument("--new-pair", dest="new_pair", action="store_true",
+                    help="mint a fresh pair key and print it")
     sr.add_argument("--force", action="store_true")
     sr.set_defaults(func=cmd_session_register)
 
