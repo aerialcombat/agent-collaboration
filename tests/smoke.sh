@@ -420,6 +420,126 @@ assert d['messages'][0]['body'] == 'web view two'
   kill $web_pid 2>/dev/null || true
   wait $web_pid 2>/dev/null || true
 
+  echo "-- peer-inbox: v1.7 pair-key cross-cwd send/receive --"
+  local pk_db="$TMP_ROOT/peer-inbox-pk.db"
+  local pk_a="$TMP_ROOT/peer-inbox-pk-a"
+  local pk_b="$TMP_ROOT/peer-inbox-pk-b"
+  mkdir -p "$pk_a" "$pk_b"
+  local pk_a_real pk_b_real
+  pk_a_real="$(cd "$pk_a" && pwd -P)"
+  pk_b_real="$(cd "$pk_b" && pwd -P)"
+  local pk_out
+  pk_out=$(AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyA \
+    "$agent_collab" session register --cwd "$pk_a_real" --label backend --agent claude --new-pair)
+  local pk_key
+  pk_key=$(printf '%s\n' "$pk_out" | grep -oE 'pair_key=[a-z0-9-]+' | head -1 | cut -d= -f2)
+  [[ -n "$pk_key" ]] || fail "--new-pair did not emit pair_key"
+  AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyB \
+    "$agent_collab" session register --cwd "$pk_b_real" --label frontend --agent codex --pair-key "$pk_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyA \
+    "$agent_collab" peer send --cwd "$pk_a_real" --as backend --to frontend --message "cross-cwd via pair_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyB \
+    "$agent_collab" peer receive --cwd "$pk_b_real" --as frontend --format plain --mark-read \
+    | grep -q "cross-cwd via pair_key" || fail "pair_key cross-cwd message not delivered"
+
+  echo "-- peer-inbox: v1.7 pair-key duplicate label rejected --"
+  if AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyC \
+       "$agent_collab" session register --cwd "$TMP_ROOT" --label backend --agent gemini --pair-key "$pk_key" >/dev/null 2>&1; then
+    fail "duplicate label within a pair was accepted"
+  fi
+
+  echo "-- peer-inbox: v1.7 pair-key peer list scopes across cwds --"
+  local pk_list
+  pk_list=$(AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=pkeyB \
+    "$agent_collab" peer list --cwd "$pk_b_real" --as frontend --json)
+  python3 -c "
+import json
+rows = json.loads('''$pk_list''')
+labels = sorted(r['label'] for r in rows)
+assert labels == ['backend'], f'pair_key peer list wrong: {labels}'
+" || fail "pair_key peer list did not include cross-cwd peer"
+
+  echo "-- peer-inbox: v1.7 auto-label generates adj-noun --"
+  local auto_label_out auto_label
+  auto_label_out=$(AGENT_COLLAB_INBOX_DB="$pk_db" AGENT_COLLAB_SESSION_KEY=autoA \
+    "$agent_collab" session register --cwd "$TMP_ROOT" --agent claude)
+  auto_label=$(printf '%s\n' "$auto_label_out" | awk '/^registered:/ {print $2}')
+  [[ "$auto_label" =~ ^[a-z]+-[a-z]+$ ]] || fail "auto-label did not match adj-noun shape: $auto_label"
+
+  echo "-- peer-inbox: v1.7 slug uniqueness (pair-keys no collisions in 5000; labels under birthday bound) --"
+  python3 <<'PY' || fail "slug collision check failed"
+import importlib.util
+spec = importlib.util.spec_from_file_location("p", "scripts/peer-inbox-db.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+from collections import Counter
+pk_counts = Counter(m.generate_pair_key() for _ in range(5000))
+if len(pk_counts) != 5000:
+    raise SystemExit(f"pair-key collisions: {5000 - len(pk_counts)} dups in 5000")
+# Labels live in a 128*128 = 16,384 space. Birthday paradox at 200 draws
+# predicts <2% expected collisions; cap at 5% to catch a shrunk wordlist
+# or biased RNG without flunking the paradox itself.
+label_counts = Counter(m.generate_label() for _ in range(200))
+dup_rate = 1 - (len(label_counts) / 200)
+if dup_rate > 0.05:
+    raise SystemExit(f"label collision rate too high: {dup_rate:.3%}")
+PY
+
+  echo "-- peer-inbox: v1.7 auto-infer --to with single peer --"
+  local ai_db="$TMP_ROOT/peer-inbox-ai.db"
+  local ai_a="$TMP_ROOT/peer-inbox-ai-a"
+  local ai_b="$TMP_ROOT/peer-inbox-ai-b"
+  mkdir -p "$ai_a" "$ai_b"
+  local ai_a_real ai_b_real
+  ai_a_real="$(cd "$ai_a" && pwd -P)"
+  ai_b_real="$(cd "$ai_b" && pwd -P)"
+  local ai_out ai_key
+  ai_out=$(AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiA \
+    "$agent_collab" session register --cwd "$ai_a_real" --label alpha --agent claude --new-pair)
+  ai_key=$(printf '%s\n' "$ai_out" | grep -oE 'pair_key=[a-z0-9-]+' | cut -d= -f2)
+  AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiB \
+    "$agent_collab" session register --cwd "$ai_b_real" --label beta --agent codex --pair-key "$ai_key" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiA \
+    "$agent_collab" peer send --cwd "$ai_a_real" --as alpha --message "inferred target" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiB \
+    "$agent_collab" peer receive --cwd "$ai_b_real" --as beta --format plain --mark-read \
+    | grep -q "inferred target" || fail "auto-inferred send did not reach single peer"
+
+  echo "-- peer-inbox: v1.7 auto-infer --to rejects ambiguity --"
+  local ai_c="$TMP_ROOT/peer-inbox-ai-c"
+  mkdir -p "$ai_c"
+  local ai_c_real
+  ai_c_real="$(cd "$ai_c" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiC \
+    "$agent_collab" session register --cwd "$ai_c_real" --label gamma --agent gemini --pair-key "$ai_key" >/dev/null
+  if AGENT_COLLAB_INBOX_DB="$ai_db" AGENT_COLLAB_SESSION_KEY=aiA \
+       "$agent_collab" peer send --cwd "$ai_a_real" --as alpha --message "should fail" >/dev/null 2>&1; then
+    fail "ambiguous auto-infer send was accepted"
+  fi
+
+  echo "-- peer-inbox: v1.7 cross-runtime env vars (CLAUDE/CODEX/GEMINI_SESSION_ID) --"
+  # Each runtime exports a different env var. The helper must pick any of them.
+  # Here we simulate: a "claude" session reads CLAUDE_SESSION_ID; a "codex"
+  # session reads CODEX_SESSION_ID. Messages flow both ways.
+  local xr_db="$TMP_ROOT/peer-inbox-xr.db"
+  local xr_dir="$TMP_ROOT/peer-inbox-xr"
+  mkdir -p "$xr_dir"
+  local xr_real
+  xr_real="$(cd "$xr_dir" && pwd -P)"
+  AGENT_COLLAB_INBOX_DB="$xr_db" CLAUDE_SESSION_ID=xr-claude-1 \
+    "$agent_collab" session register --cwd "$xr_real" --label claude-side --agent claude >/dev/null
+  AGENT_COLLAB_INBOX_DB="$xr_db" CODEX_SESSION_ID=xr-codex-1 \
+    "$agent_collab" session register --cwd "$xr_real" --label codex-side --agent codex >/dev/null
+  AGENT_COLLAB_INBOX_DB="$xr_db" CLAUDE_SESSION_ID=xr-claude-1 \
+    "$agent_collab" peer send --cwd "$xr_real" --to codex-side --message "claude->codex" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$xr_db" CODEX_SESSION_ID=xr-codex-1 \
+    "$agent_collab" peer receive --cwd "$xr_real" --format plain --mark-read \
+    | grep -q "claude->codex" || fail "claude->codex message did not reach codex session via CODEX_SESSION_ID"
+  AGENT_COLLAB_INBOX_DB="$xr_db" CODEX_SESSION_ID=xr-codex-1 \
+    "$agent_collab" peer send --cwd "$xr_real" --to claude-side --message "codex->claude" >/dev/null
+  AGENT_COLLAB_INBOX_DB="$xr_db" CLAUDE_SESSION_ID=xr-claude-1 \
+    "$agent_collab" peer receive --cwd "$xr_real" --format plain --mark-read \
+    | grep -q "codex->claude" || fail "codex->claude message did not reach claude session via CLAUDE_SESSION_ID"
+
   echo "peer-inbox: all checks PASS"
 }
 

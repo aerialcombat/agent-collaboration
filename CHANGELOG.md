@@ -7,6 +7,57 @@ Commit SHAs reference the `agent-collaboration` repo.
 
 ---
 
+## v1.7 — 2026-04-17
+
+**One-sentence install: `install agent-collab` → `/agent-collab` → `/peer`.**
+
+### Added
+- `sessions.pair_key` column with a unique `(pair_key, label)` index.
+  Pair keys scope peer resolution across cwds so two sessions in
+  different directories can share a room. (`c582092`)
+- `session register --pair-key KEY` (join) and `--new-pair` (mint a
+  fresh slug). `peer send` and `peer list` automatically scope by
+  `pair_key` when the caller has one set.
+- `peer send --to` is inferred when exactly one live peer is in scope.
+  Ambiguous or empty scopes error with the candidate list. (`fb001dc`)
+- `--label` is optional on register; a memorable `adjective-noun`
+  slug is generated and printed. Pair-key slugs use
+  `adjective-noun-XXXX` from a 128×128 wordlist. (`fce583b`)
+- Slash commands `/agent-collab` (interactive register) and `/peer`
+  (send/check/list/end) drop into `~/.claude/commands/`, idempotent
+  with backup. (`5db6644`)
+- Skill `install-agent-collab` drops into `~/.claude/skills/` so the
+  user can literally type *install agent-collab*. Skill performs
+  clone → install → verify. (`875ac9b`)
+
+### Changed
+- Installer adds/removes slash commands and skills alongside the
+  existing peer-inbox helper files. `install-global-protocol install`
+  is still a no-op when everything is current.
+
+### Compatibility notes
+- **Additive.** All existing cwd-scoped flows work unchanged. Pair
+  keys only apply when explicitly opted into via `--pair-key` or
+  `--new-pair`.
+- **Cross-runtime.** Claude Code receives messages through the
+  `UserPromptSubmit` hook. Codex and Gemini have no equivalent hook
+  — those sessions must call `agent-collab peer receive` themselves
+  each turn. The DB side is symmetric (`CLAUDE_SESSION_ID`,
+  `CODEX_SESSION_ID`, `GEMINI_SESSION_ID` all work as session keys);
+  only the push-to-agent side is Claude-only.
+- **Same machine.** Pair keys still only coordinate sessions within
+  one SQLite file on one host. Cross-machine is v2.0+.
+
+### Smoke scenarios added
+- Pair-key cross-cwd send/receive.
+- Pair-key peer-list scope.
+- Duplicate label rejection inside a pair.
+- Auto-label shape + wordlist collision bound.
+- Auto-infer `--to` single-peer + ambiguity.
+- Cross-runtime env-var selection (`CLAUDE/CODEX_SESSION_ID`).
+
+---
+
 ## v1.5 — 2026-04-17 · [`d8b1139`]
 
 **Live browser view.**
