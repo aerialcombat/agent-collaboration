@@ -1422,7 +1422,12 @@ def cmd_session_adopt(args: argparse.Namespace) -> int:
 
 
 def cmd_peer_web(args: argparse.Namespace) -> int:
-    """Serve a Slack-shaped live view of the current cwd's peer traffic.
+    """Serve a Slack-shaped live view of peer traffic.
+
+    Scope modes (mutually exclusive):
+      - default: current cwd. Shows pairs whose messages stayed within cwd.
+      - --pair-key KEY: v1.7 pair key. Shows the cross-cwd conversation
+        between the two (or more) labels that joined that pair key.
 
     Sidebar lists every pair (canonical a_label < b_label) grouped by
     activity (active / idle / stale / terminated); clicking a pair shows
@@ -1432,16 +1437,38 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
       GET /                                  → SPA HTML
       GET /pairs.json                        → pair list + metadata
       GET /messages.json?pair=a+b&after=N    → messages for one pair
-      GET /messages.json?after=N             → all cwd messages (back-compat)
+      GET /messages.json?after=N             → all scoped messages (back-compat)
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from urllib.parse import parse_qs, urlparse
 
+    pair_key = getattr(args, "pair_key", None)
+    if pair_key:
+        validate_pair_key(pair_key)
     cwd = resolve_cwd(args.cwd)
     as_label = args.as_label
     if as_label:
         validate_label(as_label)
     port = int(args.port)
+
+    # In pair-key mode, resolve the set of (cwd, label) the pair spans.
+    # Messages in this view = inbox rows where BOTH endpoints are registered
+    # under this pair_key. Sessions may live in different cwds.
+    pair_members: list[tuple[str, str]] = []
+    if pair_key:
+        c = open_db()
+        try:
+            pair_members = [
+                (r["cwd"], r["label"])
+                for r in c.execute(
+                    "SELECT cwd, label FROM sessions WHERE pair_key = ? ORDER BY label",
+                    (pair_key,),
+                ).fetchall()
+            ]
+        finally:
+            c.close()
+        if not pair_members:
+            err(f"no sessions registered with pair_key {pair_key!r}", EXIT_NOT_FOUND)
 
     def _canonical_pair(a: str, b: str) -> tuple[str, str]:
         return (a, b) if a <= b else (b, a)
@@ -1450,44 +1477,83 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         """Aggregate pair metadata from inbox + sessions + peer_pairs tables."""
         c = open_db()
         try:
-            # Distinct pairs ever active in this cwd (same-cwd pair only —
-            # cross-cwd sends don't form a "pair" in the termination sense).
-            rows = c.execute(
-                """
-                SELECT
-                  CASE WHEN from_label < to_label THEN from_label ELSE to_label END AS a,
-                  CASE WHEN from_label < to_label THEN to_label ELSE from_label END AS b,
-                  MAX(id)              AS last_id,
-                  MAX(created_at)      AS last_at,
-                  COUNT(*)             AS total,
-                  SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread_backend
-                FROM inbox
-                WHERE to_cwd = ? AND from_cwd = ?
-                GROUP BY a, b
-                ORDER BY last_at DESC
-                """,
-                (str(cwd), str(cwd)),
-            ).fetchall()
+            # Distinct pairs ever active in this scope. cwd mode groups
+            # within one cwd (v1.6 behaviour). pair-key mode groups by
+            # label pairs whose endpoints both belong to the pair, across
+            # any cwd.
+            if pair_key:
+                member_labels = tuple({lbl for (_, lbl) in pair_members})
+                if not member_labels:
+                    rows = []
+                else:
+                    q_marks = ",".join("?" for _ in member_labels)
+                    rows = c.execute(
+                        f"""
+                        SELECT
+                          CASE WHEN from_label < to_label THEN from_label ELSE to_label END AS a,
+                          CASE WHEN from_label < to_label THEN to_label ELSE from_label END AS b,
+                          MAX(id)              AS last_id,
+                          MAX(created_at)      AS last_at,
+                          COUNT(*)             AS total,
+                          SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread_backend
+                        FROM inbox
+                        WHERE from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                        GROUP BY a, b
+                        ORDER BY last_at DESC
+                        """,
+                        member_labels + member_labels,
+                    ).fetchall()
+            else:
+                rows = c.execute(
+                    """
+                    SELECT
+                      CASE WHEN from_label < to_label THEN from_label ELSE to_label END AS a,
+                      CASE WHEN from_label < to_label THEN to_label ELSE from_label END AS b,
+                      MAX(id)              AS last_id,
+                      MAX(created_at)      AS last_at,
+                      COUNT(*)             AS total,
+                      SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) AS unread_backend
+                    FROM inbox
+                    WHERE to_cwd = ? AND from_cwd = ?
+                    GROUP BY a, b
+                    ORDER BY last_at DESC
+                    """,
+                    (str(cwd), str(cwd)),
+                ).fetchall()
 
             # Per-pair session activity + termination.
             pairs = []
             for r in rows:
                 a, b = r["a"], r["b"]
-                sess_a = c.execute(
-                    "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
-                    "WHERE cwd = ? AND label = ?",
-                    (str(cwd), a),
-                ).fetchone()
-                sess_b = c.execute(
-                    "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
-                    "WHERE cwd = ? AND label = ?",
-                    (str(cwd), b),
-                ).fetchone()
-                pair_state = c.execute(
-                    "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
-                    "WHERE cwd = ? AND a_label = ? AND b_label = ?",
-                    (str(cwd), a, b),
-                ).fetchone()
+                if pair_key:
+                    # Look up sessions by (pair_key, label) — any cwd.
+                    sess_a = c.execute(
+                        "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                        "WHERE pair_key = ? AND label = ?",
+                        (pair_key, a),
+                    ).fetchone()
+                    sess_b = c.execute(
+                        "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                        "WHERE pair_key = ? AND label = ?",
+                        (pair_key, b),
+                    ).fetchone()
+                    pair_state = None  # peer_pairs is cwd-keyed; skip in pair-key mode.
+                else:
+                    sess_a = c.execute(
+                        "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                        "WHERE cwd = ? AND label = ?",
+                        (str(cwd), a),
+                    ).fetchone()
+                    sess_b = c.execute(
+                        "SELECT last_seen_at, agent, role, channel_socket FROM sessions "
+                        "WHERE cwd = ? AND label = ?",
+                        (str(cwd), b),
+                    ).fetchone()
+                    pair_state = c.execute(
+                        "SELECT turn_count, terminated_at, terminated_by FROM peer_pairs "
+                        "WHERE cwd = ? AND a_label = ? AND b_label = ?",
+                        (str(cwd), a, b),
+                    ).fetchone()
 
                 def _peer_info(s) -> dict:
                     if s is None:
@@ -1534,6 +1600,35 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
     def _fetch_messages(after: int, pair: Optional[tuple[str, str]]) -> list[sqlite3.Row]:
         c = open_db()
         try:
+            if pair_key:
+                member_labels = tuple({lbl for (_, lbl) in pair_members})
+                if not member_labels:
+                    return []
+                q_marks = ",".join("?" for _ in member_labels)
+                if pair is not None:
+                    pa, pb = pair
+                    return c.execute(
+                        f"""
+                        SELECT id, from_label, to_label, body, created_at, read_at
+                        FROM inbox
+                        WHERE id > ?
+                          AND from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                          AND ((from_label = ? AND to_label = ?)
+                            OR (from_label = ? AND to_label = ?))
+                        ORDER BY id ASC
+                        """,
+                        (after,) + member_labels + member_labels + (pa, pb, pb, pa),
+                    ).fetchall()
+                return c.execute(
+                    f"""
+                    SELECT id, from_label, to_label, body, created_at, read_at
+                    FROM inbox
+                    WHERE id > ?
+                      AND from_label IN ({q_marks}) AND to_label IN ({q_marks})
+                    ORDER BY id ASC
+                    """,
+                    (after,) + member_labels + member_labels,
+                ).fetchall()
             if pair is not None:
                 pa, pb = pair
                 return c.execute(
@@ -1570,10 +1665,16 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         finally:
             c.close()
 
-    scope = f"conversations involving {as_label}" if as_label else "all cross-session messages"
-    title = f"peer-inbox — {scope} in {cwd}"
+    if pair_key:
+        member_labels = sorted({lbl for (_, lbl) in pair_members})
+        scope_desc = f"pair {pair_key} ({', '.join(member_labels)})"
+    elif as_label:
+        scope_desc = f"conversations involving {as_label} in {cwd}"
+    else:
+        scope_desc = f"all cross-session messages in {cwd}"
+    title = f"peer-inbox — {scope_desc}"
     index_html = _PEER_WEB_HTML_TEMPLATE.replace("__TITLE__", html_lib.escape(title)) \
-                                         .replace("__CWD__", html_lib.escape(str(cwd)))
+                                         .replace("__CWD__", html_lib.escape(scope_desc))
 
     def _send_json(handler, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2427,6 +2528,9 @@ def build_parser() -> argparse.ArgumentParser:
     pwb.add_argument("--cwd")
     pwb.add_argument("--as", dest="as_label",
                      help="narrow to conversations involving this label")
+    pwb.add_argument("--pair-key", dest="pair_key",
+                     help="scope to a v1.7 pair key — shows cross-cwd conversations "
+                          "between all labels registered with that key")
     pwb.add_argument("--port", default="8787",
                      help="HTTP port to bind (default 8787)")
     pwb.set_defaults(func=cmd_peer_web)
