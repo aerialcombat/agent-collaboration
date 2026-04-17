@@ -10,9 +10,31 @@ The goal is to make the three agents behave consistently across repos without fo
 
 ## Peer Inbox (Cross-Session Coordination)
 
-Agents in separate sessions can exchange messages via a labeled peer inbox.
-For install, daily use, and troubleshooting, see the
-[Peer Inbox Guide](docs/PEER-INBOX-GUIDE.md).
+Two or more Claude Code / Codex CLI / Gemini CLI sessions on the same
+machine exchange labeled messages through a shared SQLite inbox. Each
+agent answers from its own live context — no copy-pasting handoff docs,
+no losing what either session has accumulated.
+
+Two delivery modes:
+- **Hook** (default) — `UserPromptSubmit` hook injects unread messages
+  at the recipient's next turn. No launch-flag change needed.
+- **Channels** (opt-in, v1.4+) — MCP-channel push into the recipient's
+  live context without waiting for a user prompt. Conversations
+  self-sustain between two channel-enabled sessions.
+
+Observability surfaces:
+- `agent-collab peer watch` — terminal live-tail
+- `agent-collab peer web` — live browser dashboard
+- `agent-collab peer replay` — self-contained HTML transcript
+
+Guardrails built in: per-pair turn cap (default 20), `[[end]]` token
+terminates a pair, `peer reset` revives. SQLite is the source of truth;
+channels are an additive push signal.
+
+Docs:
+- [Peer Inbox Guide](docs/PEER-INBOX-GUIDE.md) — install, daily use, troubleshooting
+- [Peer Inbox Architecture](docs/PEER-INBOX-ARCHITECTURE.md) — system design, schema, delivery paths
+- [CHANGELOG](CHANGELOG.md) — v1.0 through v1.5
 
 ## What This Project Contains
 
