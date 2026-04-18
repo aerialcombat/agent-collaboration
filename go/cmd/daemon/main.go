@@ -216,41 +216,155 @@ func run(args []string) int {
 	return d.mainLoop(ctx)
 }
 
+// configFile is the on-disk JSON shape for daemon config. Field names match
+// the CLI flag names exactly so operators can translate between the two
+// without a lookup. All fields optional except when no corresponding CLI
+// flag is also passed.
+//
+// TOML support is explicitly v1+ (§10 Q#6 open for owner; JSON keeps the
+// v0 dep tree minimal and the schema easily convertible later).
+type configFile struct {
+	Label          string `json:"label,omitempty"`
+	CWD            string `json:"cwd,omitempty"`
+	SessionKey     string `json:"session_key,omitempty"`
+	CLI            string `json:"cli,omitempty"`
+	AckTimeoutSec  int    `json:"ack_timeout,omitempty"`
+	SweepTTLSec    int    `json:"sweep_ttl,omitempty"`
+	PollSec        int    `json:"poll_interval,omitempty"`
+	PauseIdleSec   int    `json:"pause_on_idle,omitempty"`
+	LogPath        string `json:"log_path,omitempty"`
+	ClaudeSettings string `json:"claude_settings,omitempty"`
+}
+
+// resolveConfigPath expands --config arguments:
+//   - absolute path or one containing a slash/dot  → used verbatim
+//   - bare name (e.g. "reviewer-codex")           → ~/.agent-collab/daemons/<name>.json
+//
+// Operator ergonomics: `agent-collab-daemon --config reviewer-codex` works
+// without typing the full path (matches §2.2 "one file per daemon" pattern).
+func resolveConfigPath(arg string) (string, error) {
+	if arg == "" {
+		return "", nil
+	}
+	// Treat any argument with a path separator or `.` as a literal path.
+	if strings.ContainsAny(arg, "/") || strings.HasPrefix(arg, ".") || strings.HasSuffix(arg, ".json") {
+		return arg, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home for --config shorthand: %w", err)
+	}
+	return filepath.Join(home, ".agent-collab", "daemons", arg+".json"), nil
+}
+
+// loadConfigFile reads + parses the JSON at path. Returns a zero-value
+// configFile + nil error when path is empty (caller passed no --config).
+func loadConfigFile(path string) (configFile, error) {
+	var cf configFile
+	if path == "" {
+		return cf, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cf, fmt.Errorf("read config %q: %w", path, err)
+	}
+	if err := json.Unmarshal(data, &cf); err != nil {
+		return cf, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	return cf, nil
+}
+
 // parseFlags returns the resolved config OR an error + exit code.
+//
+// Flag-vs-file precedence (§10 Q#6 operator contract):
+//   - CLI flag explicitly passed → wins.
+//   - CLI flag absent + config file field present → file value used.
+//   - CLI flag absent + config file field absent → default (or env for TTLs).
+//
+// The daemon-side TTL ordering invariant (§3.4 (c)) is checked post-resolve
+// and applies regardless of which source supplied each TTL.
 func parseFlags(args []string) (daemonConfig, int, error) {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
 	var (
-		label          = fs.String("label", "", "managed session label (required)")
-		cwd            = fs.String("cwd", "", "workspace cwd for the managed session (required)")
-		sessionKey     = fs.String("session-key", "", "stable session-key value exported into every spawn (required)")
-		cliFlag        = fs.String("cli", "", "which CLI to spawn per batch: claude|codex|gemini (required)")
-		ackTimeoutSec  = fs.Int("ack-timeout", 0, "per-batch ack timeout in seconds (default: AGENT_COLLAB_ACK_TIMEOUT env or 300)")
-		sweepTTLSec    = fs.Int("sweep-ttl", 0, "sweeper TTL in seconds — used here only for the startup TTL-ordering validator (default: AGENT_COLLAB_SWEEP_TTL env or 600)")
-		pollSec        = fs.Int("poll-interval", defaultPollIntervalSec, "DB poll cadence between ticks in seconds")
-		pauseIdleSec   = fs.Int("pause-on-idle", defaultPauseOnIdleSec, "seconds of no activity before slowing poll frequency")
+		configArg      = fs.String("config", "", "path to JSON config file (or bare name resolved to ~/.agent-collab/daemons/<name>.json). Flags override file values.")
+		label          = fs.String("label", "", "managed session label (required if not in --config)")
+		cwd            = fs.String("cwd", "", "workspace cwd for the managed session (required if not in --config)")
+		sessionKey     = fs.String("session-key", "", "stable session-key value exported into every spawn (required if not in --config)")
+		cliFlag        = fs.String("cli", "", "which CLI to spawn per batch: claude|codex|gemini (required if not in --config)")
+		ackTimeoutSec  = fs.Int("ack-timeout", 0, "per-batch ack timeout in seconds (default: config file, AGENT_COLLAB_ACK_TIMEOUT env, or 300)")
+		sweepTTLSec    = fs.Int("sweep-ttl", 0, "sweeper TTL in seconds — used here only for the startup TTL-ordering validator (default: config file, AGENT_COLLAB_SWEEP_TTL env, or 600)")
+		pollSec        = fs.Int("poll-interval", 0, "DB poll cadence between ticks in seconds (default: config file or 2)")
+		pauseIdleSec   = fs.Int("pause-on-idle", 0, "seconds of no activity before slowing poll frequency (default: config file or 1800)")
 		logPath        = fs.String("log-path", "", "optional slog JSON output file path")
-		claudeSettings = fs.String("claude-settings", "", "path to Claude settings.json passed via --settings on every claude spawn (default: ~/.claude/settings.json)")
+		claudeSettings = fs.String("claude-settings", "", "path to Claude settings.json passed via --settings on every claude spawn (default: config file, or ~/.claude/settings.json)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return daemonConfig{}, exitUsage, fmt.Errorf("parse flags: %w", err)
 	}
 
-	if *label == "" {
-		return daemonConfig{}, exitUsage, errors.New("--label is required")
+	// Track which flags were explicitly passed so file values don't
+	// clobber them. `flag.Visit` iterates over flags that Parse saw on
+	// the command line, so we can distinguish "flag set to zero value"
+	// from "flag not passed."
+	explicitlySet := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicitlySet[f.Name] = true })
+
+	// Load config file if --config was passed.
+	configPath, err := resolveConfigPath(*configArg)
+	if err != nil {
+		return daemonConfig{}, exitUsage, err
 	}
-	if *cwd == "" {
-		return daemonConfig{}, exitUsage, errors.New("--cwd is required")
-	}
-	if *sessionKey == "" {
-		return daemonConfig{}, exitUsage, errors.New("--session-key is required")
-	}
-	if *cliFlag == "" {
-		return daemonConfig{}, exitUsage, errors.New("--cli is required (claude|codex|gemini)")
+	cf, err := loadConfigFile(configPath)
+	if err != nil {
+		// Config-file read/parse failures are operator-recoverable with
+		// a clearer file, so return exitConfig (78, sysexits EX_CONFIG)
+		// rather than exitUsage so the exit code reflects "fix your
+		// config" not "fix your command line."
+		return daemonConfig{}, exitConfig, err
 	}
 
-	kind, err := parseCLIKind(*cliFlag)
+	// Resolve each config value with the flag-file-env-default precedence.
+	resolvedLabel := *label
+	if !explicitlySet["label"] && cf.Label != "" {
+		resolvedLabel = cf.Label
+	}
+	resolvedCWD := *cwd
+	if !explicitlySet["cwd"] && cf.CWD != "" {
+		resolvedCWD = cf.CWD
+	}
+	resolvedSessionKey := *sessionKey
+	if !explicitlySet["session-key"] && cf.SessionKey != "" {
+		resolvedSessionKey = cf.SessionKey
+	}
+	resolvedCLIString := *cliFlag
+	if !explicitlySet["cli"] && cf.CLI != "" {
+		resolvedCLIString = cf.CLI
+	}
+	resolvedLogPath := *logPath
+	if !explicitlySet["log-path"] && cf.LogPath != "" {
+		resolvedLogPath = cf.LogPath
+	}
+	resolvedClaudeSettings := *claudeSettings
+	if !explicitlySet["claude-settings"] && cf.ClaudeSettings != "" {
+		resolvedClaudeSettings = cf.ClaudeSettings
+	}
+
+	if resolvedLabel == "" {
+		return daemonConfig{}, exitUsage, errors.New("--label is required (or set `label` in --config file)")
+	}
+	if resolvedCWD == "" {
+		return daemonConfig{}, exitUsage, errors.New("--cwd is required (or set `cwd` in --config file)")
+	}
+	if resolvedSessionKey == "" {
+		return daemonConfig{}, exitUsage, errors.New("--session-key is required (or set `session_key` in --config file)")
+	}
+	if resolvedCLIString == "" {
+		return daemonConfig{}, exitUsage, errors.New("--cli is required (or set `cli` in --config file): claude|codex|gemini")
+	}
+
+	kind, err := parseCLIKind(resolvedCLIString)
 	if err != nil {
 		return daemonConfig{}, exitUsage, err
 	}
@@ -258,13 +372,39 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 	// Resolve cwd (symlink-resolved to match session-register + Go
 	// peer-inbox resolveCWD behavior) so (cwd, label) lookups in the
 	// DB match.
-	resolvedCWD, err := resolveCWD(*cwd)
+	resolvedCWDFinal, err := resolveCWD(resolvedCWD)
 	if err != nil {
 		return daemonConfig{}, exitInternal, fmt.Errorf("resolve cwd: %w", err)
 	}
 
-	ack := resolveIntSecondsWithEnv(*ackTimeoutSec, "AGENT_COLLAB_ACK_TIMEOUT", defaultAckTimeoutSecs)
-	sweep := resolveIntSecondsWithEnv(*sweepTTLSec, "AGENT_COLLAB_SWEEP_TTL", defaultSweepTTLSecs)
+	// TTL resolution: flag → config file → env → default. `explicitlySet`
+	// distinguishes "--ack-timeout 0" (unusual; 0 is invalid downstream)
+	// from "flag not passed".
+	ackSec := *ackTimeoutSec
+	if !explicitlySet["ack-timeout"] && cf.AckTimeoutSec > 0 {
+		ackSec = cf.AckTimeoutSec
+	}
+	sweepSec := *sweepTTLSec
+	if !explicitlySet["sweep-ttl"] && cf.SweepTTLSec > 0 {
+		sweepSec = cf.SweepTTLSec
+	}
+	ack := resolveIntSecondsWithEnv(ackSec, "AGENT_COLLAB_ACK_TIMEOUT", defaultAckTimeoutSecs)
+	sweep := resolveIntSecondsWithEnv(sweepSec, "AGENT_COLLAB_SWEEP_TTL", defaultSweepTTLSecs)
+
+	pollResolved := *pollSec
+	if !explicitlySet["poll-interval"] && cf.PollSec > 0 {
+		pollResolved = cf.PollSec
+	}
+	if pollResolved == 0 {
+		pollResolved = defaultPollIntervalSec
+	}
+	pauseResolved := *pauseIdleSec
+	if !explicitlySet["pause-on-idle"] && cf.PauseIdleSec > 0 {
+		pauseResolved = cf.PauseIdleSec
+	}
+	if pauseResolved == 0 {
+		pauseResolved = defaultPauseOnIdleSec
+	}
 
 	if ack <= 0 {
 		return daemonConfig{}, exitUsage, errors.New("--ack-timeout must be positive")
@@ -272,36 +412,35 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 	if sweep <= 0 {
 		return daemonConfig{}, exitUsage, errors.New("--sweep-ttl must be positive")
 	}
-	if *pollSec <= 0 {
+	if pollResolved <= 0 {
 		return daemonConfig{}, exitUsage, errors.New("--poll-interval must be positive")
 	}
-	if *pauseIdleSec <= 0 {
+	if pauseResolved <= 0 {
 		return daemonConfig{}, exitUsage, errors.New("--pause-on-idle must be positive")
 	}
 
 	// Claude settings: §4 bullet 5 + §8.2 fixture-pin MANDATORY.
 	// Resolve to a concrete path now so the fixture-pin test can
 	// inspect the daemon's spawn argv deterministically.
-	claudeSettingsResolved := *claudeSettings
-	if claudeSettingsResolved == "" {
+	if resolvedClaudeSettings == "" {
 		if home, err := os.UserHomeDir(); err == nil {
-			claudeSettingsResolved = filepath.Join(home, ".claude", "settings.json")
+			resolvedClaudeSettings = filepath.Join(home, ".claude", "settings.json")
 		} else {
-			claudeSettingsResolved = ".claude/settings.json"
+			resolvedClaudeSettings = ".claude/settings.json"
 		}
 	}
 
 	return daemonConfig{
-		Label:              *label,
-		CWD:                resolvedCWD,
-		SessionKey:         *sessionKey,
+		Label:              resolvedLabel,
+		CWD:                resolvedCWDFinal,
+		SessionKey:         resolvedSessionKey,
 		CLI:                kind,
 		AckTimeout:         time.Duration(ack) * time.Second,
 		SweepTTL:           time.Duration(sweep) * time.Second,
-		Poll:               time.Duration(*pollSec) * time.Second,
-		PauseOnIdle:        time.Duration(*pauseIdleSec) * time.Second,
-		ClaudeSettingsPath: claudeSettingsResolved,
-		LogPath:            *logPath,
+		Poll:               time.Duration(pollResolved) * time.Second,
+		PauseOnIdle:        time.Duration(pauseResolved) * time.Second,
+		ClaudeSettingsPath: resolvedClaudeSettings,
+		LogPath:            resolvedLogPath,
 	}, exitOK, nil
 }
 
