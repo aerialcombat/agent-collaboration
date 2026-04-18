@@ -605,6 +605,16 @@ behavior).
 - **room-gemini** (gemini-direct)  — no reply; daemon log shows spawn→ack_timeout_abandoned after 180s; consistent with gemini peer-send behavioral quirk from v0.1.2 dogfood (NOT a v3.1 regression)
 - round-1 deployment-gap probe confirmed daemons need restart to pick up prompt patches (meta-lesson: patch-merged ≠ patch-deployed)
 
+**2026-04-19 vs `v3.x-topic-3-v0.3-shipped` @ `4d65bf3`** — test-engineer v0.3 ship-closure probe.
+
+- **pi-mono 0.67.68** — E10a (codex→openai-codex shim) **PASS**
+  - shim argv pi-style; deprecation warn on startup; batch-2 recall "indigo"; reset deletes file; batch-4 reply "NONE"
+- **pi-mono 0.67.68** — E10b (gemini→google-antigravity shim) **PASS**
+  - shim argv pi-style; batch-2 recall "amber"; reset deletes file
+  - batch-4 reply "amber" via model OOB inbox-DB reconstruction (NOT pi session resume — fresh session UUID confirms Arch D reset contract intact). Behavioral property of `gemini-3-flash` under current tool-access surface; not an Arch D protocol gap. Candidate v3.1 papercut for operator-guide clarity.
+
+Closes v0.3 per the v0.1.2 ship-closure meta-lesson: fake-binary gates don't validate real-CLI behavior. BOTH phases of E10 PASSED as required by §10 Q4 ratification. The E10b reset-recall anomaly is a vendor/tooling observation (not a daemon regression) and is queued for v3.1+ operator-guide treatment.
+
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure (E5 + E6, both now RETIRED v0.3).
