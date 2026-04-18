@@ -454,6 +454,15 @@ behavior).
   - Batch-2 reply "sapphire"; argv `--session <same path>`; mechanism2 in ~3s
   - Confirms v0.2.1 env-var revert (v2 `ZAI_API_KEY` "fix" reverted to plugin-correct `ZAI_GLM_API_KEY`)
 
+**2026-04-19 vs v3.1 [PROMPT] patch @ `23da0c1`** — test-engineer E9 probe.
+
+- **room-pi** (pi+zai-glm)         — self-label ✓, interpolation ✓, peer-send ✓
+- **room-pi-codex** (pi+openai)    — self-label ✓, interpolation ✓, peer-send ✓
+- **room-pi-gemini** (pi+google-a) — self-label ✓, interpolation ✓, peer-send ✓
+- **room-codex** (codex-direct)    — self-label ✓, interpolation ✓, peer-send ✓
+- **room-gemini** (gemini-direct)  — no reply; daemon log shows spawn→ack_timeout_abandoned after 180s; consistent with gemini peer-send behavioral quirk from v0.1.2 dogfood (NOT a v3.1 regression)
+- round-1 deployment-gap probe confirmed daemons need restart to pick up prompt patches (meta-lesson: patch-merged ≠ patch-deployed)
+
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
