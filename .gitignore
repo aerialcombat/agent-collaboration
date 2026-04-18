@@ -1,5 +1,13 @@
 .DS_Store
 .agent-collab/reviews/
+.agent-collab/replay-*.html
+.agent-collab/sessions/
 docs/superpowers/
 scripts/__pycache__/
 **/__pycache__/
+
+# Go build artifacts
+go/bin/
+
+# Scratch / ad-hoc polling
+poll_messages.sh
