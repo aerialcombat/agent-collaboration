@@ -346,12 +346,12 @@ install_daemon_config_dir() {
 
   cat >"$PEER_INBOX_DAEMON_EXAMPLE_CFG" <<'EOF'
 {
-  "_note": "Topic 3 daemon config template. Copy to <label>.json and edit. Invoke via: agent-collab-daemon --config <label>",
+  "_note": "Topic 3 daemon config template (v0.3 canonical: pi-routed openai-codex example). Copy to <label>.json and edit. Invoke via: agent-collab-daemon --config <label>",
 
   "label": "CHANGEME-reviewer-codex",
   "cwd":   "CHANGEME-/absolute/path/to/workspace",
   "session_key": "CHANGEME-stable-session-key-string",
-  "cli": "codex",
+  "cli": "pi",
 
   "ack_timeout":   300,
   "sweep_ttl":     600,
@@ -361,10 +361,16 @@ install_daemon_config_dir() {
   "claude_settings": "",
   "log_path": "",
 
-  "_arch_d_note": "Topic 3 v0.1 (Arch D) opt-in: set cli_session_resume=true to pass the CLI vendor's native session-ID into subsequent spawns (codex+gemini only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation. See docs/DAEMON-OPERATOR-GUIDE.md Arch D section.",
-  "cli_session_resume": false,
+  "_arch_d_note": "Topic 3 v0.1 (Arch D) opt-in: set cli_session_resume=true to pass the CLI vendor's native session-ID into subsequent spawns. Default false preserves fresh-invocation per batch. See docs/DAEMON-OPERATOR-GUIDE.md Arch D section.",
+  "cli_session_resume": true,
 
-  "_pi_note": "For a --cli pi daemon (Topic 3 v0.2; pi-mono multi-provider), see example-pi.json.disabled in this dir for the nested pi: { provider, model, session_dir } sub-object shape."
+  "_v03_note": "Topic 3 v0.3 collapse: codex-direct and gemini-direct are RETIRED. For codex-like behavior, use cli=pi with pi.provider=openai-codex (as shown below). For gemini-like behavior, use pi.provider=google-antigravity. Legacy cli=codex / cli=gemini configs still work via SOFT SHIM through v0.3 + HARD RETIRE in v0.4 — migrate when convenient. See example-pi.json.disabled for provider options.",
+
+  "pi": {
+    "provider":    "openai-codex",
+    "model":       "gpt-5.3-codex",
+    "session_dir": "$HOME/.agent-collab/pi-sessions"
+  }
 }
 EOF
   chmod 0644 "$PEER_INBOX_DAEMON_EXAMPLE_CFG"

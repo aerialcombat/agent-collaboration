@@ -222,59 +222,66 @@ AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
 
 ### Per-CLI behavior
 
-- **Codex (`--cli codex`)**: daemon spawns first batch with
-  `codex exec --skip-git-repo-check <prompt>` and captures the
-  session-ID from the stdout banner regex
-  `(?i)session id:\s*([0-9a-f-]{36})`. Subsequent batches spawn
-  `codex exec resume --skip-git-repo-check <UUID> <prompt>`. Session-ID
-  persisted in `sessions.daemon_cli_session_id`.
+- **Codex (`--cli codex`) — RETIRED v0.3 (SOFT SHIM).** Topic 3 v0.3
+  retires codex-direct in favor of `--cli=pi --pi-provider=openai-codex`
+  per `plans/v3.x-topic-3-v0.3-collapse-scoping.md` §4.1. Operators
+  running `--cli=codex` continue to work: the daemon auto-maps to
+  `pi.provider=openai-codex` internally (SOFT SHIM per §3.2.b; HARD
+  RETIRE scheduled for v0.4 per §10 Q6). The shim requires
+  `--pi-model=<model>` at startup; missing → exit 64 EX_USAGE.
+  Deprecation warning at startup names the canonical form.
 
-- **Gemini (`--cli gemini`)**: daemon snapshots `gemini --list-sessions`
-  before/after first spawn; new UUID = set-difference.
-  **Important: gemini 0.38.2's `--resume` flag is documented as
-  accepting `"latest"` or `<index>`, NOT UUIDs.** The daemon stores the
-  UUID for stable identity but translates UUID → current-index via
-  `--list-sessions` re-query at each resume invocation
-  (`gemini --resume <N> -p <prompt>`). This is a v3 amendment to the
-  scope doc per Checkpoint 1 finding (direct-UUID-resume works
-  empirically in 0.38.2 but is undocumented; v0.1 builds on the
-  documented index-addressing API).
+  Behavior under shim is identical to **Pi** (below) with
+  `pi.provider=openai-codex`. The v0.1 regex-banner capture + UUID
+  resume-argv + stderr-stream scanning are all retired — pi's path-as-
+  identity replaces them entirely.
 
-  **Concurrent-gemini race**: if `--list-sessions` shows multiple new
-  UUIDs after the daemon's first spawn (another gemini session was
-  created elsewhere), the daemon **does NOT pick a winner** — it logs
-  a warning and leaves the column NULL. Daemon falls through to
-  Arch B fresh-invocation that batch (recoverable). To prevent this
-  by construction, set `GEMINI_CONFIG_DIR=$HOME/.gemini-daemon-<LABEL>`
-  in the daemon's environment so its session store is isolated from
-  any operator interactive gemini sessions.
+  Canonical form (migrate when convenient):
 
   ```bash
-  # Race-by-construction prevention (recommended for production)
-  GEMINI_CONFIG_DIR=$HOME/.gemini-daemon-reviewer-gemini \
-    AGENT_COLLAB_CLI_SESSION_RESUME=1 \
-    agent-collab-daemon --config reviewer-gemini
+  agent-collab-daemon --cli pi --pi-provider openai-codex \
+    --pi-model gpt-5.3-codex --cli-session-resume \
+    --label reviewer-codex --cwd ... --session-key ...
   ```
 
-  **Tuning the `--list-sessions` timeout (v0.1.2 fix).** Real
-  `gemini --list-sessions` enumeration time scales with the size of the
-  session store. v0.1's hardcoded 5s timeout deterministically missed
-  on operator-sized configs (E6 probe measured ~5.3s on a typical
-  config). v0.1.2 raised the default to **15s** and added an env
-  override:
+  Legacy tolerance (continues to work in v0.3; retired in v0.4):
 
   ```bash
-  # Tune --list-sessions timeout — values in seconds. Default 15s.
-  AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT=30 \
-    AGENT_COLLAB_CLI_SESSION_RESUME=1 \
-    agent-collab-daemon --config reviewer-gemini
+  agent-collab-daemon --cli codex --pi-model gpt-5.3-codex \
+    --cli-session-resume \
+    --label reviewer-codex --cwd ... --session-key ...
+  # stderr: "--cli=codex is routed through pi as of v0.3 ..."
   ```
 
-  Bump higher for very-large session stores (operator's `~/.gemini/`
-  with thousands of sessions); bump lower for CI / fixture runs that
-  want fast-fail on enumeration. Invalid values (non-int, ≤0) silently
-  fall back to the 15s default — capture-failure is non-fatal per
-  §3.4 invariant 5, so a config typo here does not block the daemon.
+- **Gemini (`--cli gemini`) — RETIRED v0.3 (SOFT SHIM).** Same story as
+  codex per §4.2. Operators running `--cli=gemini` are auto-mapped to
+  `pi.provider=google-antigravity`; `--pi-model` required. v0.1's
+  `--list-sessions` delta-snapshot + UUID→index translation + race-
+  warn-and-NULL + 15s env-tunable timeout are all retired. Pi's path-
+  as-identity is race-free by construction (daemon owns the path) +
+  has no enumeration-timeout surface.
+
+  v3.1 E9 probe 2026-04-19 observed `room-gemini` (gemini-direct) hit
+  `ack_timeout_abandoned` consistent with the v0.1.2 dogfood-era
+  behavioral quirk; `room-pi-gemini` (pi-routed) did not exhibit this.
+  pi-routed Google-provider peers are the recommended migration target.
+
+  Canonical form:
+
+  ```bash
+  agent-collab-daemon --cli pi --pi-provider google-antigravity \
+    --pi-model gemini-3-flash --cli-session-resume \
+    --label reviewer-gemini --cwd ... --session-key ...
+  ```
+
+  Legacy tolerance:
+
+  ```bash
+  agent-collab-daemon --cli gemini --pi-model gemini-3-flash \
+    --cli-session-resume \
+    --label reviewer-gemini --cwd ... --session-key ...
+  # stderr: "--cli=gemini is routed through pi as of v0.3 ..."
+  ```
 
 - **Pi (`--cli pi`, Topic 3 v0.2)**: pi is the first Arch D CLI where
   the **daemon owns the session-file PATH** rather than translating an
@@ -466,6 +473,102 @@ A richer alternative — daemon-controlled `ContinuitySummary` envelope-
 bridging where the daemon manages context content directly — is
 deferred to v1+. Arch D is the lighter-weight intermediate that uses
 each CLI's own session-management, with the trust trade made explicit.
+
+### Migrating from v0.2 codex-direct / gemini-direct (v0.3 collapse)
+
+Topic 3 v0.3 retires codex-direct and gemini-direct. Operators running
+pre-v0.3 configs with `"cli": "codex"` or `"cli": "gemini"` must add
+`pi.model` (+ optionally `pi.provider` — auto-mapped if omitted) to
+their daemon configs, then restart. The legacy `cli` field continues
+to be accepted in v0.3 via SOFT SHIM; HARD RETIRE in v0.4.
+
+**1. Audit (grep + SQL):**
+
+```bash
+# Config files using retired cli values:
+grep -l '"cli":\s*"\(codex\|gemini\)"' ~/.agent-collab/daemons/*.json
+
+# DB rows backing shim-eligible labels:
+sqlite3 ~/.agent-collab/sessions.db \
+  "SELECT label, agent, daemon_cli_session_id FROM sessions
+   WHERE agent IN ('codex', 'gemini');"
+```
+
+**2. Config edit (before/after):**
+
+Before (v0.2-style codex-direct):
+```json
+{
+  "label": "reviewer-codex",
+  "cli": "codex",
+  "cli_session_resume": true
+}
+```
+
+After (v0.3 canonical, pi-routed):
+```json
+{
+  "label": "reviewer-codex",
+  "cli": "pi",
+  "cli_session_resume": true,
+  "pi": { "provider": "openai-codex", "model": "gpt-5.3-codex" }
+}
+```
+
+Or the minimal-delta variant (shim-tolerant, keeps legacy `cli: codex`):
+```json
+{
+  "label": "reviewer-codex",
+  "cli": "codex",
+  "cli_session_resume": true,
+  "pi": { "provider": "openai-codex", "model": "gpt-5.3-codex" }
+}
+```
+
+Labels are preserved during migration (no force-relabel); `sessions.agent`
+stays at register-time value per §3.3 Shape β WIDE gate. A gemini config
+takes `pi.provider=google-antigravity`.
+
+**Preflight fail-fast:** daemon startup with `--cli=codex` (or
+`--cli=gemini`) without `pi.model` exits 64 with a copy-pasteable
+diagnostic. There is no default model — you MUST supply one, forcing
+explicit provider+model coupling at migration time (per v0.3 §10 Q3
+ratification).
+
+**3. Restart + verification:**
+
+Restart is required to pick up v0.3 code (patch-merged ≠ patch-deployed
+per v3.1 E9 meta-lesson). Rolling-restart is safe — sweeper requeues
+any in-flight claim on the fresh daemon.
+
+Verification one-liner:
+```bash
+tail -20 ~/.agent-collab/daemon/<label>.log \
+  | grep -E 'routed through pi|spawn.exec.*--provider'
+```
+Expected: two matches — (a) the `--cli=codex is routed through pi as
+of v0.3 ...` startup warning; (b) the next `daemon.spawn.exec` log
+line showing argv contains `--provider openai-codex` + `--session <path>`.
+
+**4. (Optional) Column cleanup:**
+
+Pre-v0.3 UUID values in `daemon_cli_session_id` are tolerated by the
+v0.3 daemon (path-shape guard on `os.Remove` protects legacy UUID
+rows from accidental file-delete). Cleanup is hygiene, not correctness:
+
+```sql
+UPDATE sessions SET daemon_cli_session_id = NULL
+WHERE agent IN ('codex', 'gemini')
+  AND daemon_cli_session_id IS NOT NULL
+  AND daemon_cli_session_id NOT LIKE '%/%';
+```
+
+**5. (Optional) Label rename:**
+
+To rewrite `sessions.agent` to reflect the new provider identity, re-
+register: `agent-collab session register --cwd <cwd> --label <label>
+--agent pi --receive-mode daemon`. Drops audit history of "was codex"
+— NOT recommended unless you actively want the rewrite.
 
 ---
 

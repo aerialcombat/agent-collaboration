@@ -60,7 +60,21 @@ Three probes. E5 covers codex banner-format drift detection. E6 covers
 gemini `--list-sessions` serialization drift detection. E7 captures
 pinned CLI versions for future drift-comparison runs.
 
-### Probe E5 — Codex banner regex against live `codex 0.121+`
+### Probe E5 — Codex banner regex against live `codex 0.121+` — RETIRED v0.3 (see §E10)
+
+> **RETIRED v0.3.** Topic 3 v0.3 collapse retires codex-direct spawning
+> in favor of pi-routed (`--cli=pi --pi-provider=openai-codex`). The
+> codex banner-regex capture code path this probe validated is deleted;
+> pi owns path-as-identity session resume end-to-end. E5's coverage is
+> subsumed by §E10 Phase 10a (pi-openai-codex through live CLI).
+>
+> The E5 protocol + its last-run history block are preserved below as
+> empirical baseline for the v0.1-era tag annotations (per test-
+> engineer F4 preservation pattern). Do NOT run E5 against v0.3+
+> builds — the daemon no longer spawns `codex exec` directly.
+
+**Original (v0.1-era) protocol follows:**
+
 
 **Intent:** the daemon's regex `(?i)session id:\s*([0-9a-f-]{36})`
 correctly captures the session-ID from a real `codex exec` invocation,
@@ -135,7 +149,23 @@ grep "spawn.argv" /tmp/daemon-probe-e5-target/daemon.log | tail -2
   semantic broke or session-state expired between batches). Re-run with
   shorter delay; if still failing, escalate to codex vendor.
 
-### Probe E6 — Gemini `--list-sessions` parser against live `gemini 0.38+`
+### Probe E6 — Gemini `--list-sessions` parser against live `gemini 0.38+` — RETIRED v0.3 (see §E10)
+
+> **RETIRED v0.3.** Topic 3 v0.3 collapse retires gemini-direct
+> spawning in favor of pi-routed (`--cli=pi --pi-provider=google-antigravity`).
+> The gemini `--list-sessions` delta-snapshot + UUID→index translation
+> code path this probe validated is deleted; pi owns path-as-identity
+> session resume end-to-end (race-free by construction; no enumeration
+> timeout surface). E6's coverage is subsumed by §E10 Phase 10b (pi-
+> google-antigravity through live CLI).
+>
+> The E6 protocol + its last-run history block are preserved below as
+> empirical baseline for the v0.1-era tag annotations (per test-
+> engineer F4 preservation pattern). Do NOT run E6 against v0.3+
+> builds — the daemon no longer spawns `gemini --list-sessions`.
+
+**Original (v0.1-era) protocol follows:**
+
 
 **Intent:** the daemon's `--list-sessions` parser correctly extracts
 UUIDs from real gemini output, the delta-snapshot capture identifies
@@ -383,17 +413,129 @@ agent-collab peer send --as e8-driver --to e8-pi \
   stale file (rare; check that file path is truly deleted and no
   backup/`.deleted` artifact exists).
 
+### Probe E10 — Collapsed-path shim: codex via pi-openai-codex + gemini via pi-google-antigravity
+
+**Intent:** Topic 3 v0.3 collapse (`plans/v3.x-topic-3-v0.3-collapse-scoping.md`)
+retires codex-direct + gemini-direct in favor of pi-routed equivalents.
+E10 validates the SOFT SHIM end-to-end against live CLIs + real
+provider endpoints. Mandatory for v0.3 closure per §11 + the v0.1.2
+meta-lesson (fake-binary gates don't validate real-CLI behavior).
+
+Single umbrella probe, BOTH phases required. Each phase asserts
+session-resume (capture + reuse + file-delete-on-reset) AND v3.1
+[PROMPT] peer-send reply-path works end-to-end.
+
+**Prerequisites:** `pi --version` ≥ `0.67.68`. Auth for both providers
+available on operator install:
+- `~/.pi/agent/auth.json` contains `openai-codex` OAuth entry (run
+  `pi /login` once for openai-codex if not present).
+- `~/.pi/agent/auth.json` contains `google-antigravity` OAuth entry
+  (run `pi /login` once for google-antigravity if not present; refresh
+  is auto-handled by pi-mono).
+
+#### Phase 10a — `--cli=codex` shim → pi-openai-codex
+
+**Setup + probe:**
+
+```bash
+mkdir -p /tmp/e10a-driver && cd /tmp/e10a-driver
+agent-collab session register --label e10a-driver --agent claude
+
+mkdir -p /tmp/e10a-target && cd /tmp/e10a-target
+SESSION_KEY=$(uuidgen)
+AGENT_COLLAB_SESSION_KEY=$SESSION_KEY \
+  agent-collab session register \
+    --receive-mode daemon --agent codex \
+    --label e10a-codex --cwd "$PWD"
+
+# Start the SHIM daemon — --cli=codex, not --cli=pi. Daemon emits the
+# deprecation warning + routes through spawnPi internally.
+AGENT_COLLAB_SESSION_KEY=$SESSION_KEY \
+  agent-collab-daemon \
+    --label e10a-codex --cwd "$PWD" \
+    --session-key "$SESSION_KEY" \
+    --cli codex --pi-model gpt-5.3-codex \
+    --cli-session-resume \
+    --log-path /tmp/e10a-target/daemon.log
+# Expect in daemon.log + stderr:
+#   "--cli=codex is routed through pi as of v0.3 ..."
+
+# Driver — batch 1: seed context + instruct reply.
+agent-collab peer send --as e10a-driver --to e10a-codex \
+  --message "remember the word: amethyst. reply to me with 'ACK1' using: agent-collab peer send --as e10a-codex --to e10a-driver --message 'ACK1'"
+
+# Wait for completion. Assert:
+# (a) session file created at /tmp/e10a-target/pi-sessions/e10a-codex.jsonl (or
+#     $HOME/.agent-collab/pi-sessions/e10a-codex.jsonl if session_dir default).
+# (b) daemon.log contains: daemon.spawn.exec with argv including
+#     --provider openai-codex + --session <path>.
+# (c) e10a-driver's inbox contains the "ACK1" reply from e10a-codex
+#     (v3.1 peer-send reply-path assertion).
+
+# Driver — batch 2: context recall.
+agent-collab peer send --as e10a-driver --to e10a-codex \
+  --message "what word did I ask you to remember? reply with just the word."
+
+# Assert: reply quotes "amethyst" (proves vendor-side context retained
+# across spawns via pi-routed path).
+
+# Reset + negative recall.
+peer-inbox daemon-reset-session --cwd /tmp/e10a-target --as e10a-codex --format json
+# Expect JSON contains deleted_file.
+
+agent-collab peer send --as e10a-driver --to e10a-codex \
+  --message "what word did I ask you to remember earlier? reply with NONE if you don't remember."
+
+# Assert: reply does NOT contain "amethyst".
+```
+
+**Phase 10a pass criteria:**
+1. Deprecation warning in daemon.log + stderr.
+2. Argv per `daemon.spawn.exec` contains `--provider openai-codex` +
+   `--session <path>` (no legacy `exec resume` / `--skip-git-repo-check`).
+3. Session file created at `$pi.session_dir/e10a-codex.jsonl`.
+4. Batch 2 reply contains "amethyst" (context retained).
+5. Reset JSON contains `deleted_file`; file deleted from disk.
+6. Batch 4 reply does NOT contain "amethyst" (reset actually reset).
+7. Peer-send reply from batch 1 lands in e10a-driver inbox
+   (v3.1 peer-send reply-path assertion).
+
+#### Phase 10b — `--cli=gemini` shim → pi-google-antigravity
+
+Identical structure to Phase 10a with:
+- `--cli=gemini --pi-model=gemini-3-flash`
+- `--agent gemini` at session register
+- Label `e10b-gemini` / driver `e10b-driver`
+
+Assert: argv contains `--provider google-antigravity`. No legacy
+`--list-sessions` / `--resume N` tokens. Peer-send reply lands in
+driver inbox. Context recall + reset behave per Phase 10a's criteria.
+
+**E10 overall pass criterion:** BOTH Phase 10a AND Phase 10b PASS.
+Either phase failing blocks the v0.3 closure tag.
+
+**Fail handling:**
+- Argv missing `--provider` / wrong provider value: shim mapping
+  regression. Inspect `shimProviderMap` in `go/cmd/daemon/main.go`
+  parseFlags.
+- Deprecation warning absent: `run()` startup warning wire broken.
+- Peer-send reply missing from driver inbox: v3.1 [PROMPT] patch
+  regression. Re-check `tests/daemon-prompt-interpolation.sh` + live
+  CLI's interpretation of `{{SELF_LABEL}}` interpolation.
+- `deleted_file` absent from reset JSON: path-shape guard or Shape β
+  WIDE agent-gate regression. Inspect `runResetSession`.
+
 ## Probe results template
 
 For each probe, record in your run log:
 
 ```
-Probe ID: E5 | E6 | E7 | E8
+Probe ID: E5 (RETIRED v0.3) | E6 (RETIRED v0.3) | E7 | E8 | E10 (10a / 10b)
 Date: YYYY-MM-DD
 codex version: codex-cli X.Y.Z   (E5, E7)
 gemini version: gemini X.Y.Z     (E6, E7)
-pi version: pi-mono X.Y.Z        (E8)
-provider + model: zai-glm / glm-4.6 (E8)
+pi version: pi-mono X.Y.Z        (E8, E10)
+provider + model: zai-glm / glm-4.6 (E8); openai-codex / gpt-5.3-codex (E10a); google-antigravity / gemini-3-flash (E10b)
 Outcome: PASS | FAIL | PARTIAL
 Notes: <free-form observations, especially: did the regex / parser match?
         did vendor resume work? any unexpected stderr output? any
@@ -465,22 +607,20 @@ behavior).
 
 ## When to re-run
 
-- Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
-- Before tagging `v3.x-topic-3-v0.2-shipped` — E8 required for closure
-  (per v0.1.2 ship-closure meta-lesson: fake-binary gates don't validate
-  real-CLI behavior).
-- After bumping `codex`, `gemini`, or `pi` CLI to a new version (covers
-  the fixture-pin contract).
-- After modifying any of: `spawnCodex`, `spawnGemini`, `spawnPi`,
-  `parseGeminiListSessions`, `codexSessionIDRE`, `resolvePiSessionPath`,
-  or related helpers in `go/cmd/daemon/main.go`.
+- Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure (E5 + E6, both now RETIRED v0.3).
+- Before tagging `v3.x-topic-3-v0.2-shipped` — E8 required for closure (per v0.1.2 ship-closure meta-lesson: fake-binary gates don't validate real-CLI behavior).
+- Before tagging `v3.x-topic-3-v0.3-shipped` — E10 BOTH phases required for closure (Phase 10a openai-codex + Phase 10b google-antigravity; same meta-lesson).
+- After bumping `pi` CLI or any provider model the shim targets (openai-codex, google-antigravity) to a new version.
+- After modifying any of: `spawnPi`, `resolvePiSessionPath`, `mintPiSessionPath`, `shimProviderMap`, the shim deprecation-warning strings in `run()`, or the reset-verb Shape β + path-shape guard logic.
 - Before merging any PR that touches `tests/fixtures/cli-session/*`.
 
 ## References
 
 - [DAEMON-OPERATOR-GUIDE.md § Architecture D](./DAEMON-OPERATOR-GUIDE.md#architecture-d--cli-native-session-id-pass-through-v01-opt-in)
-  — operator-facing concepts (includes v0.2 pi sub-section with provider-
-  auth env-var table + pi-specific reset semantics).
+  — operator-facing concepts. Post-v0.3: codex + gemini sub-sections
+  are RETIRED banners pointing to the pi-routed canonical form; pi
+  sub-section covers all non-claude workflows; new "Migrating from v0.2
+  codex-direct / gemini-direct" subsection documents operator flow.
 - [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md) — Topic 3 v0 E2E probes
   (E1-E4); template this protocol mirrors.
 - `plans/v3.x-topic-3-arch-d-scoping.md` — v0.1 scope-doc; §6.1 + §6.2
@@ -489,9 +629,13 @@ behavior).
   invariants pi-reading (especially invariant 5 re-create-at-same-path);
   §8.1 pi-specific reset semantics (file-delete gated on
   `sessions.agent == 'pi'`).
-- `tests/daemon-cli-resume-codex.sh`, `tests/daemon-cli-resume-gemini.sh`,
-  `tests/daemon-cli-resume-pi.sh`, `tests/daemon-pi-session-lifecycle.sh`
-  — shape-2 CI gates that fixtures pin against.
+- `plans/v3.x-topic-3-v0.3-collapse-scoping.md` — v0.3 scope-doc;
+  §3.2.b SOFT SHIM mechanism, §3.3 Shape β WIDE + path-shape guard,
+  §4.1 + §4.2 codex/gemini retirement, §9.3 migration story.
+- `tests/daemon-cli-resume-pi.sh`, `tests/daemon-pi-session-lifecycle.sh`,
+  `tests/daemon-collapse-migration.sh` — active CI gates (pi-native +
+  v0.3 shim regression). `daemon-cli-resume-codex.sh` +
+  `daemon-cli-resume-gemini.sh` are retired-banner stubs post-v0.3.
 - `tests/fixtures/cli-session/codex-banner.txt`,
   `tests/fixtures/cli-session/gemini-list-sessions.txt`,
   `tests/fixtures/cli-session/pi-help.txt` — pinned fixtures (pi-help
