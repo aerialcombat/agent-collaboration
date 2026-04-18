@@ -111,6 +111,9 @@ SESSION_KEY_ENV_CANDIDATES = (
 EXIT_OK = 0
 EXIT_LABEL_COLLISION = 1
 EXIT_CONFIG_ERROR = 2
+EXIT_USAGE = 64  # sysexits.h EX_USAGE — CLI invoked with contradictory flags
+EXIT_CONTRACT_VIOLATION = 65  # sysexits.h EX_DATAERR — Topic 3 fail-loud:
+                              # receive-mode mismatch, stale-claim --complete, etc.
 EXIT_VALIDATION = 3
 EXIT_PEER_OFFLINE = 4
 EXIT_PATH_DRIFT = 5
@@ -1222,10 +1225,28 @@ def cmd_session_register(args: argparse.Namespace) -> int:
             )
         )
 
+        # receive_mode resolution (Topic 3 §3.4 (b)):
+        #   --receive-mode daemon       → explicit daemon (e.g. session the
+        #                                 daemon-binary manages)
+        #   --receive-mode interactive  → explicit interactive
+        #   omitted, existing row       → preserve existing receive_mode
+        #                                 (avoids silent flip on refresh)
+        #   omitted, new row            → default 'interactive'
+        explicit_mode = getattr(args, "receive_mode", None)
+        if explicit_mode:
+            receive_mode_value = explicit_mode
+        elif row is not None:
+            try:
+                receive_mode_value = row["receive_mode"] or "interactive"
+            except (KeyError, IndexError):
+                receive_mode_value = "interactive"
+        else:
+            receive_mode_value = "interactive"
+
         conn.execute(
             """
-            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at, receive_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cwd, label) DO UPDATE SET
               agent = excluded.agent,
               role = excluded.role,
@@ -1233,9 +1254,10 @@ def cmd_session_register(args: argparse.Namespace) -> int:
               channel_socket = excluded.channel_socket,
               pair_key = excluded.pair_key,
               started_at = excluded.started_at,
-              last_seen_at = excluded.last_seen_at
+              last_seen_at = excluded.last_seen_at,
+              receive_mode = excluded.receive_mode
             """,
-            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now),
+            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now, receive_mode_value),
         )
         conn.execute("COMMIT")
     finally:
@@ -1798,13 +1820,103 @@ def format_hook_block(rows: list[sqlite3.Row]) -> str:
     return "".join(parts)
 
 
+def _sessions_receive_mode(conn: sqlite3.Connection, cwd: str, label: str) -> str:
+    """Return the receive_mode for (cwd, label) or 'interactive' if unset.
+
+    Used by cmd_peer_receive to enforce §3.4 guarantee (b): interactive
+    verbs reject daemon-mode labels and vice versa. Safe no-op on pre-0002
+    DBs (column absence falls through to the default).
+    """
+    row = conn.execute(
+        "SELECT receive_mode FROM sessions WHERE cwd = ? AND label = ?",
+        (cwd, label),
+    ).fetchone()
+    if row is None:
+        return "interactive"
+    try:
+        return row["receive_mode"] or "interactive"
+    except (KeyError, IndexError):
+        return "interactive"
+
+
+def _sessions_daemon_state(conn: sqlite3.Connection, cwd: str, label: str) -> str:
+    """Return the daemon_state ('open' | 'closed') for (cwd, label).
+
+    Used by --daemon-mode claim preflight to enforce §3.4 guarantee (e):
+    claim-time closed-state check.
+    """
+    row = conn.execute(
+        "SELECT daemon_state FROM sessions WHERE cwd = ? AND label = ?",
+        (cwd, label),
+    ).fetchone()
+    if row is None:
+        return "open"
+    try:
+        return row["daemon_state"] or "open"
+    except (KeyError, IndexError):
+        return "open"
+
+
+def _default_sweep_ttl_seconds() -> int:
+    """Resolve sweep TTL from env or fall back to 10-minute production default.
+
+    Matches the Topic 3 §3.3 ratio-invariant default (2× daemon ack-timeout).
+    The daemon itself validates the ratio at startup; this helper is for the
+    CLI-level --sweep invocation that doesn't know about daemon-state.
+    """
+    env = os.environ.get("AGENT_COLLAB_SWEEP_TTL", "")
+    if env:
+        try:
+            parsed = int(env)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return 600  # 10 minutes
+
+
 def cmd_peer_receive(args: argparse.Namespace) -> int:
+    # Dispatch table for Topic 3 daemon-mode verbs. All four sub-modes
+    # (--mark-read, --daemon-mode, --complete, --sweep) are mutually
+    # exclusive; argparse doesn't enforce because they're plain store_true
+    # flags, so we validate here.
+    sub_modes = [
+        getattr(args, "mark_read", False),
+        getattr(args, "daemon_mode", False),
+        getattr(args, "complete", False),
+        getattr(args, "sweep", False),
+    ]
+    if sum(1 for m in sub_modes if m) > 1:
+        err(
+            "peer receive: --mark-read, --daemon-mode, --complete, --sweep are mutually exclusive",
+            EXIT_USAGE,
+        )
+
+    if getattr(args, "sweep", False):
+        return _cmd_peer_receive_sweep(args)
+    if getattr(args, "complete", False):
+        return _cmd_peer_receive_complete(args)
+    if getattr(args, "daemon_mode", False):
+        return _cmd_peer_receive_daemon_mode(args)
+
     cwd = resolve_cwd(args.cwd)
     self_cwd, self_label = resolve_self(args.as_label, cwd)
 
     conn = open_db()
     try:
         if args.mark_read:
+            # §3.4 (b): interactive-mode --mark-read refuses to run on a
+            # daemon-mode label (fail loud, not silent no-op). Lets daemon
+            # misconfig surface at invocation rather than via missing
+            # injection.
+            mode = _sessions_receive_mode(conn, str(self_cwd), self_label)
+            if mode == "daemon":
+                err(
+                    f"receive-mode mismatch: session ({self_cwd}, {self_label}) "
+                    f"has receive_mode='daemon'; interactive --mark-read refused "
+                    f"(Topic 3 §3.4 (b) verb-entry gate)",
+                    EXIT_CONTRACT_VIOLATION,
+                )
             # Atomic claim-and-mark in a writer transaction. The UPDATE ...
             # RETURNING clause guarantees no concurrent receiver can claim
             # the same rows.
@@ -1923,6 +2035,236 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
             print(f"[{r['from_label']} @ {r['created_at']}]")
             print(r["body"])
             print()
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Topic 3 daemon-mode receive helpers. These run as separate verbs on the
+# same argparse subparser as interactive --mark-read but target distinct
+# code paths per the §2.3 path-separation invariant — daemon-mode rows
+# (claimed_at NOT NULL, read_at NULL) are never visible to interactive
+# reads (SQL partition per §3.4 (a)), and interactive-mode rows (read_at
+# NOT NULL, claimed_at NULL) are invisible to daemon claims. The two code
+# paths don't share row-state.
+# ---------------------------------------------------------------------------
+
+def _cmd_peer_receive_daemon_mode(args: argparse.Namespace) -> int:
+    """peer receive --daemon-mode --as <label>: atomic claim pass.
+
+    Path (per §2.1):
+      1. Resolve self from (cwd, label).
+      2. Reject if session's receive_mode != 'daemon' (§3.4 (b)).
+      3. Return empty batch if session's daemon_state == 'closed' (§3.4 (e)).
+      4. Atomic claim: UPDATE inbox SET claimed_at, claim_owner WHERE
+         to_cwd, to_label match AND read_at IS NULL AND claimed_at IS NULL.
+      5. Serialize batch in chosen --format.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+
+    conn = open_db()
+    try:
+        # §3.4 (b): verb-entry receive_mode gate.
+        mode = _sessions_receive_mode(conn, str(self_cwd), self_label)
+        if mode != "daemon":
+            err(
+                f"receive-mode mismatch: session ({self_cwd}, {self_label}) "
+                f"has receive_mode={mode!r}; --daemon-mode requires 'daemon' "
+                f"(register with `session-register --receive-mode daemon`; "
+                f"Topic 3 §3.4 (b) verb-entry gate)",
+                EXIT_CONTRACT_VIOLATION,
+            )
+
+        # §3.4 (e): closed-state at claim-time. Preflight before claiming so
+        # sweeper-requeued rows can't trigger a new spawn on a closed daemon.
+        state = _sessions_daemon_state(conn, str(self_cwd), self_label)
+        if state == "closed":
+            rows = []
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+            now = now_iso()
+            rows = conn.execute(
+                """
+                UPDATE inbox
+                SET claimed_at = ?, claim_owner = ?
+                WHERE to_cwd = ? AND to_label = ?
+                  AND read_at IS NULL
+                  AND claimed_at IS NULL
+                RETURNING id, from_cwd, from_label, body, created_at
+                """,
+                (now, self_label, str(self_cwd), self_label),
+            ).fetchall()
+            bump_last_seen(conn, str(self_cwd), self_label)
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    if args.format == "json":
+        payload = [
+            {
+                "id": r["id"],
+                "from_cwd": r["from_cwd"],
+                "from_label": r["from_label"],
+                "body": r["body"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+        json.dump(payload, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    elif args.format == "hook":
+        sys.stdout.write(format_hook_block(list(rows)))
+        if rows:
+            sys.stdout.write("\n")
+    elif args.format == "hook-json":
+        block = format_hook_block(list(rows))
+        hook_event_name = os.environ.get(
+            "AGENT_COLLAB_HOOK_EVENT_NAME", "UserPromptSubmit"
+        )
+        envelope = {
+            "hookSpecificOutput": {
+                "hookEventName": hook_event_name,
+                "additionalContext": block,
+            }
+        } if block else {}
+        if envelope:
+            json.dump(envelope, sys.stdout, ensure_ascii=False)
+            sys.stdout.write("\n")
+    else:  # plain
+        if not rows:
+            return EXIT_OK
+        for r in rows:
+            print(f"[{r['from_label']} @ {r['created_at']}]")
+            print(r["body"])
+            print()
+    return EXIT_OK
+
+
+def _cmd_peer_receive_complete(args: argparse.Namespace) -> int:
+    """peer receive --complete --as <label>: complete in-flight claim.
+
+    Path (per §2.1 + §3.4 (d)): fail-loud if the UPDATE matches zero rows.
+    Zero-row = claim was reaped by the sweeper (legitimate-slow-but-reaped
+    race from alpha §B). Caller logs rejected work; sweeper-then-reclaim
+    cycle handles redelivery.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+
+    conn = open_db()
+    try:
+        mode = _sessions_receive_mode(conn, str(self_cwd), self_label)
+        if mode != "daemon":
+            err(
+                f"receive-mode mismatch: session ({self_cwd}, {self_label}) "
+                f"has receive_mode={mode!r}; --complete requires 'daemon' "
+                f"(Topic 3 §3.4 (b) verb-entry gate)",
+                EXIT_CONTRACT_VIOLATION,
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        now = now_iso()
+        completed = conn.execute(
+            """
+            UPDATE inbox
+            SET completed_at = ?
+            WHERE to_cwd = ? AND to_label = ?
+              AND claim_owner = ?
+              AND claimed_at IS NOT NULL
+              AND completed_at IS NULL
+            RETURNING id
+            """,
+            (now, str(self_cwd), self_label, self_label),
+        ).fetchall()
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    if not completed:
+        err(
+            f"no in-flight claim held by ({self_cwd}, {self_label}) — "
+            f"claim was reaped by sweeper (TTL-expired) or already completed. "
+            f"Topic 3 §3.4 (d): fail-loud on stale claim; caller should log "
+            f"rejected work and proceed.",
+            EXIT_CONTRACT_VIOLATION,
+        )
+
+    # Success path: emit the completed row count / ids so the daemon can
+    # record what it just acked (observability).
+    if args.format == "json":
+        json.dump(
+            {"completed_ids": [r["id"] for r in completed]},
+            sys.stdout,
+            ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(f"completed: {len(completed)} row(s); ids={[r['id'] for r in completed]}")
+    return EXIT_OK
+
+
+def _cmd_peer_receive_sweep(args: argparse.Namespace) -> int:
+    """peer receive --sweep [--sweep-ttl SECS]: reaper pass (§3.3).
+
+    Reverts claimed_at = NULL on rows older than sweep_ttl without
+    completed_at. Keeps claim_owner intact as last-claim audit trail
+    (per alpha §A fix). Emits the reaped row set in JSON for
+    observability / downstream alerting.
+    """
+    sweep_ttl = (
+        args.sweep_ttl if getattr(args, "sweep_ttl", None) is not None
+        else _default_sweep_ttl_seconds()
+    )
+    if sweep_ttl <= 0:
+        err("--sweep-ttl must be a positive integer (seconds)", EXIT_USAGE)
+
+    # Build the cutoff ISO-8601 string: "reap rows where claimed_at < now - ttl".
+    from datetime import timedelta  # local import keeps module-level imports tidy
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=sweep_ttl)
+    cutoff_iso = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        # Alpha §A fix: SET only claimed_at = NULL. `claim_owner` preserved
+        # as audit trail so RETURNING can surface which daemon's batch got
+        # reaped. The next claim on the same row overwrites claim_owner.
+        reaped = conn.execute(
+            """
+            UPDATE inbox
+            SET claimed_at = NULL
+            WHERE claimed_at IS NOT NULL
+              AND completed_at IS NULL
+              AND claimed_at < ?
+            RETURNING id, to_cwd, to_label, claim_owner
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    payload = {
+        "sweep_ttl_seconds": sweep_ttl,
+        "cutoff": cutoff_iso,
+        "reaped": [
+            {
+                "id": r["id"],
+                "to_cwd": r["to_cwd"],
+                "to_label": r["to_label"],
+                "claim_owner": r["claim_owner"],
+            }
+            for r in reaped
+        ],
+    }
+    if args.format == "json":
+        json.dump(payload, sys.stdout, ensure_ascii=False)
+        sys.stdout.write("\n")
+    else:
+        print(f"swept: {len(reaped)} row(s) reaped (ttl={sweep_ttl}s, cutoff={cutoff_iso})")
+        for r in reaped:
+            print(f"  id={r['id']} to=({r['to_cwd']}, {r['to_label']}) "
+                  f"prev_claim_owner={r['claim_owner']}")
     return EXIT_OK
 
 
@@ -3327,6 +3669,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="join the pair identified by KEY (share with another session)")
     sr.add_argument("--new-pair", dest="new_pair", action="store_true",
                     help="mint a fresh pair key and print it")
+    sr.add_argument("--receive-mode", dest="receive_mode",
+                    choices=["interactive", "daemon"],
+                    help="verb-entry gate for receive path (Topic 3 §3.4 (b)). "
+                         "'daemon' labels reject interactive --mark-read; "
+                         "'interactive' labels reject --daemon-mode. "
+                         "Omitted = preserve existing (or 'interactive' for new sessions).")
     sr.add_argument("--force", action="store_true")
     sr.set_defaults(func=cmd_session_register)
 
@@ -3417,8 +3765,25 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["hook", "hook-json", "plain", "json"],
         default="plain",
     )
-    pr.add_argument("--mark-read", action="store_true")
+    # Interactive-mode flag.
+    pr.add_argument("--mark-read", action="store_true",
+                    help="Interactive-mode atomic claim-and-mark. Rejects daemon-mode labels.")
     pr.add_argument("--since")
+    # Daemon-mode flags (Topic 3 v0, §2.1 + §3.4). Mutually exclusive with
+    # --mark-read and with each other; `cmd_peer_receive` enforces the
+    # exclusion at runtime so argparse stays readable.
+    pr.add_argument("--daemon-mode", dest="daemon_mode", action="store_true",
+                    help="Daemon claim pass: atomic claim of unread rows into daemon-mode state. "
+                         "Requires session receive_mode='daemon'; returns empty if daemon_state='closed'.")
+    pr.add_argument("--complete", dest="complete", action="store_true",
+                    help="Daemon completion-ack: mark in-flight claim complete. "
+                         "Fails loudly (non-zero exit) if no in-flight claim is held by the calling label "
+                         "(per §3.4 guarantee (d): reaped-mid-processing detection).")
+    pr.add_argument("--sweep", dest="sweep", action="store_true",
+                    help="Sweeper pass: revert claimed_at on rows older than sweep-ttl without completed_at. "
+                         "Returns JSON of reaped rows for audit. Run on a timer (cron / systemd-timer).")
+    pr.add_argument("--sweep-ttl", dest="sweep_ttl", type=int,
+                    help="Sweep TTL in seconds; overrides AGENT_COLLAB_SWEEP_TTL env (default 600s = 10m production).")
     pr.set_defaults(func=cmd_peer_receive)
 
     pl = sub.add_parser("peer-list")
