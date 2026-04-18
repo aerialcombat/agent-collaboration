@@ -447,6 +447,13 @@ behavior).
 `~/.pi/agent/`. Isolate via `AGENT_COLLAB_INBOX_DB=<path>` +
 `--pi-session-dir <path>` instead.
 
+**2026-04-18 vs `v3.x-topic-3-v0.2.1-shipped` @ `b66476a`** — test-engineer env-var revert verification.
+
+- **pi-mono 0.67.68** — E8 capture+resume PASS under `ZAI_GLM_API_KEY`-only (`ZAI_API_KEY` unset)
+  - Captured path: `/tmp/e8v021-probe/pi-sessions/e8v021-pi.jsonl`
+  - Batch-2 reply "sapphire"; argv `--session <same path>`; mechanism2 in ~3s
+  - Confirms v0.2.1 env-var revert (v2 `ZAI_API_KEY` "fix" reverted to plugin-correct `ZAI_GLM_API_KEY`)
+
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
