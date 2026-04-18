@@ -62,6 +62,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,6 +116,37 @@ const (
 // memory at runtime. Mirror of the constant referenced in the MCP
 // server instructions / docs/PEER-INBOX-GUIDE.md — keep in sync.
 var contentStopSentinel = "[" + "[" + "end" + "]" + "]"
+
+// codexBannerSessionRE matches the session-id line emitted by
+// `codex exec` on first-spawn startup. Fixture-pinned at
+// tests/fixtures/cli-session/codex-banner.txt (real codex 0.121.0
+// output). Topic 3 v0.1 Arch D §6.1 — capture strategy: scan the
+// spawn's own stdout buffer for this line; on match, persist group 1
+// (UUID) to sessions.daemon_cli_session_id for resume on next batch.
+//
+// Compiled once at package init for per-spawn reuse. Case-insensitive
+// to tolerate codex-vendor minor casing drift without a fixture-pin
+// break; fixture-pin on the test side still fails loud on format
+// change (e.g., the "session id:" prefix disappearing entirely).
+//
+// Per §3.4 invariant 5: capture-failure (no match) is non-fatal —
+// logged as a warning and the batch proceeds Arch B fresh-invocation.
+var codexBannerSessionRE = regexp.MustCompile(`(?i)session id:\s*([0-9a-f-]{36})`)
+
+// codexStaleSessionRE matches codex's "session not found" /
+// "no such session" error patterns. Liberal match per Topic 3 v0.1
+// Arch D §3.4 invariant 5 "if uncertain, log + clear" — better to
+// drop a still-live UUID (next capture recovers) than wedge a stale
+// one across respawns.
+//
+// Scanned against the spawn's captured stdout buffer. execSpawn
+// currently inherits stderr to the daemon's stderr (operator-visible,
+// not captured), so if a future codex release writes the indicator
+// ONLY to stderr, stale detection may miss — the fallback safety
+// mechanism is the operator SQL escape hatch documented in §3.3
+// TERTIARY. Current codex 0.121.0 observed to write the indicator to
+// stdout alongside the banner.
+var codexStaleSessionRE = regexp.MustCompile(`(?i)(session not found|no such session|session .* not found|unknown session)`)
 
 // ---------------------------------------------------------------------------
 // Config
@@ -831,6 +863,22 @@ func containsContentStop(rows []store.InboxMessage) bool {
 // managed label. Called after a content-stop-triggered batch completes
 // — on next poll, DaemonModeClaim's §3.4 (e) preflight returns empty
 // and the daemon stays dormant until externally reopened.
+//
+// Topic 3 v0.1 Arch D §8.2 SECONDARY auto-GC: after SetDaemonState
+// succeeds, this helper additionally NULLs sessions.daemon_cli_session_id
+// for the same (cwd, label). This is the *only* daemon-side trigger for
+// CLI-session-ID reset in v0/v0.1 — L2 (external SQL flip of
+// daemon_state='closed' with no L1 sentinel) does NOT auto-GC the CLI
+// session-ID; the operator must run `peer-inbox daemon-reset-session`
+// separately. L3 quiescence is "pause poll cadence" (not "drop daemon
+// state") and deliberately preserves the resume invariant. A timer-based
+// auto-GC is deferred to v1+ per §10 Q4.
+//
+// Both UPDATEs ride the same SQLiteLocal handle (one Open, two updates,
+// then Close) — efficient and keeps the transition atomic from the
+// daemon's point of view. ClearDaemonCLISessionID is idempotent per
+// §3.4 invariant 3: if the column is already NULL, the call still
+// returns nil (no error, safe-to-spam).
 func (d *daemon) transitionClosed(ctx context.Context) error {
 	openCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -839,8 +887,28 @@ func (d *daemon) transitionClosed(ctx context.Context) error {
 		return fmt.Errorf("store open: %w", err)
 	}
 	defer st.Close()
-	if err := st.SetDaemonState(openCtx, store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}, "closed"); err != nil {
+	self := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+	if err := st.SetDaemonState(openCtx, self, "closed"); err != nil {
 		return fmt.Errorf("set daemon_state closed: %w", err)
+	}
+	// §8.2 auto-GC: NULL the captured CLI session-ID so reopening this
+	// daemon (operator flipping daemon_state back to 'open') gets a
+	// fresh CLI session by construction. Non-fatal — if ClearDaemon
+	// CLISessionID fails (e.g. mid-transition DB contention), we log and
+	// continue: daemon_state='closed' is the load-bearing state change;
+	// a stale CLI session-ID in a closed daemon is harmless because no
+	// spawn will read it until reopening, at which point the operator
+	// can re-assert via `peer-inbox daemon-reset-session` per §3.3
+	// PRIMARY. Idempotent on already-NULL columns per §3.4 invariant 3.
+	if err := st.ClearDaemonCLISessionID(openCtx, self); err != nil {
+		d.log.Warn("daemon.cli_session_auto_gc.l1_content_stop_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+	} else {
+		d.log.Info("daemon.cli_session_auto_gc.l1_content_stop",
+			"label", d.cfg.Label,
+		)
 	}
 	return nil
 }
@@ -1122,28 +1190,555 @@ func (d *daemon) spawnClaude(ctx context.Context, prompt string) (string, error)
 // stdin=/dev/null. §4 bullets 2 + 3: stdin-close prevents codex exec's
 // known hang-on-open-stdin bug; --skip-git-repo-check lets the daemon
 // operate in non-git workspaces (e.g. scratch dirs).
+//
+// Topic 3 v0.1 Arch D §4.1 + §6.1: when d.cfg.CLISessionResume is true,
+// this helper additionally wires in CLI-native session-resume:
+//  1. Before argv construction: query sessions.daemon_cli_session_id via
+//     GetDaemonCLISessionID. If non-empty, argv becomes
+//     `codex exec resume --skip-git-repo-check <UUID> <prompt>` per §4.1.
+//     If empty, argv stays as today (first-batch / post-reset fresh spawn).
+//  2. After spawn returns (regardless of exit code — capture is best-effort
+//     per §3.4 invariant 5): scan the captured stdout buffer for
+//     `(?i)session id:\s*([0-9a-f-]{36})`. If matched AND no UUID was
+//     previously cached, persist via SetDaemonCLISessionID for next batch.
+//  3. Stale-UUID fallback: if the spawn exited non-zero AND we passed a
+//     cached UUID AND the output indicates "session not found" (liberal
+//     match per §3.4 invariant 5 "if uncertain, log + clear"), clear the
+//     cached UUID so the next batch re-captures. Non-fatal; daemon's
+//     normal stale-claim handling (§3.4 (d)) kicks in via the existing
+//     spawn-error flow in processBatch.
+//
+// When d.cfg.CLISessionResume is false, spawnCodex behavior is
+// byte-identical to Topic 3 v0 (preserved per §9.3 gate 4c defensive
+// assertion: flag=false + column non-NULL must still produce
+// resume-free argv). §3.4 invariant 1 — envelope payload remains
+// load-bearing per batch: the full prompt is always passed, regardless
+// of whether resume is in use. Resume only augments argv, never splits
+// or elides the prompt content.
 func (d *daemon) spawnCodex(ctx context.Context, prompt string) (string, error) {
+	session := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+
+	// Opt-in gate: Topic 3 v0 byte-identical behavior when flag is false.
+	// §3.4 gate-4c + asymmetry defense: the flag is authoritative; a
+	// non-NULL column value alone must not change argv shape.
+	var cachedSessionID string
+	if d.cfg.CLISessionResume {
+		cachedSessionID = d.lookupCodexSessionID(ctx, session)
+	}
+
 	args := []string{
 		"exec",
 		"--skip-git-repo-check",
 		prompt,
 	}
-	return d.execSpawn(ctx, "codex", args, map[string]string{
+	if cachedSessionID != "" {
+		// §4.1 resume-with-cached-UUID argv form:
+		//   codex exec resume --skip-git-repo-check <UUID> <prompt>
+		args = []string{
+			"exec",
+			"resume",
+			"--skip-git-repo-check",
+			cachedSessionID,
+			prompt,
+		}
+	}
+
+	stdout, runErr := d.execSpawn(ctx, "codex", args, map[string]string{
 		"CODEX_SESSION_ID": d.cfg.SessionKey,
 	})
+
+	// Best-effort capture / stale-detection. §3.4 invariant 5: any
+	// failure path here is a warning, never a fatal — the batch result
+	// (stdout, runErr) is returned unchanged to the caller.
+	if d.cfg.CLISessionResume {
+		d.postSpawnCodexResumeHandling(ctx, session, cachedSessionID, stdout, runErr)
+	}
+
+	return stdout, runErr
+}
+
+// lookupCodexSessionID reads sessions.daemon_cli_session_id for the
+// daemon's (cwd, label). Returns empty string on any SQL error (§3.4
+// invariant 5 capture-failure-non-fatal — falling through to fresh
+// invocation is always safe). Uses a 5-second timeout so a wedged DB
+// can't stall the spawn indefinitely.
+func (d *daemon) lookupCodexSessionID(ctx context.Context, session store.Session) string {
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(lookupCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_capture.codex_lookup_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+			"msg", "store open failed; proceeding fresh-invocation Arch B (non-fatal per §3.4 invariant 5)",
+		)
+		return ""
+	}
+	defer st.Close()
+	id, err := st.GetDaemonCLISessionID(lookupCtx, session)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_capture.codex_lookup_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+			"msg", "lookup failed; proceeding fresh-invocation Arch B (non-fatal per §3.4 invariant 5)",
+		)
+		return ""
+	}
+	return id
+}
+
+// postSpawnCodexResumeHandling implements the post-spawn side of Arch D
+// §6.1 capture + §3.4 invariant 5 stale-UUID fallback for codex. Called
+// only when d.cfg.CLISessionResume is true.
+//
+//   - If cachedSessionID was empty AND the stdout banner yielded a new
+//     UUID: persist via SetDaemonCLISessionID for the next batch.
+//   - If cachedSessionID was non-empty AND the spawn exited non-zero
+//     AND output indicates a stale session (liberal match): clear via
+//     ClearDaemonCLISessionID so the next batch re-captures fresh.
+//   - All failures (no regex match, SQL error) are warnings — never
+//     propagated up; the batch result is untouched.
+//
+// Note on stderr vs stdout: execSpawn inherits stderr to the daemon's
+// stderr (operator-visible). The stale-UUID regex here scans the
+// captured stdout buffer only. If a future codex release writes the
+// "session not found" indicator solely to stderr, stale detection may
+// miss — safety mechanism is still §3.4 invariant 5's fresh-invocation
+// fallback: operator can SQL-escape-hatch the column per §3.3 TERTIARY.
+func (d *daemon) postSpawnCodexResumeHandling(ctx context.Context, session store.Session, cachedSessionID, stdout string, runErr error) {
+	// Stale-UUID-fallback path: we passed a cached UUID, the spawn
+	// errored, and the output suggests the CLI-side session is gone.
+	// Liberal match per task spec: "if uncertain, log + clear".
+	if cachedSessionID != "" && runErr != nil && codexStaleSessionRE.MatchString(stdout) {
+		d.log.Warn("daemon.cli_session_capture.codex_stale_uuid",
+			"label", d.cfg.Label,
+			"cached_uuid", cachedSessionID,
+			"msg", "codex reported stale/unknown session; clearing daemon_cli_session_id (next batch will re-capture per §3.4 invariant 5)",
+		)
+		clearCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		st, err := sqlitestore.Open(clearCtx)
+		if err != nil {
+			d.log.Warn("daemon.cli_session_capture.codex_clear_open_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+			)
+			return
+		}
+		defer st.Close()
+		if err := st.ClearDaemonCLISessionID(clearCtx, session); err != nil {
+			d.log.Warn("daemon.cli_session_capture.codex_clear_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+			)
+		}
+		return
+	}
+
+	// First-capture path: previously-uncached label + this spawn's
+	// stdout banner yielded a UUID → persist. No-op if we already had
+	// a cached UUID (the already-cached identity is the stable one;
+	// resumed spawns may still emit a banner line with the same or a
+	// different UUID depending on codex-vendor behavior — do not
+	// clobber the persisted value on a re-spawn).
+	if cachedSessionID != "" {
+		return
+	}
+
+	match := codexBannerSessionRE.FindStringSubmatch(stdout)
+	if match == nil {
+		d.log.Warn("daemon.cli_session_capture.codex_no_match",
+			"label", d.cfg.Label,
+			"stdout_bytes", len(stdout),
+			"msg", "codex banner regex did not match; leaving daemon_cli_session_id NULL (fixture drift or banner-format change — next batch will re-attempt capture)",
+		)
+		return
+	}
+	captured := match[1]
+
+	setCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(setCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_capture.codex_persist_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return
+	}
+	defer st.Close()
+	if err := st.SetDaemonCLISessionID(setCtx, session, captured); err != nil {
+		d.log.Warn("daemon.cli_session_capture.codex_persist_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return
+	}
+	d.log.Info("daemon.cli_session_capture.codex_captured",
+		"label", d.cfg.Label,
+		"uuid", captured,
+	)
 }
 
 // spawnGemini runs `gemini -p <prompt>` with stdin=/dev/null. §4
 // bullet 4 gemini timeout-units is already handled by install-script
 // on the receive side; daemon just needs to export the env var.
+//
+// Topic 3 v0.1 Arch D (§4.2 + §6.2): when d.cfg.CLISessionResume is
+// true, the spawn helper captures the gemini vendor's session-UUID on
+// first batch via a --list-sessions delta-snapshot (BEFORE/AFTER the
+// no-resume spawn) and persists it to sessions.daemon_cli_session_id.
+// On subsequent batches, re-queries --list-sessions to translate the
+// cached UUID into its CURRENT 1-based index (indices shift as new
+// sessions push older ones up the list per gemini 0.38.2 --help:
+// "Use 'latest' for most recent or index number (e.g. --resume 5)"),
+// then invokes `gemini --resume <N> -p <prompt>`. UUID stays the
+// stable persisted identity; the index is computed at resume time.
+//
+// v3 amendment (Checkpoint 1 finding): gemini 0.38.2's --resume is
+// documented as accepting "latest" or <index> only; direct-UUID-resume
+// works empirically but is undocumented. v0.1 builds on the documented
+// index-addressing API. v1+ may collapse the translation step if a
+// future gemini release documents direct-UUID-resume.
+//
+// §3.4 invariants honored here:
+//   - Invariant 1 (envelope load-bearing per batch): the full prompt
+//     is ALWAYS passed via -p regardless of resume state; --resume
+//     only prepends argv, never replaces the prompt content.
+//   - Invariant 2 (no session-store introspection): the daemon only
+//     calls `gemini --list-sessions`; it never reads ~/.gemini/*
+//     files or parses gemini-internal session history.
+//   - Invariant 5 (capture-failure non-fatal): zero new UUIDs, >1 new
+//     UUIDs (concurrent-gemini race per §6.2 + §10 Q2), or
+//     --list-sessions exec failure — all log a warning and leave the
+//     column NULL; the spawn still proceeds Arch B fresh-invocation.
+//
+// When d.cfg.CLISessionResume is false the helper is byte-identical
+// to the Topic 3 v0 form (no --list-sessions calls, no DB reads).
+// Gate 5d defensive-assertion verifies that flag=false + column
+// non-NULL still produces a resume-free argv.
 func (d *daemon) spawnGemini(ctx context.Context, prompt string) (string, error) {
+	if !d.cfg.CLISessionResume {
+		// Topic 3 v0 byte-identical path. Gate 5d asserts this.
+		args := []string{
+			"-p",
+			prompt,
+		}
+		return d.execSpawn(ctx, "gemini", args, map[string]string{
+			"GEMINI_SESSION_ID": d.cfg.SessionKey,
+		})
+	}
+
+	// Arch D enabled. Consult the DB for a cached UUID — fresh store
+	// handle per invocation matches the completeBatch / claimTick
+	// pattern; short timeout bounds any wedged-DB stall.
+	cachedUUID := d.readCachedGeminiSessionID(ctx)
+
+	if cachedUUID != "" {
+		// Resume path: re-query --list-sessions, translate UUID →
+		// current index. If the UUID is no longer present (CLI-side
+		// eviction / vendor GC / operator deletion), NULL the column
+		// and fall through to Arch B fresh-invocation for this batch
+		// (next batch will re-capture via the capture path below).
+		idx, found, err := d.lookupGeminiSessionIndex(ctx, cachedUUID)
+		switch {
+		case err != nil:
+			// §3.4 invariant 5: --list-sessions failure is non-fatal.
+			// DO NOT clear the cached UUID — the UUID may still be
+			// valid; this is a transient exec error, not evidence of
+			// eviction. Proceed Arch B for this batch.
+			d.log.Warn("daemon.cli_session_resume.gemini_list_sessions_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+				"msg", "--list-sessions re-query failed; proceeding Arch B for this batch",
+			)
+		case found:
+			// Happy path: pass INDEX (not UUID) to --resume per v3
+			// amendment / §4.2.
+			args := []string{
+				"--resume", strconv.Itoa(idx),
+				"-p",
+				prompt,
+			}
+			return d.execSpawn(ctx, "gemini", args, map[string]string{
+				"GEMINI_SESSION_ID": d.cfg.SessionKey,
+			})
+		default:
+			// UUID-not-found (stale) per §6.2 Resume subsection. Clear
+			// the column + fall through to capture path below.
+			d.log.Warn("daemon.cli_session_resume.gemini_stale_uuid",
+				"label", d.cfg.Label,
+				"cached_uuid", cachedUUID,
+				"msg", "cached UUID not in current --list-sessions (CLI-side eviction / GC / operator deletion); NULL-ing column + proceeding Arch B; next batch will re-capture",
+			)
+			d.clearCachedGeminiSessionID(ctx)
+			cachedUUID = "" // Trigger capture path below.
+		}
+	}
+
+	// Capture path: no cached UUID (first batch OR stale UUID just
+	// cleared). Snapshot BEFORE, spawn without --resume, snapshot
+	// AFTER, persist the new UUID via set-difference.
+	var before map[string]int
+	if cachedUUID == "" {
+		// Best-effort BEFORE snapshot. Failure → log + skip capture
+		// this batch per §3.4 invariant 5.
+		snap, err := d.runGeminiListSessions(ctx)
+		if err != nil {
+			d.log.Warn("daemon.cli_session_capture.gemini_before_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+				"msg", "--list-sessions BEFORE snapshot failed; skipping capture for this batch",
+			)
+			// Leave before==nil so we skip the AFTER snapshot too.
+		} else {
+			before = snap
+		}
+	}
+
 	args := []string{
 		"-p",
 		prompt,
 	}
-	return d.execSpawn(ctx, "gemini", args, map[string]string{
+	out, spawnErr := d.execSpawn(ctx, "gemini", args, map[string]string{
 		"GEMINI_SESSION_ID": d.cfg.SessionKey,
 	})
+
+	// AFTER snapshot + delta. Only attempt if BEFORE succeeded.
+	// Capture-failure is always non-fatal: (out, spawnErr) flow to
+	// the caller untouched.
+	if before != nil {
+		after, err := d.runGeminiListSessions(ctx)
+		if err != nil {
+			d.log.Warn("daemon.cli_session_capture.gemini_after_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+				"msg", "--list-sessions AFTER snapshot failed; leaving column NULL",
+			)
+		} else {
+			newUUIDs := make([]string, 0, 1)
+			for uuid := range after {
+				if _, inBefore := before[uuid]; !inBefore {
+					newUUIDs = append(newUUIDs, uuid)
+				}
+			}
+			switch len(newUUIDs) {
+			case 1:
+				d.persistCapturedGeminiSessionID(ctx, newUUIDs[0])
+			case 0:
+				// §6.2: "gemini may have suppressed session creation
+				// on this invocation." Leave NULL per §3.4 invariant
+				// 5; next batch re-attempts capture.
+				d.log.Warn("daemon.cli_session_capture.gemini_no_new_uuid",
+					"label", d.cfg.Label,
+					"before_count", len(before),
+					"after_count", len(after),
+					"msg", "no new UUID in --list-sessions delta; gemini may have suppressed session creation on this invocation; leaving column NULL",
+				)
+			default:
+				// CONSERVATIVE per §6.2 + §10 Q2: concurrent-gemini
+				// race. Daemon does NOT pick a winner (mtime or
+				// otherwise) because silent pick risks grabbing the
+				// operator's interactive gemini session as the
+				// daemon's resume target (contaminating both).
+				// Warn-and-NULL is loud-recoverable: operator sees
+				// the log, can quiesce other gemini invocations OR
+				// set per-daemon GEMINI_CONFIG_DIR per §6.2
+				// operator-setup paragraph.
+				d.log.Warn("daemon.cli_session_capture.gemini_race_detected",
+					"label", d.cfg.Label,
+					"new_uuid_count", len(newUUIDs),
+					"new_uuids", newUUIDs,
+					"msg", "more than one new UUID between BEFORE/AFTER --list-sessions snapshots; concurrent-gemini race — leaving column NULL; consider GEMINI_CONFIG_DIR per operator guide",
+				)
+			}
+		}
+	}
+
+	return out, spawnErr
+}
+
+// geminiSessionLineRE matches one row of `gemini --list-sessions`
+// output. Gemini 0.38.2 format (fixture: tests/fixtures/cli-session/
+// gemini-list-sessions.txt):
+//
+//	  1. PROMPT_PREVIEW (1 day ago) [UUID]
+//
+// Leading whitespace, 1-based index, a dot, space, arbitrary prompt
+// preview (may include its own punctuation — we use a greedy match up
+// to the FINAL `[UUID]` suffix), then the UUID in brackets at end-of-
+// line. The header line "Available sessions for this project (N):"
+// and blank lines do not match and are skipped.
+var geminiSessionLineRE = regexp.MustCompile(`^\s*(\d+)\.\s+.*\[([0-9a-fA-F-]{36})\]\s*$`)
+
+// parseGeminiListSessions parses raw `gemini --list-sessions` stdout
+// into a map of UUID → 1-based index. Returns an empty map on no
+// matches (benign: fresh install with empty session store, or header-
+// only output). Duplicate UUIDs in the output (shouldn't happen per
+// gemini's model) keep the first-seen index defensively.
+func parseGeminiListSessions(data []byte) map[string]int {
+	out := make(map[string]int)
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	// Bump buffer so long prompt previews don't trip the default 64
+	// KiB line cap.
+	buf := make([]byte, 0, 1<<20)
+	scanner.Buffer(buf, 1<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		m := geminiSessionLineRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		idx, err := strconv.Atoi(m[1])
+		if err != nil || idx < 1 {
+			continue
+		}
+		uuid := strings.ToLower(m[2])
+		if _, exists := out[uuid]; !exists {
+			out[uuid] = idx
+		}
+	}
+	return out
+}
+
+// runGeminiListSessions execs `gemini --list-sessions` with the same
+// env inheritance (including GEMINI_CONFIG_DIR if the operator set it
+// per §6.2 for race-avoidance) and cwd as the upcoming spawn. Short
+// 5-second timeout — this is a local enumeration query, never a model
+// call. Returns the UUID → 1-based-index map or an exec/parse error.
+//
+// Per §3.4 invariant 2: this is the ONLY permitted introspection of
+// gemini's session-store state. The daemon does NOT open or parse
+// ~/.gemini/* files.
+func (d *daemon) runGeminiListSessions(ctx context.Context) (map[string]int, error) {
+	bin := "gemini"
+	if override := os.Getenv("AGENT_COLLAB_DAEMON_GEMINI_BIN"); override != "" {
+		bin = override
+	}
+
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(listCtx, bin, "--list-sessions")
+	cmd.Dir = d.cfg.CWD
+	cmd.Stdin = nil
+	// Inherit full env — GEMINI_CONFIG_DIR (operator opt-in per §6.2)
+	// rides along unchanged. The --list-sessions enumeration does not
+	// need the daemon-spawn flags (AGENT_COLLAB_DAEMON_SPAWN, session
+	// key) because there's no prompt + no hook short-circuit concern.
+	cmd.Env = os.Environ()
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		if listCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("gemini --list-sessions timed out after 5s")
+		}
+		return nil, fmt.Errorf("gemini --list-sessions: %w", err)
+	}
+	return parseGeminiListSessions([]byte(out.String())), nil
+}
+
+// lookupGeminiSessionIndex re-queries `gemini --list-sessions` and
+// returns the current 1-based index for the given UUID. found=false
+// means the UUID is no longer in the list (CLI-side eviction / GC /
+// operator deletion); caller clears the column and proceeds Arch B.
+// A non-nil error means --list-sessions itself failed (exec err,
+// timeout); caller logs + proceeds Arch B but DOES NOT clear the
+// column on this path (transient exec errors shouldn't cost the
+// cached identity).
+func (d *daemon) lookupGeminiSessionIndex(ctx context.Context, uuid string) (idx int, found bool, err error) {
+	snap, err := d.runGeminiListSessions(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	normalized := strings.ToLower(uuid)
+	idx, found = snap[normalized]
+	return idx, found, nil
+}
+
+// readCachedGeminiSessionID opens a fresh store handle, reads the
+// cached UUID, closes. Returns "" on any error (treated as "no
+// cache") — §3.4 invariant 5: DB-read failure is non-fatal; the
+// batch just proceeds Arch B + re-attempts capture.
+func (d *daemon) readCachedGeminiSessionID(ctx context.Context) string {
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(openCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_resume.gemini_store_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return ""
+	}
+	defer st.Close()
+	self := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+	id, err := st.GetDaemonCLISessionID(openCtx, self)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_resume.gemini_get_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return ""
+	}
+	return id
+}
+
+// persistCapturedGeminiSessionID writes the captured UUID to the
+// sessions row. Non-fatal on error per §3.4 invariant 5.
+func (d *daemon) persistCapturedGeminiSessionID(ctx context.Context, uuid string) {
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(openCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_capture.gemini_store_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return
+	}
+	defer st.Close()
+	self := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+	if err := st.SetDaemonCLISessionID(openCtx, self, uuid); err != nil {
+		d.log.Warn("daemon.cli_session_capture.gemini_set_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return
+	}
+	d.log.Info("daemon.cli_session_capture.gemini_captured",
+		"label", d.cfg.Label,
+		"uuid", uuid,
+	)
+}
+
+// clearCachedGeminiSessionID NULLs the column on stale-UUID fallback.
+// Non-fatal on error per §3.4 invariant 5 — if clear fails, the
+// daemon proceeds Arch B for this batch; next batch will attempt a
+// fresh resume and may re-detect the stale-UUID condition (loop is
+// bounded by operator intervention via the SQL escape hatch per
+// §3.3 TERTIARY or `peer-inbox daemon-reset-session`).
+func (d *daemon) clearCachedGeminiSessionID(ctx context.Context) {
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(openCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_resume.gemini_clear_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+		return
+	}
+	defer st.Close()
+	self := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+	if err := st.ClearDaemonCLISessionID(openCtx, self); err != nil {
+		d.log.Warn("daemon.cli_session_resume.gemini_clear_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+		)
+	}
 }
 
 // execSpawn is the shared spawn implementation. Stdin is always
