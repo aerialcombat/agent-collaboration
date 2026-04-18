@@ -24,6 +24,7 @@ high and there's no manual copy-paste.
 5. [Delivery modes](#delivery-modes)
    - [Hook (default)](#hook-default)
    - [Channels (real-time push, opt-in)](#channels-real-time-push-opt-in)
+   - [Auto-reply daemons](#auto-reply-daemons)
 6. [Per-runtime cheatsheet](#per-runtime-cheatsheet)
 7. [Examples](#examples)
 8. [Troubleshooting](#troubleshooting)
@@ -367,6 +368,46 @@ in its running context **without a user prompt**.
   sends in either direction are blocked until `peer reset`.
 - `peer_pairs.terminated_by` records who ended the exchange.
 
+### Auto-reply daemons
+
+Topic 3 v0 adds an **auto-reply daemon** (`agent-collab-daemon`,
+Go binary at `go/cmd/daemon/`) that gives Codex CLI and Gemini CLI
+peer-inbox auto-reply parity with Claude Code. A daemon is an
+OS-local process that watches the inbox for messages addressed to a
+specific label and autonomously services them by spawning a fresh
+`codex exec` / `gemini -p` / `claude -p` invocation per batch,
+injecting the envelope as the spawn's user prompt, and waiting for a
+completion-ack signal before moving to the next batch.
+
+**When to use a daemon.** You have an interactive Codex or Gemini
+session (or even a Claude session) and you want it to keep
+autonomously replying to peer-inbox messages between your human
+prompts — without you having to type anything in that session's
+terminal. The daemon enables "send a message to Codex, walk away,
+come back to see the reply" workflows that previously required a
+Claude-Channels-paired session.
+
+**When NOT to use a daemon.**
+- Your Claude Code session already has the hook installed —
+  messages auto-inject on every `UserPromptSubmit`. No daemon needed
+  for turn-boundary delivery.
+- Your Claude Code session is launched with Channels — messages
+  push in real-time mid-turn. Daemon is turn-boundary-driven (fresh
+  LLM per batch, W3 worker shape) and doesn't improve on this for
+  Claude.
+- Cross-host coordination. The daemon is single-machine-local;
+  cross-host sync is deferred to v3.3+.
+
+**Full operator guide:** [DAEMON-OPERATOR-GUIDE.md](./DAEMON-OPERATOR-GUIDE.md).
+Covers config flags, architecture, the four-layer termination
+stack, the completion-ack contract, troubleshooting, and the
+security + cost model.
+
+**Validation protocol:** [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md).
+Four owner-supervised E2E probes (E1-E4) run at ship time to
+validate live-CLI delivery — complements the shape-2 CI gates at
+`tests/daemon-*.sh`.
+
 ---
 
 ## Per-runtime cheatsheet
@@ -376,6 +417,7 @@ in its running context **without a user prompt**.
 | Register | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) |
 | Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Yes, via `UserPromptSubmit` hook | Yes, via `BeforeAgent` hook |
 | Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Not yet (see [Codex issue #18056](https://github.com/openai/codex/issues/18056) for upstream MCP notifications tracking) | Not supported (architectural; see Gemini issue #3052) |
+| Auto-reply via daemon | Yes (`agent-collab-daemon --cli claude`; usually unnecessary given hook + Channels coverage) | Yes (`agent-collab-daemon --cli codex`) | Yes (`agent-collab-daemon --cli gemini`) |
 | Peer send | identical | identical | identical |
 
 Installing the hook on all three CLIs is a single `scripts/install-global-protocol` run — it detects which CLI homes exist (`~/.claude`, `~/.codex`, `~/.gemini`) and registers the unified `hooks/peer-inbox-inject.sh` into each. Codex additionally gets `[features] codex_hooks = true` appended to `~/.codex/config.toml` (required by Codex for hooks to fire).
@@ -585,7 +627,13 @@ schema.
   Mid-turn notifications that arrive while an agent is working
   surface in Claude via the peer-inbox MCP channel but not in Codex
   (blocked on [Codex issue #18056](https://github.com/openai/codex/issues/18056))
-  or Gemini (structurally declined per their issue #3052).
+  or Gemini (structurally declined per their issue #3052). The
+  Topic 3 v0 auto-reply daemon closes the Codex / Gemini parity gap
+  for *reactive* behavior (fresh LLM per batch at turn boundaries,
+  W3 worker shape per
+  [DAEMON-OPERATOR-GUIDE.md](./DAEMON-OPERATOR-GUIDE.md)) but is
+  still turn-boundary-driven — it does not enable mid-turn push
+  into an already-running Codex / Gemini session.
 - **Message bodies are UTF-8 text**, 8 KB max. Binary / `\0` bytes
   are not supported — base64-encode externally if needed.
 - **No archive or retention.** V1 retains every message forever.
@@ -605,6 +653,8 @@ schema.
 
 - [ARCHITECTURE.md](./PEER-INBOX-ARCHITECTURE.md) — system design, data model, delivery paths
 - [CHANGELOG.md](../CHANGELOG.md) — version history (v1.0–v1.5)
+- [DAEMON-OPERATOR-GUIDE.md](./DAEMON-OPERATOR-GUIDE.md) — Topic 3 v0 auto-reply daemon operator reference
+- [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md) — Topic 3 v0 daemon E2E probe protocol
 - [plans/peer-inbox.md](../plans/peer-inbox.md) — original design doc (v3, post-Codex review)
 - [.agent-collab/reviews/peer-inbox-*.md](../.agent-collab/reviews/) — challenge + verify reviews
 - [GLOBAL-PROTOCOL.md](./GLOBAL-PROTOCOL.md) — the collaboration protocol peer-inbox extends

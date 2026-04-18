@@ -17,6 +17,7 @@ Local integration reference:
 - installer: `scripts/install-global-protocol`
 - doctor: `scripts/doctor-global-protocol`
 - review artifacts: `.agent-collab/reviews/`
+- peer-inbox auto-reply daemon (Topic 3 v0): `docs/DAEMON-OPERATOR-GUIDE.md` (operator reference) and `docs/DAEMON-VALIDATION.md` (E2E probe protocol)
 
 This repo does not use plan/state/event files by default because most work here is doc-heavy and low-risk.
 
