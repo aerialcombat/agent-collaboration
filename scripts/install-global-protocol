@@ -20,6 +20,9 @@ PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
+CODEX_HOOKS="$HOME/.codex/hooks.json"
+CODEX_CONFIG="$HOME/.codex/config.toml"
+GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 SLASH_COMMANDS=("agent-collab.md" "peer.md")
 SKILLS=("install-agent-collab")
 
@@ -550,6 +553,246 @@ print(f"uninstalled: {settings_path} (UserPromptSubmit hook)")
 PY
 }
 
+# merge_hook_json is the generic installer for a JSON-based hook config.
+# Claude (settings.json), Codex (hooks.json), and Gemini (settings.json)
+# all expose the same hooks.<event>[].hooks[] array-of-command shape;
+# only the file path and event-name key differ. One implementation
+# reduces the B1/B8 drift class gamma/alpha flagged in Track B.
+#
+# Usage: merge_hook_json <settings_path> <event_name> <hook_command> <timestamp>
+merge_hook_json() {
+  local settings="$1"
+  local event_name="$2"
+  local hook_command="$3"
+  local timestamp="$4"
+
+  mkdir -p "$(dirname "$settings")"
+
+  if [[ -f "$settings" ]]; then
+    cp "$settings" "${settings}.bak.${timestamp}"
+  fi
+
+  HOOK_COMMAND="$hook_command" SETTINGS_PATH="$settings" EVENT_NAME="$event_name" python3 <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+settings_path = Path(os.environ["SETTINGS_PATH"])
+hook_command = os.environ["HOOK_COMMAND"]
+event_name = os.environ["EVENT_NAME"]
+
+if settings_path.exists() and settings_path.stat().st_size > 0:
+    try:
+        data = json.loads(settings_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"error: {settings_path} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(data, dict):
+        print(f"error: {settings_path} root is not a JSON object", file=sys.stderr)
+        sys.exit(1)
+else:
+    data = {}
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    print(f"error: {settings_path} hooks is not an object", file=sys.stderr)
+    sys.exit(1)
+
+entries = hooks.setdefault(event_name, [])
+if not isinstance(entries, list):
+    print(f"error: {settings_path} hooks.{event_name} is not a list", file=sys.stderr)
+    sys.exit(1)
+
+def matcher_has_our_command(matcher):
+    if not isinstance(matcher, dict):
+        return False
+    for h in matcher.get("hooks", []) or []:
+        if isinstance(h, dict) and "peer-inbox-inject.sh" in (h.get("command") or ""):
+            return True
+    return False
+
+our_block = {
+    "hooks": [
+        {"type": "command", "command": hook_command, "timeout": 5}
+    ]
+}
+
+already_installed = any(matcher_has_our_command(m) for m in entries)
+if already_installed:
+    print(f"current: {settings_path}")
+else:
+    entries.append(our_block)
+    hooks[event_name] = entries
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"installed: {settings_path} ({event_name} hook)")
+PY
+}
+
+# remove_hook_json is the generic uninstaller paired with merge_hook_json.
+# Usage: remove_hook_json <settings_path> <event_name> <timestamp>
+remove_hook_json() {
+  local settings="$1"
+  local event_name="$2"
+  local timestamp="$3"
+
+  if [[ ! -f "$settings" ]]; then
+    echo "missing: $settings"
+    return
+  fi
+
+  cp "$settings" "${settings}.bak.${timestamp}"
+
+  SETTINGS_PATH="$settings" EVENT_NAME="$event_name" python3 <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+settings_path = Path(os.environ["SETTINGS_PATH"])
+event_name = os.environ["EVENT_NAME"]
+try:
+    data = json.loads(settings_path.read_text())
+except json.JSONDecodeError as e:
+    print(f"error: {settings_path} is not valid JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+hooks = data.get("hooks") or {}
+entries = hooks.get(event_name) or []
+if not isinstance(entries, list):
+    print(f"warn: {event_name} is not a list; skipping")
+    sys.exit(0)
+
+def is_our_hook(h):
+    return isinstance(h, dict) and "peer-inbox-inject.sh" in (h.get("command") or "")
+
+touched = False
+new_entries = []
+for matcher in entries:
+    if not isinstance(matcher, dict):
+        new_entries.append(matcher)
+        continue
+    inner = matcher.get("hooks") or []
+    if not isinstance(inner, list):
+        new_entries.append(matcher)
+        continue
+    kept_inner = [h for h in inner if not is_our_hook(h)]
+    if len(kept_inner) == len(inner):
+        new_entries.append(matcher)
+        continue
+    touched = True
+    if kept_inner:
+        new_matcher = dict(matcher)
+        new_matcher["hooks"] = kept_inner
+        new_entries.append(new_matcher)
+
+if not touched:
+    print(f"no managed block: {settings_path}")
+    sys.exit(0)
+
+if new_entries:
+    hooks[event_name] = new_entries
+else:
+    hooks.pop(event_name, None)
+    if not hooks:
+        data.pop("hooks", None)
+
+settings_path.write_text(json.dumps(data, indent=2) + "\n")
+print(f"uninstalled: {settings_path} ({event_name} hook)")
+PY
+}
+
+# enable_codex_hooks_flag appends `[features] codex_hooks = true` to
+# ~/.codex/config.toml if not already present. Codex requires the feature
+# flag in addition to hooks.json for UserPromptSubmit hooks to fire. The
+# edit is idempotent: skipped if `codex_hooks = true` is already set.
+enable_codex_hooks_flag() {
+  local config="$1"
+  local timestamp="$2"
+
+  mkdir -p "$(dirname "$config")"
+
+  CONFIG_PATH="$config" TS="$timestamp" python3 <<'PY'
+import os
+import re
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_PATH"])
+existing = config_path.read_text() if config_path.exists() else ""
+
+# Already enabled? Match `codex_hooks = true` in any [features] section
+# (naive but safe: the key is unique and only documented under [features]).
+if re.search(r'(?m)^\s*codex_hooks\s*=\s*true\s*$', existing):
+    print(f"current: {config_path} ([features] codex_hooks already true)")
+    raise SystemExit(0)
+
+# Back up before modifying.
+if config_path.exists():
+    config_path.with_suffix(f".toml.bak.{os.environ['TS']}").write_text(existing)
+
+# Append a [features] block. If one already exists without codex_hooks,
+# we still append a new block — TOML allows it. Cleaner than parsing.
+appended = existing
+if appended and not appended.endswith("\n"):
+    appended += "\n"
+appended += "\n[features]\ncodex_hooks = true\n"
+config_path.write_text(appended)
+print(f"enabled: {config_path} ([features] codex_hooks = true)")
+PY
+}
+
+# disable_codex_hooks_flag removes the `codex_hooks = true` line from
+# ~/.codex/config.toml on uninstall. Only removes the exact line; does
+# not tear down a user-authored [features] block.
+disable_codex_hooks_flag() {
+  local config="$1"
+  local timestamp="$2"
+
+  if [[ ! -f "$config" ]]; then
+    return
+  fi
+
+  CONFIG_PATH="$config" TS="$timestamp" python3 <<'PY'
+import os
+import re
+from pathlib import Path
+
+config_path = Path(os.environ["CONFIG_PATH"])
+existing = config_path.read_text()
+
+if not re.search(r'(?m)^\s*codex_hooks\s*=\s*true\s*$', existing):
+    print(f"no managed line: {config_path}")
+    raise SystemExit(0)
+
+config_path.with_suffix(f".toml.bak.{os.environ['TS']}").write_text(existing)
+
+# Remove the codex_hooks line + a possibly-now-empty [features] block we
+# authored. Conservative: only strip [features]\ncodex_hooks = true\n
+# when those two lines are adjacent and [features] has no other keys.
+cleaned = re.sub(
+    r'\n\[features\]\ncodex_hooks\s*=\s*true\s*\n',
+    '\n',
+    existing,
+)
+# Also handle the case where our block is at the start of file with no
+# leading newline.
+cleaned = re.sub(
+    r'^\[features\]\ncodex_hooks\s*=\s*true\s*\n',
+    '',
+    cleaned,
+)
+# And the leftover-line case if the [features] block had other keys and
+# only codex_hooks should be removed.
+cleaned = re.sub(
+    r'(?m)^\s*codex_hooks\s*=\s*true\s*\n',
+    '',
+    cleaned,
+)
+config_path.write_text(cleaned)
+print(f"disabled: {config_path} ([features] codex_hooks removed)")
+PY
+}
+
 mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini"
 
 case "$MODE" in
@@ -580,6 +823,17 @@ case "$MODE" in
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-channel.py" "$PEER_INBOX_CHANNEL_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+    # Register the same unified hook with Codex and Gemini if their homes
+    # exist (detected via $HOME/.{codex,gemini} already ensured by mkdir
+    # above). The hook script is schema-agnostic — all three CLIs parse
+    # identically.
+    if [[ -d "$HOME/.codex" ]]; then
+      merge_hook_json "$CODEX_HOOKS" "UserPromptSubmit" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+      enable_codex_hooks_flag "$CODEX_CONFIG" "$TIMESTAMP"
+    fi
+    if [[ -d "$HOME/.gemini" ]]; then
+      merge_hook_json "$GEMINI_SETTINGS" "BeforeAgent" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+    fi
     merge_user_mcp_server "$PEER_INBOX_CHANNEL_SCRIPT" "$TIMESTAMP"
 
     # Slash commands: /agent-collab and /peer in Claude Code.
@@ -602,6 +856,10 @@ case "$MODE" in
     echo "peer-inbox:"
     echo "  helper:  $PEER_INBOX_DB_SCRIPT"
     echo "  hook:    $PEER_INBOX_HOOK_SCRIPT"
+    echo "           registered in:"
+    echo "             $CLAUDE_SETTINGS (UserPromptSubmit)"
+    [[ -f "$CODEX_HOOKS" ]] && echo "             $CODEX_HOOKS (UserPromptSubmit)"
+    [[ -f "$GEMINI_SETTINGS" ]] && echo "             $GEMINI_SETTINGS (BeforeAgent)"
     echo "  channel: $PEER_INBOX_CHANNEL_SCRIPT (launch claude with --dangerously-load-development-channels server:peer-inbox)"
     echo "  db:      $PEER_INBOX_HOME/sessions.db (created on first session register)"
     echo "slash commands:"
@@ -622,6 +880,15 @@ case "$MODE" in
     remove_installed_block "$GEMINI_TARGET"
     remove_managed_command "$COMMAND_TARGET"
     remove_claude_hook "$CLAUDE_SETTINGS" "$TIMESTAMP"
+    if [[ -f "$CODEX_HOOKS" ]]; then
+      remove_hook_json "$CODEX_HOOKS" "UserPromptSubmit" "$TIMESTAMP"
+    fi
+    if [[ -f "$CODEX_CONFIG" ]]; then
+      disable_codex_hooks_flag "$CODEX_CONFIG" "$TIMESTAMP"
+    fi
+    if [[ -f "$GEMINI_SETTINGS" ]]; then
+      remove_hook_json "$GEMINI_SETTINGS" "BeforeAgent" "$TIMESTAMP"
+    fi
     remove_user_mcp_server "$TIMESTAMP"
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"

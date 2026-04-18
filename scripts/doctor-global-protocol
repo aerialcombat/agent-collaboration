@@ -14,6 +14,9 @@ PEER_INBOX_DB_SCRIPT="$PEER_INBOX_HOME/scripts/peer-inbox-db.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOME/hooks/peer-inbox-inject.sh"
 PEER_INBOX_DB_PATH="${AGENT_COLLAB_INBOX_DB:-$PEER_INBOX_HOME/sessions.db}"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+CODEX_HOOKS="$HOME/.codex/hooks.json"
+CODEX_CONFIG="$HOME/.codex/config.toml"
+GEMINI_SETTINGS="$HOME/.gemini/settings.json"
 PEER_INBOX_SQLITE_MIN="3.35.0"
 TESTED_CLAUDE_VERSION="2.1.78 (Claude Code)"
 TESTED_CODEX_VERSION="codex-cli 0.115.0"
@@ -340,27 +343,54 @@ sys.exit(0 if cur >= need else 1)
     block "peer-inbox DB parent dir not writable: $db_parent"
   fi
 
-  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
-    warn "Claude settings.json not found at $CLAUDE_SETTINGS — UserPromptSubmit hook cannot be registered"
-  else
-    if python3 -c "
-import json, sys
+  check_hook_registration "Claude" "$CLAUDE_SETTINGS" "UserPromptSubmit"
+  check_hook_registration "Codex" "$CODEX_HOOKS" "UserPromptSubmit"
+  check_hook_registration "Gemini" "$GEMINI_SETTINGS" "BeforeAgent"
+
+  # Codex additionally requires the feature flag to honor its hooks.json.
+  if [[ -f "$CODEX_CONFIG" ]]; then
+    if grep -qE '^\s*codex_hooks\s*=\s*true\s*$' "$CODEX_CONFIG" 2>/dev/null; then
+      pass "Codex codex_hooks feature flag enabled in $CODEX_CONFIG"
+    else
+      warn "Codex codex_hooks feature flag missing from $CODEX_CONFIG — hooks.json will be ignored (run install-global-protocol)"
+    fi
+  elif [[ -f "$CODEX_HOOKS" ]]; then
+    warn "Codex hooks.json present but $CODEX_CONFIG missing — feature flag required for hooks to fire"
+  fi
+}
+
+# check_hook_registration verifies a hooks.<event>[].hooks[] entry pointing
+# at peer-inbox-inject.sh exists in the given settings file. Uniform across
+# Claude / Codex / Gemini since all three share the same JSON shape.
+check_hook_registration() {
+  local label="$1"
+  local settings_path="$2"
+  local event_name="$3"
+
+  if [[ ! -f "$settings_path" ]]; then
+    warn "$label hook config not found at $settings_path — $event_name hook cannot be registered"
+    return
+  fi
+
+  if SETTINGS_PATH="$settings_path" EVENT_NAME="$event_name" python3 -c '
+import json, os, sys
+path = os.environ["SETTINGS_PATH"]
+event = os.environ["EVENT_NAME"]
 try:
-    d = json.load(open('$CLAUDE_SETTINGS'))
+    d = json.load(open(path))
 except Exception as e:
     print(e, file=sys.stderr); sys.exit(2)
-ups = (d.get('hooks') or {}).get('UserPromptSubmit') or []
+entries = (d.get("hooks") or {}).get(event) or []
 found = any(
-    'peer-inbox-inject.sh' in (h.get('command') or '')
-    for m in ups if isinstance(m, dict)
-    for h in (m.get('hooks') or []) if isinstance(h, dict)
+    "peer-inbox-inject.sh" in (h.get("command") or "")
+    for m in entries if isinstance(m, dict)
+    for h in (m.get("hooks") or []) if isinstance(h, dict)
 )
 sys.exit(0 if found else 1)
-" 2>/dev/null; then
-      pass "peer-inbox UserPromptSubmit hook registered in $CLAUDE_SETTINGS"
-    else
-      warn "peer-inbox UserPromptSubmit hook not registered in $CLAUDE_SETTINGS (run install-global-protocol)"
-    fi
+' 2>/dev/null; then
+    pass "peer-inbox $event_name hook registered in $settings_path ($label)"
+  else
+    warn "peer-inbox $event_name hook not registered in $settings_path ($label) — run install-global-protocol"
   fi
 }
 
