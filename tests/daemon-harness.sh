@@ -100,7 +100,7 @@ OUT="${FAKE_CLI_OUT:-/dev/null}"
     echo "ARGV[$i]=$a"
     i=$((i+1))
   done
-  for k in AGENT_COLLAB_DAEMON_SPAWN AGENT_COLLAB_SESSION_KEY CLAUDE_SESSION_ID CODEX_SESSION_ID GEMINI_SESSION_ID PATH; do
+  for k in AGENT_COLLAB_DAEMON_SPAWN AGENT_COLLAB_SESSION_KEY CLAUDE_SESSION_ID CODEX_SESSION_ID GEMINI_SESSION_ID ZAI_API_KEY PATH; do
     v="${!k-}"
     echo "ENV[$k]=$v"
   done
@@ -160,11 +160,18 @@ c.close()
     claude) bin_env_key="AGENT_COLLAB_DAEMON_CLAUDE_BIN" ;;
     codex)  bin_env_key="AGENT_COLLAB_DAEMON_CODEX_BIN" ;;
     gemini) bin_env_key="AGENT_COLLAB_DAEMON_GEMINI_BIN" ;;
+    pi)     bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN" ;;
   esac
+
+  local extra_args_str=""
+  if [[ "$cli_kind" == "pi" ]]; then
+    extra_args_str="--pi-provider zai-glm --pi-model glm-4.6 --pi-session-dir $TMP/pi-sessions-harness"
+  fi
 
   (
     export "$bin_env_key=$fake_cli"
     export FAKE_CLI_OUT
+    # shellcheck disable=SC2086
     "$DAEMON" \
       --label daemon-recv \
       --cwd "$DAEMON_CWD" \
@@ -174,6 +181,7 @@ c.close()
       --sweep-ttl 10 \
       --poll-interval 1 \
       --log-path "$TMP/daemon-${cli_kind}.log" \
+      $extra_args_str \
       >/dev/null 2>&1 &
     echo $! > "$TMP/daemon.pid"
   )
@@ -203,12 +211,22 @@ c.close()
 #     AGENT_COLLAB_DAEMON_SPAWN=1 + AGENT_COLLAB_SESSION_KEY + CLI-
 #     specific env key set to the configured session-key value.
 # =============================================================================
-step "(1) W3 env-var propagation across claude/codex/gemini"
+step "(1) W3 env-var propagation across claude/codex/gemini/pi"
 
 FAKE_SHARED="$TMP/fake-shared.sh"
 make_fake_cli "$FAKE_SHARED"
 
-for cli_kind in claude codex gemini; do
+# Register daemon as pi for the pi spawn (the same daemon-recv label needs
+# its agent toggled; we do that inline via SQL rather than re-registering).
+# For claude/codex/gemini the original registration (--agent claude) is
+# sufficient because the daemon's --cli flag is what picks the spawn path.
+
+# Topic 3 v0.2 §9.2 gate 7: provider API env vars (ZAI_API_KEY as the
+# canonical operator-shell export) must survive daemon spawn into pi
+# process env. We export it here once; every subtest inherits it.
+export ZAI_API_KEY="test-fixture-zai"
+
+for cli_kind in claude codex gemini pi; do
   run_one_spawn "$cli_kind" "$FAKE_SHARED"
   out="$(cat "$FAKE_CLI_OUT")"
   grep -q '^ENV\[AGENT_COLLAB_DAEMON_SPAWN\]=1$' <<<"$out" \
@@ -227,6 +245,14 @@ for cli_kind in claude codex gemini; do
     gemini)
       grep -q '^ENV\[GEMINI_SESSION_ID\]=key-daemon$' <<<"$out" \
         || { echo "$out"; fail "$cli_kind: GEMINI_SESSION_ID not set"; }
+      ;;
+    pi)
+      # Pi has no dedicated session-ID env var (daemon owns path, not
+      # vendor UUID). Instead assert the provider API key survives the
+      # os.Environ() inheritance — the canonical operator-shell pattern
+      # per §4.4 "provider auth" paragraph.
+      grep -q '^ENV\[ZAI_API_KEY\]=test-fixture-zai$' <<<"$out" \
+        || { echo "$out"; fail "pi: ZAI_API_KEY did not survive daemon spawn (§9.2 gate 7 provider-env propagation)"; }
       ;;
   esac
   echo "   $cli_kind: env propagation ok"

@@ -20,7 +20,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 DEFAULT_DB = Path.home() / ".agent-collab" / "sessions.db"
 DEFAULT_CLAUDE_SESSION_LOG_DIR = Path.home() / ".agent-collab" / "claude-sessions-seen"
@@ -30,7 +30,7 @@ DEFAULT_MAX_PAIR_TURNS = 100
 TERMINATION_TOKEN = "[[end]]"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PAIR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
-VALID_AGENTS = {"claude", "codex", "gemini"}
+VALID_AGENTS = {"claude", "codex", "gemini", "pi"}
 
 # Wordlists for pair-key slugs (adjective-noun-XXXX) and auto-generated
 # labels (adjective-noun). 128 × 128 × 65536 ≈ 1 billion pair-key combos
@@ -2008,6 +2008,33 @@ def _get_daemon_cli_session_id(conn: sqlite3.Connection, cwd: str, label: str) -
     return val if val else None
 
 
+def _get_session_agent_and_cli_session_id(
+    conn: sqlite3.Connection, cwd: str, label: str
+) -> Optional[Tuple[str, Optional[str]]]:
+    """Read (agent, daemon_cli_session_id) for a session row in a single SELECT.
+
+    Topic 3 v0.2 §8.1 Python parity: the reset verb needs `sessions.agent`
+    to gate the pi-specific file-delete side-effect, and the cached path
+    to know which file to delete. Returns None if no row matches.
+
+    sessions.agent is TEXT NOT NULL per schema (peer-inbox-db.py:303-306),
+    populated at `session register` time; always non-empty on a row hit.
+    cli_session_id is None when the column is NULL.
+    """
+    row = conn.execute(
+        "SELECT agent, daemon_cli_session_id FROM sessions WHERE cwd = ? AND label = ?",
+        (cwd, label),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        agent = row["agent"]
+        cli_session_id = row["daemon_cli_session_id"]
+    except (KeyError, IndexError):
+        return None
+    return agent, (cli_session_id if cli_session_id else None)
+
+
 def _clear_daemon_cli_session_id(conn: sqlite3.Connection, cwd: str, label: str) -> int:
     """NULL the persisted CLI session-ID for (cwd, label).
 
@@ -2394,9 +2421,45 @@ def _cmd_peer_receive_reset_session(args: argparse.Namespace) -> int:
     self_cwd, self_label = resolve_self(args.as_label, cwd)
 
     conn = open_db()
+    deleted_path: Optional[str] = None
     try:
+        # Topic 3 v0.2 §8.1 Python parity: read agent + cached path BEFORE
+        # clearing so we can gate the file-delete on sessions.agent == 'pi'.
+        # Missing row → EXIT_NOT_FOUND (same as v0.1).
+        row = _get_session_agent_and_cli_session_id(conn, str(self_cwd), self_label)
+        if row is None:
+            conn.close()
+            err(
+                f"no session row for cwd={str(self_cwd)!r} label={self_label!r} — "
+                f"operator misconfigured the label, or the session was never registered. "
+                f"Run `agent-collab session register --cwd {self_cwd} --label {self_label} "
+                f"--receive-mode daemon` first.",
+                EXIT_NOT_FOUND,
+            )
+            return EXIT_NOT_FOUND  # Unreachable; err() exits.
+        agent, cached_path = row
+
         rowcount = _clear_daemon_cli_session_id(conn, str(self_cwd), self_label)
         conn.commit()
+
+        # Pi-specific file-delete side-effect. sessions.agent == 'pi' gate
+        # = correctness; NotExist tolerance = resilience. Defense-in-depth
+        # matches the Go reset verb behavior (§8.1).
+        if agent == "pi" and cached_path:
+            try:
+                os.unlink(cached_path)
+                deleted_path = cached_path
+            except FileNotFoundError:
+                # Idempotent — §3.4 invariant 3. File already gone; no-op.
+                pass
+            except OSError as e:
+                # File existed, unlink failed (e.g. permission). Column is
+                # already NULL'd; reset SUCCEEDS. Operator can `rm` manually
+                # per §8.3 TERTIARY. Log to stderr; non-fatal.
+                sys.stderr.write(
+                    f"daemon-reset-session: warning: column cleared but unlink "
+                    f"{cached_path!r} failed: {e}\n"
+                )
     finally:
         conn.close()
 
@@ -2410,8 +2473,11 @@ def _cmd_peer_receive_reset_session(args: argparse.Namespace) -> int:
         )
 
     if args.format == "json":
+        payload = {"reset": True, "label": self_label}
+        if deleted_path:
+            payload["deleted_file"] = deleted_path
         json.dump(
-            {"reset": True, "label": self_label},
+            payload,
             sys.stdout,
             ensure_ascii=False,
         )
@@ -2421,6 +2487,8 @@ def _cmd_peer_receive_reset_session(args: argparse.Namespace) -> int:
             f"daemon-reset-session: cleared daemon_cli_session_id for ({self_cwd}, {self_label}); "
             f"next spawn will allocate a fresh CLI session"
         )
+        if deleted_path:
+            print(f"daemon-reset-session: deleted session file: {deleted_path}")
     return EXIT_OK
 
 

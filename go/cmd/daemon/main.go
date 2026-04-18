@@ -160,7 +160,19 @@ const (
 	cliClaude cliKind = "claude"
 	cliCodex  cliKind = "codex"
 	cliGemini cliKind = "gemini"
+	cliPi     cliKind = "pi"
 )
+
+// piConfig holds the per-CLI config for `--cli pi`. Provider + Model are
+// REQUIRED at daemon startup (exit 64 if either is missing when CLI=pi)
+// per Topic 3 v0.2 §4.4 / §7.2. SessionDir is optional; defaults to
+// $HOME/.agent-collab/pi-sessions and is auto-created with 0700 perms on
+// first spawn.
+type piConfig struct {
+	Provider   string
+	Model      string
+	SessionDir string
+}
 
 // daemonConfig is the resolved runtime config for one daemon instance.
 // Built from CLI flags + env-var overrides in parseFlags; passed by
@@ -180,13 +192,16 @@ type daemonConfig struct {
 	ClaudeSettingsPath string
 	LogPath            string
 	// Topic 3 v0.1 (Architecture D) §7 — CLI-native session-resume
-	// opt-in flag. When true AND CLI in {codex, gemini}, daemon
+	// opt-in flag. When true AND CLI in {codex, gemini, pi}, daemon
 	// captures the CLI vendor session-ID on first spawn (§6) and
 	// passes the cached identity to subsequent spawns. When CLI=claude,
 	// the daemon emits a one-time warning at startup (§4.3) and
 	// proceeds Arch B fresh-invocation regardless. Default false
 	// preserves Topic 3 v0 behavior.
 	CLISessionResume bool
+	// Topic 3 v0.2 §4.4 / §7.1 — per-CLI pi config (provider/model/
+	// session_dir). Zero-value when CLI != cliPi.
+	Pi piConfig
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +316,19 @@ type configFile struct {
 	// sufficient for v0.1 since the v1+ shape is documented in §7.3.
 	// Pointer to distinguish "field absent" from "field set to false."
 	CLISessionResume *bool `json:"cli_session_resume,omitempty"`
+	// Topic 3 v0.2 §7.1 nested-per-CLI sub-object. Pointer to distinguish
+	// "absent" from "{}".
+	Pi *piConfigFile `json:"pi,omitempty"`
+}
+
+// piConfigFile mirrors piConfig on disk. All fields optional at the JSON
+// layer; required-field validation happens in parseFlags after precedence
+// resolution so a missing field in the config file can still be supplied
+// via CLI flag or env.
+type piConfigFile struct {
+	Provider   string `json:"provider,omitempty"`
+	Model      string `json:"model,omitempty"`
+	SessionDir string `json:"session_dir,omitempty"`
 }
 
 // resolveConfigPath expands --config arguments:
@@ -366,7 +394,12 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		pauseIdleSec   = fs.Int("pause-on-idle", 0, "seconds of no activity before slowing poll frequency (default: config file or 1800)")
 		logPath          = fs.String("log-path", "", "optional slog JSON output file path")
 		claudeSettings   = fs.String("claude-settings", "", "path to Claude settings.json passed via --settings on every claude spawn (default: config file, or ~/.claude/settings.json)")
-		cliSessionResume = fs.Bool("cli-session-resume", false, "Topic 3 v0.1 Arch D opt-in: pass the CLI vendor's native session-ID into subsequent spawns (codex/gemini only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation behavior.")
+		cliSessionResume = fs.Bool("cli-session-resume", false, "Topic 3 v0.1 Arch D opt-in: pass the CLI vendor's native session-ID into subsequent spawns (codex/gemini/pi only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation behavior.")
+		// Topic 3 v0.2 §7.2 pi per-CLI flags. One-off CLI fallbacks;
+		// config-file JSON via nested pi: {} is the preferred shape.
+		piProvider   = fs.String("pi-provider", "", "pi provider name (required when --cli=pi; e.g. zai-glm, openai-codex, anthropic). Can also be supplied via `pi.provider` in --config or AGENT_COLLAB_DAEMON_PI_PROVIDER env.")
+		piModel      = fs.String("pi-model", "", "pi model name (required when --cli=pi; e.g. glm-4.6). Can also be supplied via `pi.model` in --config or AGENT_COLLAB_DAEMON_PI_MODEL env.")
+		piSessionDir = fs.String("pi-session-dir", "", "directory for pi session JSONL files (default: $HOME/.agent-collab/pi-sessions). Can also be supplied via `pi.session_dir` in --config or AGENT_COLLAB_DAEMON_PI_SESSION_DIR env.")
 	)
 	if err := fs.Parse(args); err != nil {
 		return daemonConfig{}, exitUsage, fmt.Errorf("parse flags: %w", err)
@@ -441,7 +474,7 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		return daemonConfig{}, exitUsage, errors.New("--session-key is required (or set `session_key` in --config file)")
 	}
 	if resolvedCLIString == "" {
-		return daemonConfig{}, exitUsage, errors.New("--cli is required (or set `cli` in --config file): claude|codex|gemini")
+		return daemonConfig{}, exitUsage, errors.New("--cli is required (or set `cli` in --config file): claude|codex|gemini|pi")
 	}
 
 	kind, err := parseCLIKind(resolvedCLIString)
@@ -510,6 +543,70 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		}
 	}
 
+	// Topic 3 v0.2 §7.2 pi per-CLI config resolution. Precedence:
+	// CLI flag > config file > env > default (§7.3). SessionDir has a
+	// default; Provider + Model have none (REQUIRED validation below).
+	resolvedPiProvider := *piProvider
+	if !explicitlySet["pi-provider"] {
+		if cf.Pi != nil && cf.Pi.Provider != "" {
+			resolvedPiProvider = cf.Pi.Provider
+		} else if v := os.Getenv("AGENT_COLLAB_DAEMON_PI_PROVIDER"); v != "" {
+			resolvedPiProvider = v
+		}
+	}
+	resolvedPiModel := *piModel
+	if !explicitlySet["pi-model"] {
+		if cf.Pi != nil && cf.Pi.Model != "" {
+			resolvedPiModel = cf.Pi.Model
+		} else if v := os.Getenv("AGENT_COLLAB_DAEMON_PI_MODEL"); v != "" {
+			resolvedPiModel = v
+		}
+	}
+	resolvedPiSessionDir := *piSessionDir
+	if !explicitlySet["pi-session-dir"] {
+		if cf.Pi != nil && cf.Pi.SessionDir != "" {
+			resolvedPiSessionDir = cf.Pi.SessionDir
+		} else if v := os.Getenv("AGENT_COLLAB_DAEMON_PI_SESSION_DIR"); v != "" {
+			resolvedPiSessionDir = v
+		}
+	}
+	if resolvedPiSessionDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			resolvedPiSessionDir = filepath.Join(home, ".agent-collab", "pi-sessions")
+		}
+	}
+
+	// Topic 3 v0.2 §4.4 required-field validation: pi.provider + pi.model
+	// are MANDATORY when cli=pi. Exit 64 (EX_USAGE) with a clear diagnostic
+	// naming the missing field(s). Done at startup (not per-spawn) so the
+	// daemon fails loud before any peer-inbox activity.
+	if kind == cliPi {
+		if resolvedPiProvider == "" {
+			return daemonConfig{}, exitUsage, errors.New(
+				"config error: pi.provider is required when --cli=pi (set via --pi-provider, `pi.provider` in --config, or AGENT_COLLAB_DAEMON_PI_PROVIDER env)",
+			)
+		}
+		if resolvedPiModel == "" {
+			return daemonConfig{}, exitUsage, errors.New(
+				"config error: pi.model is required when --cli=pi (set via --pi-model, `pi.model` in --config, or AGENT_COLLAB_DAEMON_PI_MODEL env)",
+			)
+		}
+		// §4.4 model-provider coupling check: if the model string is
+		// provider-qualified (contains "/"), the prefix must match
+		// resolvedPiProvider. Prevents the silent-misroute class where
+		// pi's own flag-parse would accept `--provider zai-glm --model
+		// openai/gpt-4o` but the daemon config contradicts itself.
+		if slash := strings.Index(resolvedPiModel, "/"); slash > 0 {
+			modelProviderPrefix := resolvedPiModel[:slash]
+			if modelProviderPrefix != resolvedPiProvider {
+				return daemonConfig{}, exitUsage, fmt.Errorf(
+					"config error: pi.model %q provider-qualified as %q but pi.provider is %q; provider/model must agree",
+					resolvedPiModel, modelProviderPrefix, resolvedPiProvider,
+				)
+			}
+		}
+	}
+
 	return daemonConfig{
 		Label:              resolvedLabel,
 		CWD:                resolvedCWDFinal,
@@ -522,6 +619,11 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		ClaudeSettingsPath: resolvedClaudeSettings,
 		LogPath:            resolvedLogPath,
 		CLISessionResume:   resolvedCLISessionResume,
+		Pi: piConfig{
+			Provider:   resolvedPiProvider,
+			Model:      resolvedPiModel,
+			SessionDir: resolvedPiSessionDir,
+		},
 	}, exitOK, nil
 }
 
@@ -533,8 +635,10 @@ func parseCLIKind(v string) (cliKind, error) {
 		return cliCodex, nil
 	case "gemini":
 		return cliGemini, nil
+	case "pi":
+		return cliPi, nil
 	default:
-		return "", fmt.Errorf("--cli must be one of: claude, codex, gemini (got %q)", v)
+		return "", fmt.Errorf("--cli must be one of: claude, codex, gemini, pi (got %q)", v)
 	}
 }
 
@@ -893,6 +997,26 @@ func (d *daemon) transitionClosed(ctx context.Context) error {
 	if err := st.SetDaemonState(openCtx, self, "closed"); err != nil {
 		return fmt.Errorf("set daemon_state closed: %w", err)
 	}
+	// Topic 3 v0.2 §8.2 pi-specific auto-GC extension: read the cached
+	// path BEFORE clearing the column so we can delete the session file
+	// from disk. The CLI identity is known at this code-site (d.cfg.CLI
+	// == cliPi), so no sessions.agent lookup is needed here — the
+	// sessions.agent gate matters only in the cross-process reset verb
+	// (§8.1) where the CLI identity is NOT known a priori. Non-fatal:
+	// a Get failure logs + proceeds to Clear; an os.Remove failure on
+	// a file that exists is logged + ignored (the clearer Clear still
+	// runs).
+	var pathToDelete string
+	if d.cfg.CLI == cliPi {
+		if cached, err := st.GetDaemonCLISessionID(openCtx, self); err == nil {
+			pathToDelete = cached
+		} else {
+			d.log.Warn("daemon.cli_session_auto_gc.pi_get_failed",
+				"label", d.cfg.Label,
+				"err", err.Error(),
+			)
+		}
+	}
 	// §8.2 auto-GC: NULL the captured CLI session-ID so reopening this
 	// daemon (operator flipping daemon_state back to 'open') gets a
 	// fresh CLI session by construction. Non-fatal — if ClearDaemon
@@ -911,6 +1035,22 @@ func (d *daemon) transitionClosed(ctx context.Context) error {
 		d.log.Info("daemon.cli_session_auto_gc.l1_content_stop",
 			"label", d.cfg.Label,
 		)
+	}
+	// Topic 3 v0.2 §8.2 pi-specific file-delete side-effect. NotExist-
+	// tolerant per §3.4 invariant 3 (idempotent reset).
+	if pathToDelete != "" {
+		if err := os.Remove(pathToDelete); err != nil && !errors.Is(err, os.ErrNotExist) {
+			d.log.Warn("daemon.cli_session_auto_gc.pi_file_delete_failed",
+				"label", d.cfg.Label,
+				"path", pathToDelete,
+				"err", err.Error(),
+			)
+		} else {
+			d.log.Info("daemon.cli_session_auto_gc.pi_file_deleted",
+				"label", d.cfg.Label,
+				"path", pathToDelete,
+			)
+		}
 	}
 	return nil
 }
@@ -1158,6 +1298,8 @@ func (d *daemon) spawnCLI(ctx context.Context, prompt string) (string, error) {
 		return d.spawnCodex(ctx, prompt)
 	case cliGemini:
 		return d.spawnGemini(ctx, prompt)
+	case cliPi:
+		return d.spawnPi(ctx, prompt)
 	default:
 		return "", fmt.Errorf("unknown cli kind: %q", d.cfg.CLI)
 	}
@@ -1785,6 +1927,133 @@ func (d *daemon) clearCachedGeminiSessionID(ctx context.Context) {
 			"err", err.Error(),
 		)
 	}
+}
+
+// spawnPi runs `pi --provider <P> --model <M> {--session <PATH> | --no-session} -p <prompt>`
+// with stdin=/dev/null. Topic 3 v0.2 (§4.4) adds pi as the 4th Arch D
+// CLI; pi is distinct from codex/gemini in that the daemon OWNS the
+// session-file PATH rather than translating an opaque vendor-minted UUID.
+//
+// Spawn forms per §4.4:
+//   - cli_session_resume=false:
+//     `pi --provider P --model M --no-session -p <prompt>`
+//     fresh ephemeral session per spawn (pi 0.67.68 `--no-session`
+//     "Don't save session (ephemeral)"). Parallel to Arch B for codex/gemini.
+//   - cli_session_resume=true, column NULL (first batch):
+//     daemon mints `$pi.session_dir/$label.jsonl`, ensures the dir
+//     exists (0700), persists path to sessions.daemon_cli_session_id,
+//     then spawns with `--session <path>`. Pi creates the file on
+//     first write.
+//   - cli_session_resume=true, column non-NULL (subsequent batches):
+//     daemon passes cached path as `--session <PATH>` unchanged. Per
+//     §3.4 invariant 5, missing file at spawn time is tolerated: pi
+//     is idempotent w.r.t. file existence; creates on first write.
+//     No column rewrite needed.
+//
+// §3.4 invariants:
+//   - Invariant 1 (envelope load-bearing per batch): full prompt is
+//     always passed via -p regardless of resume state.
+//   - Invariant 2 (no session-store introspection): daemon owns the
+//     path string but NEVER opens, reads, or parses the JSONL contents.
+//   - Invariant 5 (capture-failure non-fatal): SetDaemonCLISessionID
+//     SQL failure → log warning, leave column NULL; spawn still
+//     proceeds with the minted path (pi creates an orphan-until-next-
+//     persist file). Next batch retries the persist.
+func (d *daemon) spawnPi(ctx context.Context, prompt string) (string, error) {
+	baseArgs := []string{
+		"--provider", d.cfg.Pi.Provider,
+		"--model", d.cfg.Pi.Model,
+	}
+
+	if !d.cfg.CLISessionResume {
+		// Mix-mode gate (§9.2 (B)): flag=false always emits --no-session,
+		// regardless of any value in daemon_cli_session_id. The flag is
+		// authoritative; a non-NULL column alone must not change argv.
+		args := append(baseArgs, "--no-session", "-p", prompt)
+		stdout, _, err := d.execSpawn(ctx, "pi", args, nil)
+		return stdout, err
+	}
+
+	// Arch D enabled. Read-or-mint path.
+	session := store.Session{CWD: d.cfg.CWD, Label: d.cfg.Label}
+	sessionPath := d.resolvePiSessionPath(ctx, session)
+
+	args := append(baseArgs, "--session", sessionPath, "-p", prompt)
+	stdout, _, err := d.execSpawn(ctx, "pi", args, nil)
+	return stdout, err
+}
+
+// resolvePiSessionPath returns the session-file path for the daemon's
+// (cwd, label), reading a cached path from sessions.daemon_cli_session_id
+// if set OR minting a fresh one at $pi.session_dir/$label.jsonl and
+// persisting it. §3.4 invariant 5: persist-failure is non-fatal — the
+// minted path is returned even if SetDaemonCLISessionID fails, so the
+// spawn proceeds with an orphan-until-next-persist file; next batch
+// retries.
+func (d *daemon) resolvePiSessionPath(ctx context.Context, session store.Session) string {
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	st, err := sqlitestore.Open(openCtx)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_resume.pi_store_open_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+			"msg", "store open failed; minting orphan-until-next-persist path (non-fatal per §3.4 invariant 5)",
+		)
+		return d.mintPiSessionPath()
+	}
+	defer st.Close()
+
+	cached, err := st.GetDaemonCLISessionID(openCtx, session)
+	if err != nil {
+		d.log.Warn("daemon.cli_session_resume.pi_get_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+			"msg", "get daemon_cli_session_id failed; minting orphan path",
+		)
+		return d.mintPiSessionPath()
+	}
+	if cached != "" {
+		// §3.4 invariant 5 missing-file branch: file on disk may have
+		// been rm'd out-of-band; pi will create it at the cached path
+		// on first write. No column rewrite needed.
+		return cached
+	}
+
+	// First batch: mint path, ensure dir, persist.
+	path := d.mintPiSessionPath()
+	if err := st.SetDaemonCLISessionID(openCtx, session, path); err != nil {
+		d.log.Warn("daemon.cli_session_capture.pi_set_failed",
+			"label", d.cfg.Label,
+			"err", err.Error(),
+			"path", path,
+			"msg", "persist failed; spawning with orphan path (non-fatal per §3.4 invariant 5); next batch will retry persist",
+		)
+		return path
+	}
+	d.log.Info("daemon.cli_session_capture.pi_captured",
+		"label", d.cfg.Label,
+		"path", path,
+	)
+	return path
+}
+
+// mintPiSessionPath constructs the session-file path and best-effort-
+// creates its parent dir (0700). Returns the path unconditionally; a
+// MkdirAll failure is logged but does not stop the spawn (pi will fail
+// on first write with its own error — surfaces in the normal spawn-error
+// flow rather than being a daemon-layer concern).
+func (d *daemon) mintPiSessionPath() string {
+	dir := d.cfg.Pi.SessionDir
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		d.log.Warn("daemon.cli_session_resume.pi_mkdir_failed",
+			"label", d.cfg.Label,
+			"dir", dir,
+			"err", err.Error(),
+			"msg", "MkdirAll failed; pi will surface a spawn-time error if dir is missing",
+		)
+	}
+	return filepath.Join(dir, d.cfg.Label+".jsonl")
 }
 
 // execSpawn is the shared spawn implementation. Stdin is always

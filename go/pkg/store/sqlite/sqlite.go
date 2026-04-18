@@ -701,6 +701,37 @@ func (s *SQLiteLocal) GetDaemonCLISessionID(ctx context.Context, self store.Sess
 	return id.String, nil
 }
 
+// GetSessionAgentAndCLISessionID reads both the `agent` string and the
+// persisted CLI session-ID for the (cwd, label) session in a single
+// SELECT. Topic 3 v0.2 §8.1: the reset verb (a separate process from the
+// daemon) needs `sessions.agent` to gate the pi-specific file-delete
+// side-effect; reading both columns atomically avoids a race where the
+// agent check could observe one row and the clear observes a different
+// one if the operator re-registers mid-reset.
+//
+// Returns (agent, cliSessionID, error). agent is always non-empty on
+// success (schema `agent TEXT NOT NULL`). cliSessionID is "" when the
+// column is NULL.
+func (s *SQLiteLocal) GetSessionAgentAndCLISessionID(ctx context.Context, self store.Session) (string, string, error) {
+	var agent string
+	var id sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT agent, daemon_cli_session_id
+		FROM sessions
+		WHERE cwd = ? AND label = ?
+	`, self.CWD, self.Label).Scan(&agent, &id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", fmt.Errorf("no session row for cwd=%q label=%q", self.CWD, self.Label)
+		}
+		return "", "", fmt.Errorf("get session agent + daemon_cli_session_id: %w", err)
+	}
+	if !id.Valid {
+		return agent, "", nil
+	}
+	return agent, id.String, nil
+}
+
 // ClearDaemonCLISessionID NULLs the persisted CLI session-ID for the
 // (cwd, label) session. Used by the operator reset verb
 // (peer-inbox daemon-reset-session per §8.1) and by the auto-GC hook on

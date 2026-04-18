@@ -995,4 +995,32 @@ fi
 
 echo "   (5g-ii) ok — 15s default survived 5s --list-sessions latency; capture succeeded ($UUID_G2)"
 
-echo "PASS: daemon-cli-resume-gemini — 5a/5a-translation/5b/5c/5d/5e/5f/5g all behave per §9.3 gate 5 + §3.4 invariants 1/2/5"
+# =============================================================================
+# (5h) Cross-CLI reset-isolation (Topic 3 v0.2 §9.2 gate D):
+# Reset on a gemini label MUST NOT invoke os.Remove — the pi-specific
+# file-delete branch is gated on sessions.agent == 'pi'. Regression gate
+# against a future refactor dropping the agent-check.
+# =============================================================================
+step "(5h) cross-CLI reset-isolation: gemini reset leaves deleted_file unset"
+
+CWD_H="$TMP/cwd-h"
+register_daemon "$CWD_H" "d-5h" "key-5h"
+ISO_UUID="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+set_column "$CWD_H" "d-5h" "$ISO_UUID"
+
+# Sentinel file with UUID as name. Regression catch: if reset verb
+# dropped the agent-gate and invoked os.Remove on the UUID string, the
+# sentinel (which lives at $CWD/$UUID) would be deleted.
+SENT_5H="$CWD_H/$ISO_UUID"
+echo "sentinel-for-5h" > "$SENT_5H"
+
+reset_json="$("$PI" daemon-reset-session --cwd "$CWD_H" --as d-5h --format json 2>&1)"
+[[ -n "$reset_json" ]] || fail "(5h) reset verb emitted no output"
+if echo "$reset_json" | grep -q '"deleted_file"'; then
+  fail "(5h) gemini reset emitted deleted_file field (should be absent for non-pi agent): $reset_json"
+fi
+[[ -f "$SENT_5H" ]] \
+  || fail "(5h) sentinel file deleted — reset verb invoked os.Remove on gemini UUID (agent-gate regression)"
+echo "   (5h) reset emitted no deleted_file field; sentinel survives"
+
+echo "PASS: daemon-cli-resume-gemini — 5a/5a-translation/5b/5c/5d/5e/5f/5g/5h all behave per §9.3 gate 5 + §3.4 invariants 1/2/5 + §9.2 gate D"

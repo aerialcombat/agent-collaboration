@@ -508,4 +508,40 @@ cap_b_post="$(read_cli_session_id "$DAEMON_CWD_B" "reviewer-codex-b")"
   || fail "(4d) label-b should be unchanged by A reset, got '$cap_b_post'"
 echo "   (4d) reset on A does not affect B (cross-isolation preserved)"
 
-echo "PASS: daemon-cli-resume-codex — 4a capture+resume+reset + 4b stale-fallback + 4c flag-is-gate + 4d 2-label cross-isolation"
+# =====================================================================
+# (4e) Cross-CLI reset-isolation (Topic 3 v0.2 §9.2 gate D):
+# Reset on a codex label MUST NOT invoke os.Remove — the pi-specific
+# file-delete branch is gated on sessions.agent == 'pi'. Regression gate
+# against a future refactor dropping the agent-check. Implementation:
+# JSON-format reset output must NOT include the "deleted_file" field.
+# =====================================================================
+step "(4e) cross-CLI reset-isolation: codex reset leaves deleted_file unset"
+
+# Pre-populate column with a bogus UUID so the reset has something to
+# clear (matches real-world post-capture state).
+set_cli_session_id "$DAEMON_CWD" "daemon-codex" "aaaaeeee-aaaa-4aaa-8aaa-aaaaaaaaeeee"
+
+# Create a sentinel file in $DAEMON_CWD with the UUID as its name. If a
+# future refactor accidentally drops the agent-gate and invokes
+# os.Remove, the sentinel will be deleted (UUID string interpreted as a
+# $CWD-relative path). Asserting sentinel survives = regression gate.
+SENTINEL_FILE="$DAEMON_CWD/aaaaeeee-aaaa-4aaa-8aaa-aaaaaaaaeeee"
+echo "sentinel-for-4e" > "$SENTINEL_FILE"
+
+reset_json="$("$PI" daemon-reset-session --cwd "$DAEMON_CWD" --as daemon-codex --format json 2>&1)"
+[[ -n "$reset_json" ]] || fail "(4e) reset verb emitted no output"
+
+# deleted_file is omitempty on the Go side → should NOT appear in JSON
+# for a non-pi agent.
+if echo "$reset_json" | grep -q '"deleted_file"'; then
+  fail "(4e) codex reset emitted deleted_file field (should be absent for non-pi agent): $reset_json"
+fi
+
+# Sentinel file MUST survive: regression against a future refactor
+# dropping the sessions.agent == 'pi' gate.
+[[ -f "$SENTINEL_FILE" ]] \
+  || fail "(4e) sentinel file deleted — reset verb invoked os.Remove on codex UUID (agent-gate regression)"
+
+echo "   (4e) reset emitted no deleted_file field; sentinel survives (agent-gate intact)"
+
+echo "PASS: daemon-cli-resume-codex — 4a capture+resume+reset + 4b stale-fallback + 4c flag-is-gate + 4d 2-label cross-isolation + 4e cross-CLI reset-isolation"

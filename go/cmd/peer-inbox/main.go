@@ -457,9 +457,15 @@ func runSweep(args []string) int {
 // resetSessionPayload mirrors the Python verb's JSON byte shape: emits
 // {"reset": true, "label": "..."}` so downstream observability can
 // trivially confirm the operation succeeded.
+//
+// Topic 3 v0.2 §8.1 pi-extension: DeletedFile is populated (non-empty
+// string) when the reset targeted a pi-managed label AND a session file
+// existed on disk and was removed. Empty otherwise (non-pi agent, or
+// pi with NULL column, or pi with non-existent file).
 type resetSessionPayload struct {
-	Reset bool   `json:"reset"`
-	Label string `json:"label"`
+	Reset       bool   `json:"reset"`
+	Label       string `json:"label"`
+	DeletedFile string `json:"deleted_file,omitempty"`
 }
 
 // runResetSession implements `peer-inbox daemon-reset-session --cwd DIR
@@ -513,9 +519,14 @@ func runResetSession(args []string) int {
 	defer st.Close()
 
 	self := store.Session{CWD: resolvedCWD, Label: *asLbl}
-	if err := st.ClearDaemonCLISessionID(ctx, self); err != nil {
-		// Distinguish "no session row" from other SQL errors so the
-		// operator gets a clean exit code per §8.1.
+
+	// Topic 3 v0.2 §8.1 pi-extension: read agent + cached path BEFORE
+	// clearing the column so we can gate the file-delete side-effect on
+	// sessions.agent == 'pi'. Reading both in a single SELECT avoids a
+	// window where the agent check could observe a different row than
+	// the subsequent Clear.
+	agent, cachedPath, err := st.GetSessionAgentAndCLISessionID(ctx, self)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || stringContains(err.Error(), "no session row") {
 			fmt.Fprintf(os.Stderr,
 				"daemon-reset-session: no session row for cwd=%q label=%q — "+
@@ -530,19 +541,66 @@ func runResetSession(args []string) int {
 		return exitInternal
 	}
 
+	if err := st.ClearDaemonCLISessionID(ctx, self); err != nil {
+		// Defensive branch: GetSessionAgentAndCLISessionID succeeded, so
+		// the row exists. Any Clear error at this point is a SQL fault,
+		// not a missing-row. Still handle sql.ErrNoRows for safety.
+		if errors.Is(err, sql.ErrNoRows) || stringContains(err.Error(), "no session row") {
+			fmt.Fprintf(os.Stderr,
+				"daemon-reset-session: no session row for cwd=%q label=%q\n",
+				resolvedCWD, *asLbl,
+			)
+			return exitNotFound
+		}
+		fmt.Fprintf(os.Stderr, "daemon-reset-session: %v\n", err)
+		return exitInternal
+	}
+
+	// Topic 3 v0.2 §8.1 pi-specific file-delete side-effect. Gate on
+	// sessions.agent == 'pi' (correctness boundary — cross-CLI reset-
+	// isolation per §9.2 gate D). NotExist tolerance defends against a
+	// cached path pointing to an already-deleted file AND as a safety
+	// net in case a future refactor accidentally invoked os.Remove on
+	// a non-pi row (UUID strings from codex/gemini interpreted as
+	// $CWD-relative paths will silently no-op on NotExist).
+	deletedPath := ""
+	if agent == "pi" && cachedPath != "" {
+		if err := os.Remove(cachedPath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				// File existed, Remove failed (permission, etc.) — log
+				// to stderr but keep the reset SUCCESS. The column is
+				// already NULL'd; the operator can manually `rm` the
+				// file per §8.3 TERTIARY. Non-fatal.
+				fmt.Fprintf(os.Stderr,
+					"daemon-reset-session: warning: column cleared but os.Remove(%q) failed: %v\n",
+					cachedPath, err,
+				)
+			}
+			// NotExist is the idempotent path — not an error, not a
+			// log line; §3.4 invariant 3 guarantees reset is safe-to-
+			// spam.
+		} else {
+			deletedPath = cachedPath
+		}
+	}
+
 	if fmtStr == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetEscapeHTML(false)
-		if err := enc.Encode(resetSessionPayload{Reset: true, Label: *asLbl}); err != nil {
+		if err := enc.Encode(resetSessionPayload{Reset: true, Label: *asLbl, DeletedFile: deletedPath}); err != nil {
 			fmt.Fprintf(os.Stderr, "daemon-reset-session: encode json: %v\n", err)
 			return exitInternal
 		}
 		return exitOK
 	}
 	// plain — clear, operator-facing message; consistent wording with
-	// the Python verb + the doc'd SQL escape hatch (§8.3).
+	// the Python verb + the doc'd SQL escape hatch (§8.3). Pi adds an
+	// extra line naming the deleted file when applicable.
 	fmt.Printf("daemon-reset-session: cleared daemon_cli_session_id for (%s, %s); "+
 		"next spawn will allocate a fresh CLI session\n", resolvedCWD, *asLbl)
+	if deletedPath != "" {
+		fmt.Printf("daemon-reset-session: deleted session file: %s\n", deletedPath)
+	}
 	return exitOK
 }
 

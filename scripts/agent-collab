@@ -49,7 +49,7 @@ usage() {
 Usage:
   agent-collab challenge --challenger claude|codex|gemini [options]
   agent-collab verify --challenger claude|codex|gemini [options]
-  agent-collab session register [--label <l>] --agent claude|codex|gemini
+  agent-collab session register [--label <l>] --agent claude|codex|gemini|pi
                                 [--role <r>] [--session-key <k>]
                                 [--pair-key <k> | --new-pair] [--force]
                                 --label is optional — a memorable slug is

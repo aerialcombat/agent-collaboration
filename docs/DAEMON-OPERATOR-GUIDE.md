@@ -271,6 +271,85 @@ AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
   fall back to the 15s default — capture-failure is non-fatal per
   §3.4 invariant 5, so a config typo here does not block the daemon.
 
+- **Pi (`--cli pi`, Topic 3 v0.2)**: pi is the first Arch D CLI where
+  the **daemon owns the session-file PATH** rather than translating an
+  opaque vendor-minted UUID. Pi accepts `--session <PATH>` (a JSONL
+  session file the daemon mints, ensures exists, and persists the path
+  of). No regex scan, no `--list-sessions` delta, no race tolerance —
+  path-as-identity by construction.
+
+  - **Resume-off form:** `pi --provider <P> --model <M> --no-session -p <prompt>` — pi 0.67.68 ships an explicit `--no-session` flag for ephemeral invocations (parallel to Arch B for codex/gemini). Daemon emits this form when `cli_session_resume=false` regardless of any column state.
+  - **Resume-on, first batch:** daemon mints `$pi.session_dir/$label.jsonl` (default `$HOME/.agent-collab/pi-sessions/$label.jsonl`), calls `os.MkdirAll` with 0700, persists the path to `sessions.daemon_cli_session_id`, spawns with `--session <PATH>`. Pi creates the JSONL file on first write.
+  - **Resume-on, subsequent batches:** daemon reads cached path; spawns with `--session <cached-path>`. Pi appends turns to the same file.
+  - **File-missing-at-spawn:** if the cached path's file was deleted out-of-band, the daemon passes the cached path unchanged; pi creates the file fresh at that path on first write. Deterministic-path invariant preserved; no column rewrite.
+
+  **Required config (when `cli=pi`):**
+
+  ```json
+  {
+    "cli": "pi",
+    "cli_session_resume": true,
+    "pi": {
+      "provider": "zai-glm",
+      "model": "glm-4.6",
+      "session_dir": "$HOME/.agent-collab/pi-sessions"
+    }
+  }
+  ```
+
+  `pi.provider` + `pi.model` are MANDATORY — missing either → daemon
+  startup exits 64 (EX_USAGE) with a clear diagnostic. `pi.session_dir`
+  is optional (default shown). CLI flag fallbacks: `--pi-provider`,
+  `--pi-model`, `--pi-session-dir`. Env overrides:
+  `AGENT_COLLAB_DAEMON_PI_PROVIDER`, `AGENT_COLLAB_DAEMON_PI_MODEL`,
+  `AGENT_COLLAB_DAEMON_PI_SESSION_DIR`.
+
+  **Model-provider coupling check (§4.4):** if `pi.model` is
+  provider-qualified (`"openai/gpt-4o"`) AND the prefix does NOT match
+  `pi.provider`, daemon startup rejects with exit 64 and a diagnostic
+  naming both. Prevents silent mis-routes.
+
+  **Provider auth (operator responsibility):** pi-mono routes to the
+  provider specified by `--provider`. The daemon inherits the operator
+  shell environment via `os.Environ()` — export the provider-specific
+  auth env var per pi-mono's published table (run `pi --help` for the
+  canonical list on your pi version). Common mappings (confirmed
+  against pi 0.67.68):
+
+  | provider            | env var                                      |
+  |---------------------|----------------------------------------------|
+  | `zai-glm`           | `ZAI_API_KEY`                                |
+  | `openai-codex`      | `OPENAI_API_KEY`                             |
+  | `anthropic`         | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` |
+  | `google` (Gemini)   | `GEMINI_API_KEY`                             |
+  | `google-antigravity`| OAuth (no direct env var); see pi-mono docs |
+  | `groq`              | `GROQ_API_KEY`                               |
+  | `xai`               | `XAI_API_KEY`                                |
+  | `openrouter`        | `OPENROUTER_API_KEY`                         |
+  | `mistral`           | `MISTRAL_API_KEY`                            |
+
+  **Reset semantics for pi** (extension of the PRIMARY / SECONDARY /
+  TERTIARY ladder below): because the daemon owns the path, pi reset
+  also **deletes the session file from disk**. The operator verb + L1
+  content-stop auto-GC both gate the file-delete on `sessions.agent ==
+  'pi'` — codex/gemini reset stays NULL-only. `os.Remove` is
+  `NotExist`-tolerant (idempotent per §3.4 invariant 3). A cross-CLI
+  reset-isolation regression gate (`tests/daemon-cli-resume-{codex,gemini}.sh`
+  subtest 4e/5h) locks the agent-gate so refactors can't accidentally
+  drop it.
+
+  ```bash
+  # pi reset → column NULL'd + session file deleted
+  peer-inbox daemon-reset-session --cwd <CWD> --as <pi-label> --format plain
+  # Output:
+  #   daemon-reset-session: cleared daemon_cli_session_id for (...); next spawn will allocate a fresh CLI session
+  #   daemon-reset-session: deleted session file: /home/.../pi-sessions/<label>.jsonl
+  ```
+
+  With `--format json`, the payload gains a `"deleted_file": "<path>"`
+  field (omitted when the agent is not `pi` OR the column was already
+  NULL OR the file was already absent).
+
 ### Known asymmetry: Claude
 
 `claude -p` (the form `agent-collab-daemon` uses for spawns) does not
