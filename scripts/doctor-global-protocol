@@ -357,6 +357,42 @@ sys.exit(0 if cur >= need else 1)
   elif [[ -f "$CODEX_HOOKS" ]]; then
     warn "Codex hooks.json present but $CODEX_CONFIG missing — feature flag required for hooks to fire"
   fi
+
+  # Topic 3 v0 auto-reply daemon — optional. Only warn if a daemon
+  # config file exists (operator has committed to using the daemon) but
+  # the binaries are missing. Otherwise stay silent: daemon is additive,
+  # not required for hook-based peer-inbox coordination.
+  local bin_dir="${AGENT_COLLAB_BIN_DIR:-$HOME/.local/bin}"
+  local daemon_bin="$bin_dir/agent-collab-daemon"
+  local go_cli="$bin_dir/peer-inbox"
+  local daemons_dir="$HOME/.agent-collab/daemons"
+
+  local has_any_daemon_config=0
+  if [[ -d "$daemons_dir" ]]; then
+    # Count *.json files excluding the .json.disabled example.
+    shopt -s nullglob
+    local -a cfgs=( "$daemons_dir"/*.json )
+    shopt -u nullglob
+    if (( ${#cfgs[@]} > 0 )); then
+      has_any_daemon_config=1
+    fi
+  fi
+
+  if [[ -x "$daemon_bin" ]]; then
+    pass "Topic 3 daemon binary installed: $daemon_bin"
+  elif (( has_any_daemon_config )); then
+    warn "daemon config present in $daemons_dir but $daemon_bin missing — run install-global-protocol to build + install"
+  fi
+
+  if [[ -x "$go_cli" ]]; then
+    pass "Topic 3 peer-inbox Go CLI installed: $go_cli"
+  elif (( has_any_daemon_config )); then
+    warn "daemon config present in $daemons_dir but $go_cli missing — spawned agents won't be able to call daemon-complete"
+  fi
+
+  if (( has_any_daemon_config )) && [[ ! -x "$daemon_bin" || ! -x "$go_cli" ]]; then
+    warn "see docs/DAEMON-OPERATOR-GUIDE.md for daemon setup + sweeper-timer configuration"
+  fi
 }
 
 # check_hook_registration verifies a hooks.<event>[].hooks[] entry pointing

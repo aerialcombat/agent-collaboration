@@ -17,6 +17,11 @@ PEER_INBOX_HOOKS_DIR="$PEER_INBOX_HOME/hooks"
 PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
 PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
+# Topic 3 v0 (auto-reply daemon) — go binaries + config dir.
+PEER_INBOX_DAEMONS_DIR="$PEER_INBOX_HOME/daemons"
+PEER_INBOX_DAEMON_BIN="$BIN_DIR/agent-collab-daemon"
+PEER_INBOX_GO_CLI="$BIN_DIR/peer-inbox"
+PEER_INBOX_DAEMON_EXAMPLE_CFG="$PEER_INBOX_DAEMONS_DIR/example.json.disabled"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
@@ -250,6 +255,130 @@ remove_peer_inbox_file() {
   echo "backup: ${target}.bak.${TIMESTAMP}"
   rm -f "$target"
   echo "uninstalled: $target"
+}
+
+# Topic 3 v0 (auto-reply daemon) install helpers.
+#
+# Two Go binaries get installed to $BIN_DIR so the daemon + its spawned
+# agents can invoke them from PATH:
+#
+#   agent-collab-daemon  — the daemon itself; operators run this per
+#                          managed label.
+#   peer-inbox           — Go CLI exposing daemon-claim / daemon-complete
+#                          / daemon-sweep verbs (from commit 4). Spawned
+#                          CLIs call `peer-inbox daemon-complete ...`
+#                          as their final action per §7.2 mechanism (1).
+#
+# The daemon config dir (~/.agent-collab/daemons/) gets created with a
+# disabled example config file that operators copy + edit to set up a
+# managed daemon. Extension .json.disabled ensures the example doesn't
+# accidentally get auto-loaded by anything that enumerates the dir.
+#
+# Sweeper timer (systemd-user-timer on Linux / launchd plist on macOS /
+# cron on everything) is intentionally NOT auto-installed — installing
+# a system-scoped timer without operator opt-in crosses the "shared
+# system state" line the global protocol's tone-and-style guidance
+# warns about. Operator guide at docs/DAEMON-OPERATOR-GUIDE.md covers
+# manual setup for each platform.
+
+install_go_binary() {
+  # install_go_binary <target-path> <go-pkg-path> <descriptor>
+  local target="$1"
+  local pkg="$2"
+  local descriptor="$3"
+
+  if ! command -v go >/dev/null 2>&1; then
+    echo "skip: $descriptor — go toolchain not on PATH (install go to enable daemon-mode)"
+    return
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  local tmp="${target}.new.${TIMESTAMP}"
+
+  # Build into a sibling tmp file, then atomically swap. Avoids clobbering
+  # a running daemon's binary mid-install (rename is atomic on same FS;
+  # a running process keeps its own inode).
+  if ! ( cd "$PROJECT_ROOT/go" && go build -o "$tmp" "./cmd/$pkg" ) 2>&1; then
+    rm -f "$tmp"
+    err "$descriptor build failed (./cmd/$pkg)"
+  fi
+
+  if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    echo "current: $target"
+    return
+  fi
+
+  if [[ -f "$target" ]]; then
+    cp "$target" "${target}.bak.${TIMESTAMP}"
+    echo "backup: ${target}.bak.${TIMESTAMP}"
+  fi
+
+  mv "$tmp" "$target"
+  chmod +x "$target"
+  echo "installed: $target"
+}
+
+remove_go_binary() {
+  local target="$1"
+
+  if [[ ! -f "$target" ]]; then
+    echo "missing: $target"
+    return
+  fi
+
+  cp "$target" "${target}.bak.${TIMESTAMP}"
+  echo "backup: ${target}.bak.${TIMESTAMP}"
+  rm -f "$target"
+  echo "uninstalled: $target"
+}
+
+install_daemon_config_dir() {
+  # Create the per-label daemon config dir + a disabled example operators
+  # can copy as a starting template.
+  mkdir -p "$PEER_INBOX_DAEMONS_DIR"
+
+  if [[ -f "$PEER_INBOX_DAEMON_EXAMPLE_CFG" ]]; then
+    echo "current: $PEER_INBOX_DAEMON_EXAMPLE_CFG"
+    return
+  fi
+
+  cat >"$PEER_INBOX_DAEMON_EXAMPLE_CFG" <<'EOF'
+{
+  "_note": "Topic 3 daemon config template. Copy to <label>.json and edit. Invoke via: agent-collab-daemon --config <label>",
+
+  "label": "CHANGEME-reviewer-codex",
+  "cwd":   "CHANGEME-/absolute/path/to/workspace",
+  "session_key": "CHANGEME-stable-session-key-string",
+  "cli": "codex",
+
+  "ack_timeout":   300,
+  "sweep_ttl":     600,
+  "poll_interval": 2,
+  "pause_on_idle": 1800,
+
+  "claude_settings": "",
+  "log_path": ""
+}
+EOF
+  chmod 0644 "$PEER_INBOX_DAEMON_EXAMPLE_CFG"
+  echo "installed: $PEER_INBOX_DAEMON_EXAMPLE_CFG"
+}
+
+remove_daemon_config_dir() {
+  # Intentional: never remove operator-authored .json configs or the
+  # daemons/ dir if it contains anything other than the example. Only
+  # remove the example template + empty dir.
+  if [[ -f "$PEER_INBOX_DAEMON_EXAMPLE_CFG" ]]; then
+    rm -f "$PEER_INBOX_DAEMON_EXAMPLE_CFG"
+    echo "uninstalled: $PEER_INBOX_DAEMON_EXAMPLE_CFG"
+  fi
+  if [[ -d "$PEER_INBOX_DAEMONS_DIR" ]]; then
+    # rmdir fails non-empty; that's exactly the guard we want.
+    rmdir "$PEER_INBOX_DAEMONS_DIR" 2>/dev/null \
+      && echo "removed empty dir: $PEER_INBOX_DAEMONS_DIR" \
+      || echo "kept (non-empty): $PEER_INBOX_DAEMONS_DIR"
+  fi
 }
 
 install_slash_command() {
@@ -852,6 +981,16 @@ case "$MODE" in
     fi
     merge_user_mcp_server "$PEER_INBOX_CHANNEL_SCRIPT" "$TIMESTAMP"
 
+    # Topic 3 v0: install daemon binaries + config dir. Order: Go binaries
+    # first (needed before anyone invokes them), then config dir (operator
+    # template). Binaries build-and-install via `go build`; skip
+    # gracefully if the go toolchain isn't available (install-global-
+    # protocol must remain runnable without go; only the daemon-mode
+    # features degrade).
+    install_go_binary "$PEER_INBOX_DAEMON_BIN" "daemon" "agent-collab-daemon"
+    install_go_binary "$PEER_INBOX_GO_CLI" "peer-inbox" "peer-inbox Go CLI"
+    install_daemon_config_dir
+
     # Slash commands: /agent-collab and /peer in Claude Code.
     for cmd in "${SLASH_COMMANDS[@]}"; do
       install_slash_command "$PROJECT_ROOT/commands/$cmd" "$CLAUDE_COMMANDS_DIR/$cmd"
@@ -878,6 +1017,14 @@ case "$MODE" in
     [[ -f "$GEMINI_SETTINGS" ]] && echo "             $GEMINI_SETTINGS (BeforeAgent)"
     echo "  channel: $PEER_INBOX_CHANNEL_SCRIPT (launch claude with --dangerously-load-development-channels server:peer-inbox)"
     echo "  db:      $PEER_INBOX_HOME/sessions.db (created on first session register)"
+    if [[ -x "$PEER_INBOX_DAEMON_BIN" || -x "$PEER_INBOX_GO_CLI" ]]; then
+      echo "auto-reply daemon (Topic 3 v0):"
+      [[ -x "$PEER_INBOX_DAEMON_BIN" ]] && echo "  daemon:    $PEER_INBOX_DAEMON_BIN"
+      [[ -x "$PEER_INBOX_GO_CLI"     ]] && echo "  peer-inbox: $PEER_INBOX_GO_CLI (daemon-claim / daemon-complete / daemon-sweep)"
+      echo "  configs:   $PEER_INBOX_DAEMONS_DIR/ (copy example.json.disabled → <label>.json to manage a label)"
+      echo "  operator:  $PROJECT_ROOT/docs/DAEMON-OPERATOR-GUIDE.md"
+      echo "  sweeper:   run \`peer-inbox daemon-sweep\` on a timer (systemd-user, launchd, or cron — see operator guide)"
+    fi
     echo "slash commands:"
     for cmd in "${SLASH_COMMANDS[@]}"; do
       echo "  $CLAUDE_COMMANDS_DIR/$cmd"
@@ -909,6 +1056,12 @@ case "$MODE" in
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
+    # Topic 3 v0: remove daemon binaries + example config. Operator-
+    # authored daemon configs in $PEER_INBOX_DAEMONS_DIR are preserved
+    # — uninstall mirrors the sessions.db treatment (user data stays).
+    remove_go_binary "$PEER_INBOX_DAEMON_BIN"
+    remove_go_binary "$PEER_INBOX_GO_CLI"
+    remove_daemon_config_dir
     for cmd in "${SLASH_COMMANDS[@]}"; do
       remove_slash_command "$CLAUDE_COMMANDS_DIR/$cmd"
     done
