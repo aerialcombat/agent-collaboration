@@ -422,6 +422,26 @@ timeout bump to 15s with `AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT`
 env override) work end-to-end against real CLIs — the gap that v0.1.1
 shipped without closing.
 
+**2026-04-18 vs `v3.x-topic-3-v0.2-shipped` @ `ab61c24`** — test-engineer supervised probe.
+
+- **pi-mono 0.67.68** — E8 (a)(b)(c)(d)(e) **PASS**
+  - Captured path: `/tmp/e8-probe/pi-sessions/e8-pi.jsonl`
+  - Batch-2 argv: `--session <same path>`; reply recalled "cornflower"
+  - Reset emitted `deleted_file`; file gone from disk; column NULL'd
+  - Post-reset recall → "NONE"; fresh session UUID (vendor-side context
+    truly discarded)
+
+This run validates v0.2's Arch D pi path (path-as-identity capture +
+reuse + file-delete-on-reset + reset-actually-reset) end-to-end against
+the real pi 0.67.68 CLI + ZAI GLM provider. Closes the v0.2 ship per
+the v0.1.2 meta-lesson (fake-binary gates don't validate real-CLI
+behavior).
+
+§E8 Prerequisites note (ride-along at `ab61c24`): do NOT override
+`$HOME` for probe isolation — pi reads provider-auth config from
+`~/.pi/agent/`. Isolate via `AGENT_COLLAB_INBOX_DB=<path>` +
+`--pi-session-dir <path>` instead.
+
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
