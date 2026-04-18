@@ -1,0 +1,7 @@
+{
+  "session_id": "0c7a88b8-claude-fixture",
+  "transcript_path": "/tmp/claude-transcript.jsonl",
+  "cwd": "__HOOK_PARITY_CWD__",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "example user prompt for hook-parity fixture"
+}

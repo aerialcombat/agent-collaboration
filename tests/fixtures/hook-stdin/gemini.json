@@ -1,0 +1,8 @@
+{
+  "session_id": "5e9b71c4-gemini-fixture",
+  "transcript_path": "/tmp/gemini-transcript.jsonl",
+  "cwd": "__HOOK_PARITY_CWD__",
+  "hook_event_name": "BeforeAgent",
+  "timestamp": "2026-04-18T01:00:00Z",
+  "prompt": "example user prompt for hook-parity fixture"
+}
