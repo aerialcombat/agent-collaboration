@@ -28,6 +28,20 @@ var ErrNoSession = errors.New("store: no session registered for this cwd")
 // "re-run agent-collab session register" message on the next prompt.
 var ErrPathDrift = errors.New("store: marker path-drift — marker was moved or copied")
 
+// ErrReceiveModeMismatch is returned by daemon-mode verbs when the
+// session's receive_mode column does not match the verb's expectation
+// (Topic 3 §3.4 guarantee (b), verb-entry gate). `DaemonModeClaim` and
+// `DaemonModeComplete` require `receive_mode = 'daemon'`. Callers
+// translate this into the CLI-level EX_DATAERR (65) fail-loud surface.
+var ErrReceiveModeMismatch = errors.New("store: receive-mode mismatch — daemon verb invoked on non-daemon session")
+
+// ErrStaleClaim is returned by DaemonModeComplete when the completion
+// UPDATE matches zero rows (Topic 3 §3.4 guarantee (d), alpha §B). Zero
+// rows means the claim was reaped by the sweeper between claim-time and
+// complete-time — the daemon's work on that batch is rejected and the
+// sweeper-then-reclaim cycle redelivers on the next claim pass.
+var ErrStaleClaim = errors.New("store: stale claim — completion UPDATE matched 0 rows; claim was reaped")
+
 // Session identifies a (cwd, label) pair resolved from markers + env vars.
 type Session struct {
 	CWD   string
@@ -43,6 +57,17 @@ type InboxMessage struct {
 	Body       string
 	CreatedAt  string // ISO-8601 UTC
 	RoomKey    string
+}
+
+// ReapedClaim is one row returned by DaemonModeSweep. Keeps `ClaimOwner`
+// even though the sweep UPDATE sets `claimed_at = NULL` only — Topic 3
+// alpha §A fix preserves `claim_owner` as an audit trail so downstream
+// observability can surface which daemon's batch got reaped.
+type ReapedClaim struct {
+	ID         int64
+	ToCWD      string
+	ToLabel    string
+	ClaimOwner string
 }
 
 // Store is the minimal surface the hook binary needs. It is deliberately

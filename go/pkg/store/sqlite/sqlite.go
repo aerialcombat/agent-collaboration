@@ -328,5 +328,282 @@ func (s *SQLiteLocal) ReadUnread(ctx context.Context, self store.Session) ([]sto
 	return out, nil
 }
 
+// -----------------------------------------------------------------------------
+// Topic 3 v0 daemon-mode verbs (Go parity with scripts/peer-inbox-db.py
+// `_cmd_peer_receive_daemon_mode / _cmd_peer_receive_complete /
+// _cmd_peer_receive_sweep`). These methods serve the new `go/cmd/peer-inbox/`
+// binary + (later) the daemon binary in commit 7. They do not share rows
+// with the interactive `ReadUnread` path — the SQL partition (§3.4 (a),
+// `claimed_at IS NULL` in ReadUnread's WHERE) keeps daemon-claimed rows
+// invisible to interactive reads.
+// -----------------------------------------------------------------------------
+
+// sessionReceiveMode reads the receive_mode column for (cwd, label) or
+// returns "interactive" if the session row is missing or the column is
+// empty. Mirrors Python's `_sessions_receive_mode` (§3.4 guarantee (b)
+// verb-entry gate).
+func (s *SQLiteLocal) sessionReceiveMode(ctx context.Context, cwd, label string) (string, error) {
+	var mode sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT receive_mode FROM sessions WHERE cwd = ? AND label = ?",
+		cwd, label,
+	).Scan(&mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "interactive", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read receive_mode: %w", err)
+	}
+	if !mode.Valid || mode.String == "" {
+		return "interactive", nil
+	}
+	return mode.String, nil
+}
+
+// sessionDaemonState reads the daemon_state column for (cwd, label) or
+// returns "open" if the session row is missing or the column is empty.
+// Mirrors Python's `_sessions_daemon_state` (§3.4 guarantee (e) claim-
+// time closed-state check).
+func (s *SQLiteLocal) sessionDaemonState(ctx context.Context, cwd, label string) (string, error) {
+	var state sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT daemon_state FROM sessions WHERE cwd = ? AND label = ?",
+		cwd, label,
+	).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "open", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read daemon_state: %w", err)
+	}
+	if !state.Valid || state.String == "" {
+		return "open", nil
+	}
+	return state.String, nil
+}
+
+// DaemonModeClaim atomically claims all unclaimed, unread rows addressed
+// to `self` into daemon-mode state (SET claimed_at, claim_owner). Returns
+// the rows that this call claimed. Mirrors Python's
+// `_cmd_peer_receive_daemon_mode` (Topic 3 §2.1 + §3.4 (a)(b)(e)).
+//
+// Preflights:
+//   - §3.4 (b): session's receive_mode must be 'daemon'; else return
+//     store.ErrReceiveModeMismatch.
+//   - §3.4 (e): session's daemon_state must be 'open'; if 'closed',
+//     return an empty slice with no error (daemon is intentionally idle
+//     and sweeper-requeued rows must not trigger a new spawn).
+//
+// The UPDATE's WHERE includes `read_at IS NULL AND claimed_at IS NULL`,
+// which together with the writer lock make the claim atomic against
+// concurrent daemons and against the interactive hot path (which also
+// filters `claimed_at IS NULL`).
+func (s *SQLiteLocal) DaemonModeClaim(ctx context.Context, self store.Session) ([]store.InboxMessage, error) {
+	mode, err := s.sessionReceiveMode(ctx, self.CWD, self.Label)
+	if err != nil {
+		return nil, err
+	}
+	if mode != "daemon" {
+		return nil, store.ErrReceiveModeMismatch
+	}
+	state, err := s.sessionDaemonState(ctx, self.CWD, self.Label)
+	if err != nil {
+		return nil, err
+	}
+	if state == "closed" {
+		// §3.4 (e): closed-state preflight returns empty batch without
+		// mutating inbox. No error — caller (daemon) treats as "no work."
+		return nil, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE inbox
+		SET claimed_at = ?, claim_owner = ?
+		WHERE to_cwd = ? AND to_label = ?
+		  AND read_at IS NULL
+		  AND claimed_at IS NULL
+		RETURNING id, from_cwd, from_label, body, created_at, COALESCE(room_key, '')
+	`, now, self.Label, self.CWD, self.Label)
+	if err != nil {
+		return nil, fmt.Errorf("claim inbox: %w", err)
+	}
+
+	var out []store.InboxMessage
+	for rows.Next() {
+		var m store.InboxMessage
+		if err := rows.Scan(&m.ID, &m.FromCWD, &m.FromLabel, &m.Body, &m.CreatedAt, &m.RoomKey); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan claim row: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("claim rows err: %w", err)
+	}
+	rows.Close()
+
+	// Bump last_seen_at to mirror Python's bump_last_seen on the daemon
+	// session's row.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET last_seen_at = ?
+		WHERE cwd = ? AND label = ?
+	`, now, self.CWD, self.Label); err != nil {
+		return nil, fmt.Errorf("bump last_seen: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return out, nil
+}
+
+// DaemonModeComplete marks the caller's in-flight claim complete by
+// stamping completed_at on every row matching
+// `to_cwd, to_label, claim_owner = self.Label AND claimed_at IS NOT NULL
+// AND completed_at IS NULL`. Returns the list of ids completed on
+// success. Mirrors Python's `_cmd_peer_receive_complete` (§3.4 (d),
+// alpha §B).
+//
+// Zero-row UPDATE is fail-loud: the claim was reaped by the sweeper
+// between claim-time and complete-time, or was already completed. We
+// return store.ErrStaleClaim so the caller surfaces the contract
+// violation (the daemon's batch work is rejected; sweeper-then-reclaim
+// handles redelivery).
+//
+// Also preflights receive_mode='daemon' (§3.4 (b)) — calling --complete
+// against an interactive-mode session is a CLI-level mistake.
+func (s *SQLiteLocal) DaemonModeComplete(ctx context.Context, self store.Session) ([]int64, error) {
+	mode, err := s.sessionReceiveMode(ctx, self.CWD, self.Label)
+	if err != nil {
+		return nil, err
+	}
+	if mode != "daemon" {
+		return nil, store.ErrReceiveModeMismatch
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE inbox
+		SET completed_at = ?
+		WHERE to_cwd = ? AND to_label = ?
+		  AND claim_owner = ?
+		  AND claimed_at IS NOT NULL
+		  AND completed_at IS NULL
+		RETURNING id
+	`, now, self.CWD, self.Label, self.Label)
+	if err != nil {
+		return nil, fmt.Errorf("complete inbox: %w", err)
+	}
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan complete row: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("complete rows err: %w", err)
+	}
+	rows.Close()
+
+	if len(ids) == 0 {
+		// Don't commit — no work was done. ErrStaleClaim is the §3.4 (d)
+		// fail-loud signal.
+		return nil, store.ErrStaleClaim
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return ids, nil
+}
+
+// DaemonModeSweep reaps in-flight claims older than `ttl` by reverting
+// `claimed_at` to NULL. `claim_owner` is intentionally preserved as an
+// audit trail (Topic 3 alpha §A fix — DO NOT also nullify claim_owner).
+// Returns the reaped rows so callers can log which daemon's batch got
+// requeued. Mirrors Python's `_cmd_peer_receive_sweep` (§3.3).
+//
+// A row reaped by this pass re-appears in the next DaemonModeClaim call,
+// which is the recovery loop for the legitimate-slow-but-reaped race
+// (alpha §B).
+func (s *SQLiteLocal) DaemonModeSweep(ctx context.Context, ttl time.Duration) ([]store.ReapedClaim, error) {
+	reaped, _, err := s.DaemonModeSweepWithCutoff(ctx, ttl)
+	return reaped, err
+}
+
+// DaemonModeSweepWithCutoff is like DaemonModeSweep but also returns the
+// exact cutoff ISO-8601 string that appeared in the WHERE clause, so
+// CLI callers can emit it in JSON output without recomputing `now` on
+// their own (which would drift by up to a second from the actual
+// cutoff). Matches Python's single-value cutoff in the `--format json`
+// payload.
+func (s *SQLiteLocal) DaemonModeSweepWithCutoff(ctx context.Context, ttl time.Duration) ([]store.ReapedClaim, string, error) {
+	if ttl <= 0 {
+		return nil, "", fmt.Errorf("sweep ttl must be positive, got %v", ttl)
+	}
+	cutoff := time.Now().UTC().Add(-ttl).Format("2006-01-02T15:04:05Z")
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, cutoff, fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE inbox
+		SET claimed_at = NULL
+		WHERE claimed_at IS NOT NULL
+		  AND completed_at IS NULL
+		  AND claimed_at < ?
+		RETURNING id, to_cwd, to_label, claim_owner
+	`, cutoff)
+	if err != nil {
+		return nil, cutoff, fmt.Errorf("sweep inbox: %w", err)
+	}
+
+	var reaped []store.ReapedClaim
+	for rows.Next() {
+		var r store.ReapedClaim
+		var owner sql.NullString
+		if err := rows.Scan(&r.ID, &r.ToCWD, &r.ToLabel, &owner); err != nil {
+			rows.Close()
+			return nil, cutoff, fmt.Errorf("scan reap row: %w", err)
+		}
+		if owner.Valid {
+			r.ClaimOwner = owner.String
+		}
+		reaped = append(reaped, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, cutoff, fmt.Errorf("reap rows err: %w", err)
+	}
+	rows.Close()
+
+	if err := tx.Commit(); err != nil {
+		return nil, cutoff, fmt.Errorf("commit: %w", err)
+	}
+	return reaped, cutoff, nil
+}
+
 // Compile-time assertion: SQLiteLocal implements store.Store.
 var _ store.Store = (*SQLiteLocal)(nil)
