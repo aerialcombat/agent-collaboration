@@ -285,6 +285,13 @@ pi reset deletes the file from disk (§8.1 pi-specific extension). Topic
 **Prerequisites:** `pi --version` ≥ `0.67.68`, `ZAI_API_KEY` exported,
 operator has connectivity to GLM provider.
 
+> **Do NOT override `$HOME` for E8 isolation** — pi reads provider-auth
+> config from `~/.pi/agent/`; a re-pointed `$HOME` hides the operator's
+> credentials from the daemon-spawned pi. Isolate via
+> `AGENT_COLLAB_INBOX_DB=<path>` (daemon store) + `--pi-session-dir <path>`
+> (daemon session files) instead. Per test-engineer E8 supervised-probe
+> finding 2026-04-18.
+
 **Setup:**
 
 ```bash
