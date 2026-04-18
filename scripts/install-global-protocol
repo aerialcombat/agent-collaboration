@@ -22,6 +22,7 @@ PEER_INBOX_DAEMONS_DIR="$PEER_INBOX_HOME/daemons"
 PEER_INBOX_DAEMON_BIN="$BIN_DIR/agent-collab-daemon"
 PEER_INBOX_GO_CLI="$BIN_DIR/peer-inbox"
 PEER_INBOX_DAEMON_EXAMPLE_CFG="$PEER_INBOX_DAEMONS_DIR/example.json.disabled"
+PEER_INBOX_DAEMON_PI_EXAMPLE_CFG="$PEER_INBOX_DAEMONS_DIR/example-pi.json.disabled"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 CLAUDE_COMMANDS_DIR="$HOME/.claude/commands"
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
@@ -361,11 +362,50 @@ install_daemon_config_dir() {
   "log_path": "",
 
   "_arch_d_note": "Topic 3 v0.1 (Arch D) opt-in: set cli_session_resume=true to pass the CLI vendor's native session-ID into subsequent spawns (codex+gemini only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation. See docs/DAEMON-OPERATOR-GUIDE.md Arch D section.",
-  "cli_session_resume": false
+  "cli_session_resume": false,
+
+  "_pi_note": "For a --cli pi daemon (Topic 3 v0.2; pi-mono multi-provider), see example-pi.json.disabled in this dir for the nested pi: { provider, model, session_dir } sub-object shape."
 }
 EOF
   chmod 0644 "$PEER_INBOX_DAEMON_EXAMPLE_CFG"
   echo "installed: $PEER_INBOX_DAEMON_EXAMPLE_CFG"
+
+  # Topic 3 v0.2 pi example. Separate template because pi's required
+  # config shape (nested sub-object; pi.provider + pi.model MANDATORY)
+  # differs enough from codex/gemini that inlining both in one file
+  # would risk operators copying the wrong scaffold.
+  if [[ -f "$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG" ]]; then
+    echo "current: $PEER_INBOX_DAEMON_PI_EXAMPLE_CFG"
+  else
+    cat >"$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG" <<'EOF'
+{
+  "_note": "Topic 3 v0.2 pi daemon config template (multi-provider via badlogic/pi-mono). Copy to <label>.json, set pi.provider + pi.model to your chosen pair, ensure operator env has the matching provider auth (e.g. ZAI_API_KEY for zai-glm). Invoke: agent-collab-daemon --config <label>",
+
+  "label": "CHANGEME-reviewer-pi",
+  "cwd":   "CHANGEME-/absolute/path/to/workspace",
+  "session_key": "CHANGEME-stable-session-key-string",
+  "cli": "pi",
+
+  "ack_timeout":   300,
+  "sweep_ttl":     600,
+  "poll_interval": 2,
+  "pause_on_idle": 1800,
+
+  "log_path": "",
+
+  "cli_session_resume": true,
+
+  "_pi_note": "Topic 3 v0.2: pi.provider + pi.model MANDATORY; startup exits 64 if either is missing. session_dir optional (default $HOME/.agent-collab/pi-sessions). If pi.model is provider-qualified (e.g. 'openai/gpt-4o'), its prefix MUST match pi.provider or daemon startup rejects with exit 64. Env vars (operator responsibility): ZAI_API_KEY (zai-glm) / OPENAI_API_KEY (openai-codex) / ANTHROPIC_API_KEY (anthropic) / GEMINI_API_KEY (google) — run `pi --help` for the canonical env-var table. See docs/DAEMON-OPERATOR-GUIDE.md Architecture D pi sub-section.",
+  "pi": {
+    "provider":    "zai-glm",
+    "model":       "glm-4.6",
+    "session_dir": "$HOME/.agent-collab/pi-sessions"
+  }
+}
+EOF
+    chmod 0644 "$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG"
+    echo "installed: $PEER_INBOX_DAEMON_PI_EXAMPLE_CFG"
+  fi
 }
 
 remove_daemon_config_dir() {
@@ -375,6 +415,10 @@ remove_daemon_config_dir() {
   if [[ -f "$PEER_INBOX_DAEMON_EXAMPLE_CFG" ]]; then
     rm -f "$PEER_INBOX_DAEMON_EXAMPLE_CFG"
     echo "uninstalled: $PEER_INBOX_DAEMON_EXAMPLE_CFG"
+  fi
+  if [[ -f "$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG" ]]; then
+    rm -f "$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG"
+    echo "uninstalled: $PEER_INBOX_DAEMON_PI_EXAMPLE_CFG"
   fi
   if [[ -d "$PEER_INBOX_DAEMONS_DIR" ]]; then
     # rmdir fails non-empty; that's exactly the guard we want.

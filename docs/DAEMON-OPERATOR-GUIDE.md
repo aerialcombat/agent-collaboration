@@ -182,8 +182,13 @@ passes each CLI's native session-ID into subsequent spawn invocations,
 giving cross-spawn context continuity for `codex` and `gemini` daemons
 without the operational complexity of long-running CLI shells.
 
-Scope-doc reference: `plans/v3.x-topic-3-arch-d-scoping.md`. Manual
-operator probe protocol: [DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md).
+Scope-doc references:
+- `plans/v3.x-topic-3-arch-d-scoping.md` — v0.1 scope (codex + gemini +
+  claude asymmetry); v0.1.1/v0.1.2 patch changelogs appended.
+- `plans/v3.x-topic-3-v0.2-pi-scoping.md` — v0.2 scope (pi as 4th Arch D
+  CLI; additive path-as-identity semantics).
+
+Manual operator probe protocol: [DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md). Probes E5/E6 cover codex/gemini; §E8 covers pi + provider end-to-end round-trip. Required for the v0.2 closure tag per the v0.1.2 ship-closure meta-lesson (fake-binary gates don't validate real-CLI behavior).
 
 ### When to enable
 

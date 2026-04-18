@@ -274,15 +274,114 @@ diff /tmp/daemon-probe-e7/gemini-list-sessions-live-head.txt \
 3. Operator log entry recording the pinned versions for future
    drift-comparison.
 
+### Probe E8 — Pi `--session <PATH>` round-trip against live `pi 0.67+` + GLM
+
+**Intent:** the daemon mints `$pi.session_dir/$label.jsonl`, passes it to
+pi via `--session`, pi persists cross-spawn context to the file, and a
+subsequent spawn recalls context via the same path. Additionally validate
+pi reset deletes the file from disk (§8.1 pi-specific extension). Topic
+3 v0.2 §9.2 gate 6 + test-engineer §10.1 (E) add.
+
+**Prerequisites:** `pi --version` ≥ `0.67.68`, `ZAI_API_KEY` exported,
+operator has connectivity to GLM provider.
+
+**Setup:**
+
+```bash
+# Terminal 1 (driver):
+mkdir -p /tmp/daemon-probe-e8-driver && cd /tmp/daemon-probe-e8-driver
+agent-collab session register --label e8-driver --agent claude
+
+# Terminal 2 (daemon target — pi with zai-glm):
+mkdir -p /tmp/daemon-probe-e8-target && cd /tmp/daemon-probe-e8-target
+SESSION_KEY=$(uuidgen)
+AGENT_COLLAB_SESSION_KEY=$SESSION_KEY \
+  agent-collab session register \
+    --receive-mode daemon --agent pi \
+    --label e8-pi --cwd "$PWD"
+
+# Start daemon with Arch D opt-in + required pi fields.
+AGENT_COLLAB_SESSION_KEY=$SESSION_KEY \
+  agent-collab-daemon \
+    --label e8-pi --cwd "$PWD" \
+    --session-key "$SESSION_KEY" --cli pi \
+    --pi-provider zai-glm --pi-model glm-4.6 \
+    --cli-session-resume \
+    --log-path /tmp/daemon-probe-e8-target/daemon.log
+```
+
+**Probe:**
+
+```bash
+# Terminal 1 — batch 1: seed context.
+agent-collab peer send --as e8-driver --to e8-pi \
+  --message "first message. remember the word: cornflower. reply only with ACK1."
+
+# Wait for daemon batch 1 completion.
+CAPTURED_PATH=$(sqlite3 ~/.agent-collab/sessions.db \
+  "SELECT daemon_cli_session_id FROM sessions WHERE label='e8-pi'")
+echo "Captured path: $CAPTURED_PATH"
+# Expect: path ending in /pi-sessions/e8-pi.jsonl
+
+# Session file should exist on disk and contain pi turn JSONL.
+ls -l "$CAPTURED_PATH"
+wc -l "$CAPTURED_PATH"
+
+# Batch 2 — test context recall.
+agent-collab peer send --as e8-driver --to e8-pi \
+  --message "what word did I ask you to remember? reply with just that word."
+
+# Inspect daemon log: batch 2 spawn argv must reuse the cached path.
+grep 'daemon.spawn.exec' /tmp/daemon-probe-e8-target/daemon.log | tail -2
+# Expect: argv has "--session /path/to/e8-pi.jsonl" matching $CAPTURED_PATH.
+
+# Batch 3 — reset, then verify file is GONE.
+peer-inbox daemon-reset-session \
+  --cwd /tmp/daemon-probe-e8-target --as e8-pi --format json
+# Expect JSON payload: {"reset":true,"label":"e8-pi","deleted_file":"<path>"}
+ls "$CAPTURED_PATH" 2>&1 || echo "CONFIRMED: file deleted"
+
+# Batch 4 — after reset, context must NOT persist.
+agent-collab peer send --as e8-driver --to e8-pi \
+  --message "what word did I ask you to remember earlier? reply with just that word or NONE."
+# Expect: pi replies "NONE" (or similar non-cornflower), proving reset actually reset.
+```
+
+**Pass criteria:**
+1. After batch 1: `daemon_cli_session_id` non-NULL with path shape
+   (contains `/`) pointing to an existing JSONL file.
+2. Session file contains ≥1 JSONL line after batch 1 (pi wrote turn).
+3. Batch 2's spawn argv contains `--session <same-path>` AND pi's reply
+   quotes "cornflower" (proves vendor-side context preserved).
+4. `daemon-reset-session --format json` payload contains a
+   `"deleted_file": "<path>"` field + the file is GONE from disk.
+5. Batch 4's reply does NOT contain "cornflower" — reset actually reset.
+
+**Fail handling:**
+- If (1) column is NULL: capture failed. Inspect daemon log for
+  `pi_set_failed` or `pi_mkdir_failed` warnings.
+- If (2) file missing but column set: pi's own write path broke. Check
+  pi binary, provider auth, and `pi --help` for `--session` flag.
+- If (3) argv missing `--session` or pi reply does NOT recall context:
+  resume-on form is broken. Inspect `spawnPi` branch in
+  `go/cmd/daemon/main.go`.
+- If (4) file remains after reset: agent-gate or os.Remove broken.
+  Inspect `runResetSession` in `go/cmd/peer-inbox/main.go`.
+- If (5) reply still recalls "cornflower" after reset: pi is reading a
+  stale file (rare; check that file path is truly deleted and no
+  backup/`.deleted` artifact exists).
+
 ## Probe results template
 
 For each probe, record in your run log:
 
 ```
-Probe ID: E5
+Probe ID: E5 | E6 | E7 | E8
 Date: YYYY-MM-DD
-codex version: codex-cli X.Y.Z
-gemini version: <if applicable>
+codex version: codex-cli X.Y.Z   (E5, E7)
+gemini version: gemini X.Y.Z     (E6, E7)
+pi version: pi-mono X.Y.Z        (E8)
+provider + model: zai-glm / glm-4.6 (E8)
 Outcome: PASS | FAIL | PARTIAL
 Notes: <free-form observations, especially: did the regex / parser match?
         did vendor resume work? any unexpected stderr output? any
@@ -319,22 +418,34 @@ shipped without closing.
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
-- After bumping `codex` or `gemini` CLI to a new version (covers the
-  fixture-pin contract).
-- After modifying any of: `spawnCodex`, `spawnGemini`,
-  `parseGeminiListSessions`, `codexSessionIDRE`, or related helpers in
-  `go/cmd/daemon/main.go`.
+- Before tagging `v3.x-topic-3-v0.2-shipped` — E8 required for closure
+  (per v0.1.2 ship-closure meta-lesson: fake-binary gates don't validate
+  real-CLI behavior).
+- After bumping `codex`, `gemini`, or `pi` CLI to a new version (covers
+  the fixture-pin contract).
+- After modifying any of: `spawnCodex`, `spawnGemini`, `spawnPi`,
+  `parseGeminiListSessions`, `codexSessionIDRE`, `resolvePiSessionPath`,
+  or related helpers in `go/cmd/daemon/main.go`.
 - Before merging any PR that touches `tests/fixtures/cli-session/*`.
 
 ## References
 
 - [DAEMON-OPERATOR-GUIDE.md § Architecture D](./DAEMON-OPERATOR-GUIDE.md#architecture-d--cli-native-session-id-pass-through-v01-opt-in)
-  — operator-facing concepts.
+  — operator-facing concepts (includes v0.2 pi sub-section with provider-
+  auth env-var table + pi-specific reset semantics).
 - [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md) — Topic 3 v0 E2E probes
   (E1-E4); template this protocol mirrors.
 - `plans/v3.x-topic-3-arch-d-scoping.md` — v0.1 scope-doc; §6.1 + §6.2
   for capture strategy contracts.
-- `tests/daemon-cli-resume-codex.sh`, `tests/daemon-cli-resume-gemini.sh`
+- `plans/v3.x-topic-3-v0.2-pi-scoping.md` — v0.2 scope-doc; §3.4
+  invariants pi-reading (especially invariant 5 re-create-at-same-path);
+  §8.1 pi-specific reset semantics (file-delete gated on
+  `sessions.agent == 'pi'`).
+- `tests/daemon-cli-resume-codex.sh`, `tests/daemon-cli-resume-gemini.sh`,
+  `tests/daemon-cli-resume-pi.sh`, `tests/daemon-pi-session-lifecycle.sh`
   — shape-2 CI gates that fixtures pin against.
 - `tests/fixtures/cli-session/codex-banner.txt`,
-  `tests/fixtures/cli-session/gemini-list-sessions.txt` — pinned fixtures.
+  `tests/fixtures/cli-session/gemini-list-sessions.txt`,
+  `tests/fixtures/cli-session/pi-help.txt` — pinned fixtures (pi-help
+  uses grep-pattern + version-marker check per §10 Q2 ratification; NOT
+  full-diff).
