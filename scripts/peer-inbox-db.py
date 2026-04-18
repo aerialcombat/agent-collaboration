@@ -1777,19 +1777,133 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def format_hook_block(rows: list[sqlite3.Row]) -> str:
+def _row_get_optional(row, key: str):
+    """Safe accessor for optional sqlite3.Row / dict-like columns.
+
+    sqlite3.Row raises IndexError on missing keys rather than returning
+    None. Hook-path rows (ReadUnread / cmd_peer_receive RETURNING) omit
+    ``room_key``; daemon-side callers may pass richer rows. Single helper
+    so build_peer_inbox_envelope works against either shape without
+    conditional key-presence tests sprinkled at the call site.
+    """
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return None
+    return value
+
+
+def build_peer_inbox_envelope(
+    rows,
+    *,
+    to: dict | None = None,
+    continuity_summary: str | None = None,
+    state: str | None = None,
+    content_stop: bool | None = None,
+) -> dict:
+    """Build the canonical JSON envelope for a batch of inbox rows.
+
+    Returns a dict matching the §5.1 TypeScript ``PeerInboxEnvelope``
+    interface of ``plans/v3.x-topic-3-implementation-scope.md``. This is
+    the internal data structure that both v0 consumers of the peer-inbox
+    serializer share (§5.2):
+
+      1. The Option J hook path — ``format_hook_block`` wraps this
+         function and renders the ``<peer-inbox>...</peer-inbox>`` text
+         block for ``hookSpecificOutput.additionalContext``.
+      2. The daemon-mode prompt-injection path (commit 7 of Topic 3 v0)
+         — daemon serializes the envelope, injects the same text into a
+         spawned CLI's user-prompt input.
+
+    Both consumers must render byte-identical text for a given batch;
+    the shared internal schema is the natural enforcement.
+
+    The ``to`` field is the addressee (cwd + label + optional
+    workspace_id). Hook-side callers pass ``to=None`` because the hook
+    resolves the receiver implicitly via ``ResolveSelf`` — ``to`` is
+    omitted from the JSON in that case. Daemon-side callers know the
+    addressee and pass it in.
+
+    No ``ack.batch_id`` field is present — v0 single-batch-at-a-time
+    semantics (§5.1 + §7.3, alpha #8 + reason endorse) correlate
+    completion via ``claim_owner`` alone on the inbox table.
+    """
+    envelope: dict = {}
+    if to is not None:
+        envelope["to"] = to
+
+    messages: list[dict] = []
+    for r in rows:
+        entry: dict = {
+            "id": r["id"],
+            "from_cwd": r["from_cwd"],
+            "from_label": r["from_label"],
+            "body": r["body"],
+            "created_at": r["created_at"],
+        }
+        room_key = _row_get_optional(r, "room_key")
+        if room_key:
+            entry["room_key"] = room_key
+        messages.append(entry)
+    envelope["messages"] = messages
+
+    if continuity_summary is not None:
+        envelope["continuity_summary"] = continuity_summary
+    if state is not None:
+        envelope["state"] = state
+    if content_stop is not None:
+        envelope["content_stop"] = content_stop
+
+    return envelope
+
+
+def format_hook_block(
+    rows,
+    *,
+    to: dict | None = None,
+    continuity_summary: str | None = None,
+    state: str | None = None,
+    content_stop: bool | None = None,
+) -> str:
     """Compose the <peer-inbox>...</peer-inbox> block, capped at HOOK_BLOCK_BUDGET.
+
+    Thin wrapper around ``build_peer_inbox_envelope``: constructs the
+    canonical JSON envelope first, then renders it to the existing
+    byte-stable text format (§5.2 path (a) — structural refactor that
+    preserves byte-identical output against prior fixtures). The output
+    format is unchanged from the pre-envelope implementation; the
+    envelope is purely the internal data structure that two v0
+    consumers share.
 
     Budget counts UTF-8 bytes on both runtimes (W1 review idle-birch #3
     ruling: align Python to Go — bytes is the real constraint surface).
     Previously Python measured ``len(str)`` chars against a byte budget;
     multi-byte content (e.g. Korean, Chinese, emoji) under-counted, so
-    Python included ~3× more content than Go at the same cap."""
-    if not rows:
+    Python included ~3× more content than Go at the same cap.
+
+    The optional envelope fields (``to``, ``continuity_summary``,
+    ``state``, ``content_stop``) do not affect the rendered text block
+    in v0 — the hook path is message-only. Daemon-side rendering in
+    commit 7 may extend the text format to surface these fields; any
+    such change is a path (b) format-divergence and requires re-scoping
+    per §5.2. For v0 the extra kwargs are accepted-and-ignored here so
+    callers can build one envelope and pass it to either the JSON
+    serializer or this text serializer without rebuilding state.
+    """
+    # The extra kwargs are not consumed by the hook-text rendering in
+    # v0. Silencing-by-assignment keeps the signature stable for callers
+    # that build one envelope kwargs-dict and hand it to both JSON +
+    # text paths (daemon-commit-7 pattern).
+    del to, continuity_summary, state, content_stop
+
+    rows_list = list(rows)
+    if not rows_list:
         return ""
-    labels = sorted({r["from_label"] for r in rows})
+    envelope = build_peer_inbox_envelope(rows_list)
+    messages = envelope["messages"]
+    labels = sorted({m["from_label"] for m in messages})
     header = (
-        f'<peer-inbox messages="{len(rows)}" '
+        f'<peer-inbox messages="{len(messages)}" '
         f'from-session-labels="{",".join(labels)}">'
     )
     parts = [header]
@@ -1797,16 +1911,16 @@ def format_hook_block(rows: list[sqlite3.Row]) -> str:
     # budget. Truncation message (~60 bytes when triggered) is unaccounted
     # headroom; HOOK_BLOCK_BUDGET is a 4 KiB ceiling against ~hundreds-
     # of-bytes messages, so the approximation is safe. Keep this in sync
-    # with go/cmd/hook/main.go format_hook_block's accounting.
+    # with go/cmd/hook/main.go formatHookBlock's accounting.
     closing_tag = "</peer-inbox>"
     used = len(header.encode("utf-8")) + len(closing_tag.encode("utf-8"))
     included = 0
     truncated = 0
-    for r in rows:
-        entry = f"\n[{r['from_label']} @ {r['created_at']}]\n{r['body']}\n"
+    for m in messages:
+        entry = f"\n[{m['from_label']} @ {m['created_at']}]\n{m['body']}\n"
         entry_bytes = len(entry.encode("utf-8"))
         if used + entry_bytes > HOOK_BLOCK_BUDGET and included > 0:
-            truncated = len(rows) - included
+            truncated = len(messages) - included
             break
         parts.append(entry)
         used += entry_bytes

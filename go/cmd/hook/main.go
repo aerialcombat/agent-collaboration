@@ -39,6 +39,7 @@ import (
 	"strings"
 	"time"
 
+	"agent-collaboration/go/pkg/envelope"
 	"agent-collaboration/go/pkg/obs"
 	"agent-collaboration/go/pkg/store"
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
@@ -233,19 +234,76 @@ func hookBlockBudgetBytes() int {
 	return defaultHookBlockBudget
 }
 
+// buildPeerInboxEnvelope lifts a slice of InboxMessage rows into the
+// canonical envelope.Envelope schema (§5.1 of
+// plans/v3.x-topic-3-implementation-scope.md).
+//
+// Hook-side callers pass to=nil: the hook path resolves the recipient
+// implicitly via ResolveSelf so there's no need to embed it in the
+// envelope. Daemon-side callers that already know the addressee pass a
+// populated *envelope.Addressee; the same renderer consumes either
+// shape.
+//
+// This is step one of the path-(a) structural refactor (§5.2): the
+// schema becomes the internal data structure, but formatHookBlock
+// (below) still emits byte-identical text against the pre-refactor
+// fixtures.
+func buildPeerInboxEnvelope(
+	rows []store.InboxMessage,
+	to *envelope.Addressee,
+) envelope.Envelope {
+	msgs := make([]envelope.Message, 0, len(rows))
+	for _, r := range rows {
+		msgs = append(msgs, envelope.Message{
+			ID:        r.ID,
+			FromCWD:   r.FromCWD,
+			FromLabel: r.FromLabel,
+			Body:      r.Body,
+			CreatedAt: r.CreatedAt,
+			RoomKey:   r.RoomKey,
+		})
+	}
+	return envelope.BuildFromHookRows(msgs, to)
+}
+
 // formatHookBlock mirrors format_hook_block in scripts/peer-inbox-db.py —
 // byte-for-byte compatible so the Python CLI path and the Go hook path
 // render identical additionalContext strings. Callers MUST produce the
 // same output regardless of which language rendered it.
+//
+// Structured as a thin text renderer over buildPeerInboxEnvelope:
+// Topic 3 §5.2 path (a) — the canonical JSON schema is now the
+// internal data structure, but the text format is byte-identical to
+// the pre-refactor hand-rolled implementation. tests/hook-parity.sh
+// stays green; tests/envelope-round-trip.sh asserts the schema
+// round-trip preserves output.
 func formatHookBlock(rows []store.InboxMessage) string {
 	if len(rows) == 0 {
 		return ""
 	}
+	env := buildPeerInboxEnvelope(rows, nil)
+	return renderEnvelopeText(env)
+}
 
-	// labels = sorted({ r.FromLabel for r in rows })
-	labelSet := make(map[string]struct{}, len(rows))
-	for _, r := range rows {
-		labelSet[r.FromLabel] = struct{}{}
+// renderEnvelopeText serializes an envelope.Envelope into the Option J
+// <peer-inbox>...</peer-inbox> text block. The text format is fixed
+// by tests/hook-parity.sh fixtures; any divergence is a path (b) scope
+// creep per §5.2 and requires re-scoping before landing.
+//
+// v0 emits only the envelope's Messages; To / ContinuitySummary /
+// State / ContentStop are not yet surfaced in the hook-text rendering.
+// The daemon prompt-injection consumer (commit 7) uses the same text
+// byte-for-byte for the message-only case; future format extensions
+// for the optional fields are a path (b) decision out of scope here.
+func renderEnvelopeText(env envelope.Envelope) string {
+	if len(env.Messages) == 0 {
+		return ""
+	}
+
+	// labels = sorted({ m.FromLabel for m in env.Messages })
+	labelSet := make(map[string]struct{}, len(env.Messages))
+	for _, m := range env.Messages {
+		labelSet[m.FromLabel] = struct{}{}
 	}
 	labels := make([]string, 0, len(labelSet))
 	for l := range labelSet {
@@ -257,7 +315,7 @@ func formatHookBlock(rows []store.InboxMessage) string {
 	var b strings.Builder
 	header := fmt.Sprintf(
 		`<peer-inbox messages="%d" from-session-labels="%s">`,
-		len(rows), strings.Join(labels, ","),
+		len(env.Messages), strings.Join(labels, ","),
 	)
 	b.WriteString(header)
 	// Reserve space for the closing tag so the final block fits within
@@ -268,10 +326,10 @@ func formatHookBlock(rows []store.InboxMessage) string {
 	used := len(header) + len(closingTag)
 
 	included, truncated := 0, 0
-	for _, r := range rows {
-		entry := fmt.Sprintf("\n[%s @ %s]\n%s\n", r.FromLabel, r.CreatedAt, r.Body)
+	for _, m := range env.Messages {
+		entry := fmt.Sprintf("\n[%s @ %s]\n%s\n", m.FromLabel, m.CreatedAt, m.Body)
 		if used+len(entry) > budget && included > 0 {
-			truncated = len(rows) - included
+			truncated = len(env.Messages) - included
 			break
 		}
 		b.WriteString(entry)
