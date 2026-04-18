@@ -220,6 +220,32 @@ agent-collab-daemon --cli-session-resume --label reviewer-codex --cwd ... --cli 
 AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
 ```
 
+### Model selection
+
+The daemon does NOT enforce a default `pi.model` (per v0.3 §4.2
+ratification) — operators must supply one explicitly. The table below
+names the provider+model combinations validated end-to-end by
+mediator/test-engineer probes. Use these unless you have a specific
+reason to pick something else.
+
+| Provider            | Recommended model   | Auth source                    | Validated by                |
+|---------------------|---------------------|--------------------------------|-----------------------------|
+| `openai-codex`      | `gpt-5.3-codex`     | OAuth (`~/.pi/agent/auth.json`) | §E10a probe, v0.3 dogfood   |
+| `google-antigravity`| `gemini-3-flash`    | OAuth (`~/.pi/agent/auth.json`) | §E10b probe, v0.3 dogfood   |
+| `zai-glm` (plugin)  | `glm-4.6`           | `ZAI_GLM_API_KEY` env var      | §E8 probe, v0.2+ dogfood    |
+| `anthropic`         | — (not yet probed)  | `ANTHROPIC_API_KEY` OR `pi /login` | v0.4+ scoping             |
+
+Model versions pinned at v0.3 ship-closure date. Re-validate + update
+this table when pi-mono, pi-zai-glm, or vendor model names change.
+The §E10 / §E8 probe protocols in
+[DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md)
+cover the re-validation flow.
+
+Any pi-mono-supported provider+model combination is acceptable from the
+daemon's perspective (§4.4 model-provider coupling check is the only
+enforcement). Run `pi --list-models` for the full supported set on your
+pi install; check your provider's plugin/auth requirements independently.
+
 ### Per-CLI behavior
 
 - **Codex (`--cli codex`) — RETIRED v0.3 (SOFT SHIM).** Topic 3 v0.3
