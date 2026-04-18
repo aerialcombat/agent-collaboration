@@ -1,3 +1,11 @@
+# captured from stderr — real codex 0.121.0 emits banner + diagnostics
+# to stderr, not stdout. v0.1.2 fix landed at <commit-tbd>: daemon now
+# captures BOTH streams via execSpawn's io.MultiWriter+errBuf and
+# scans the concatenation in postSpawnCodexResumeHandling. Earlier v0.1
+# captured stdout only and missed the banner entirely on real CLI runs
+# (E5 probe surfaced the gap).
+#
+# Capture command: codex exec --skip-git-repo-check 'reply STOP' 2>FIXTURE 1>/dev/null
 Reading additional input from stdin...
 OpenAI Codex v0.121.0 (research preview)
 --------

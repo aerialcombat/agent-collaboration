@@ -157,29 +157,34 @@ if [[ -n "$STALE" ]]; then
 fi
 
 if (( is_stale )); then
-  # Emit to stdout (daemon captures stdout; stderr is inherited).
-  echo "Reading additional input from stdin..."
-  echo "OpenAI Codex v0.121.0 (research preview)"
-  echo "error: session not found: $STALE"
+  # v0.1.2 fix mirror: real codex 0.121.0 emits banner + diagnostics
+  # (including "session not found") to STDERR. Daemon now captures BOTH
+  # streams via execSpawn's io.MultiWriter+errBuf and concatenates them
+  # for the regex scan in postSpawnCodexResumeHandling.
+  echo "Reading additional input from stdin..." >&2
+  echo "OpenAI Codex v0.121.0 (research preview)" >&2
+  echo "error: session not found: $STALE" >&2
   exit 1
 fi
 
-# Normal path: emit codex-0.121.0 style banner with UUID + JSONL ack.
-echo "Reading additional input from stdin..."
-echo "OpenAI Codex v0.121.0 (research preview)"
-echo "--------"
-echo "workdir: /private/tmp/fake-codex"
-echo "model: gpt-5.4"
-echo "provider: openai"
-echo "approval: never"
-echo "sandbox: read-only"
-echo "reasoning effort: xhigh"
-echo "reasoning summaries: none"
-echo "session id: $UUID"
-echo "--------"
-echo 'user'
-echo 'codex'
-echo 'tokens used'
+# Normal path: emit codex-0.121.0 style banner to STDERR (matches real
+# codex output stream — v0.1.2 fix). JSONL ack marker stays on STDOUT
+# (it's the agent's mechanism-2 fallback ack, not codex CLI output).
+echo "Reading additional input from stdin..." >&2
+echo "OpenAI Codex v0.121.0 (research preview)" >&2
+echo "--------" >&2
+echo "workdir: /private/tmp/fake-codex" >&2
+echo "model: gpt-5.4" >&2
+echo "provider: openai" >&2
+echo "approval: never" >&2
+echo "sandbox: read-only" >&2
+echo "reasoning effort: xhigh" >&2
+echo "reasoning summaries: none" >&2
+echo "session id: $UUID" >&2
+echo "--------" >&2
+echo 'user' >&2
+echo 'codex' >&2
+echo 'tokens used' >&2
 echo '{"peer_inbox_ack": true}'
 exit 0
 EOF

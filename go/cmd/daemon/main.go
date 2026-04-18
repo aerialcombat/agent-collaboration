@@ -57,6 +57,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -139,13 +140,14 @@ var codexBannerSessionRE = regexp.MustCompile(`(?i)session id:\s*([0-9a-f-]{36})
 // drop a still-live UUID (next capture recovers) than wedge a stale
 // one across respawns.
 //
-// Scanned against the spawn's captured stdout buffer. execSpawn
-// currently inherits stderr to the daemon's stderr (operator-visible,
-// not captured), so if a future codex release writes the indicator
-// ONLY to stderr, stale detection may miss — the fallback safety
-// mechanism is the operator SQL escape hatch documented in §3.3
-// TERTIARY. Current codex 0.121.0 observed to write the indicator to
-// stdout alongside the banner.
+// Scanned against BOTH stdout AND stderr of the spawned codex (v0.1.2
+// fix — earlier draft only scanned stdout, but real codex 0.121.0 writes
+// the banner + most diagnostics to stderr; v0.1 acknowledged this risk
+// in code comments but shipped stdout-only capture, and E5 probe
+// confirmed the gap empirically). execSpawn now captures stderr into a
+// separate buffer (still also inherited via io.MultiWriter to the
+// daemon's stderr for real-time operator visibility), and
+// postSpawnCodexResumeHandling scans the concatenation of both streams.
 var codexStaleSessionRE = regexp.MustCompile(`(?i)(session not found|no such session|session .* not found|unknown session)`)
 
 // ---------------------------------------------------------------------------
@@ -1180,10 +1182,11 @@ func (d *daemon) spawnClaude(ctx context.Context, prompt string) (string, error)
 		"--settings", d.cfg.ClaudeSettingsPath,
 		prompt,
 	}
-	return d.execSpawn(ctx, "claude", args, map[string]string{
+	stdout, _, err := d.execSpawn(ctx, "claude", args, map[string]string{
 		// CLI-specific env-key for Claude.
 		"CLAUDE_SESSION_ID": d.cfg.SessionKey,
 	})
+	return stdout, err
 }
 
 // spawnCodex runs `codex exec --skip-git-repo-check <prompt>` with
@@ -1243,15 +1246,20 @@ func (d *daemon) spawnCodex(ctx context.Context, prompt string) (string, error) 
 		}
 	}
 
-	stdout, runErr := d.execSpawn(ctx, "codex", args, map[string]string{
+	stdout, stderr, runErr := d.execSpawn(ctx, "codex", args, map[string]string{
 		"CODEX_SESSION_ID": d.cfg.SessionKey,
 	})
 
 	// Best-effort capture / stale-detection. §3.4 invariant 5: any
 	// failure path here is a warning, never a fatal — the batch result
 	// (stdout, runErr) is returned unchanged to the caller.
+	//
+	// v0.1.2 fix: pass stderr alongside stdout — real codex 0.121.0
+	// emits the banner (and most diagnostics) to stderr; v0.1 only
+	// scanned stdout, missing the capture entirely on real CLI runs
+	// (E5 probe surfaced the gap).
 	if d.cfg.CLISessionResume {
-		d.postSpawnCodexResumeHandling(ctx, session, cachedSessionID, stdout, runErr)
+		d.postSpawnCodexResumeHandling(ctx, session, cachedSessionID, stdout, stderr, runErr)
 	}
 
 	return stdout, runErr
@@ -1299,17 +1307,27 @@ func (d *daemon) lookupCodexSessionID(ctx context.Context, session store.Session
 //   - All failures (no regex match, SQL error) are warnings — never
 //     propagated up; the batch result is untouched.
 //
-// Note on stderr vs stdout: execSpawn inherits stderr to the daemon's
-// stderr (operator-visible). The stale-UUID regex here scans the
-// captured stdout buffer only. If a future codex release writes the
-// "session not found" indicator solely to stderr, stale detection may
-// miss — safety mechanism is still §3.4 invariant 5's fresh-invocation
-// fallback: operator can SQL-escape-hatch the column per §3.3 TERTIARY.
-func (d *daemon) postSpawnCodexResumeHandling(ctx context.Context, session store.Session, cachedSessionID, stdout string, runErr error) {
+// Note on stderr vs stdout (v0.1.2 fix): real codex 0.121.0 emits the
+// session-id banner to STDERR, not stdout. v0.1 scanned stdout only,
+// missing the entire capture path on real CLI runs (E5 probe surfaced
+// the gap). v0.1.2 execSpawn now captures BOTH streams (stderr also
+// teed to operator's stderr via io.MultiWriter so real-time visibility
+// is preserved). postSpawnCodexResumeHandling concatenates both and
+// scans the combined buffer for the banner regex AND the stale-UUID
+// regex — covers any future codex version that splits its output
+// across streams differently.
+func (d *daemon) postSpawnCodexResumeHandling(ctx context.Context, session store.Session, cachedSessionID, stdout, stderr string, runErr error) {
+	// v0.1.2: scan the concatenation of stdout + stderr (newline-joined
+	// for clean line boundaries). Real codex 0.121.0 emits banner +
+	// most diagnostics to stderr; the JSONL ack marker (when the agent
+	// uses fallback mechanism 2) lives in stdout. Concatenation covers
+	// both streams without depending on per-codex-version stream choice.
+	combined := stdout + "\n" + stderr
+
 	// Stale-UUID-fallback path: we passed a cached UUID, the spawn
-	// errored, and the output suggests the CLI-side session is gone.
-	// Liberal match per task spec: "if uncertain, log + clear".
-	if cachedSessionID != "" && runErr != nil && codexStaleSessionRE.MatchString(stdout) {
+	// errored, and the combined output suggests the CLI-side session is
+	// gone. Liberal match per task spec: "if uncertain, log + clear".
+	if cachedSessionID != "" && runErr != nil && codexStaleSessionRE.MatchString(combined) {
 		d.log.Warn("daemon.cli_session_capture.codex_stale_uuid",
 			"label", d.cfg.Label,
 			"cached_uuid", cachedSessionID,
@@ -1345,12 +1363,13 @@ func (d *daemon) postSpawnCodexResumeHandling(ctx context.Context, session store
 		return
 	}
 
-	match := codexBannerSessionRE.FindStringSubmatch(stdout)
+	match := codexBannerSessionRE.FindStringSubmatch(combined)
 	if match == nil {
 		d.log.Warn("daemon.cli_session_capture.codex_no_match",
 			"label", d.cfg.Label,
 			"stdout_bytes", len(stdout),
-			"msg", "codex banner regex did not match; leaving daemon_cli_session_id NULL (fixture drift or banner-format change — next batch will re-attempt capture)",
+			"stderr_bytes", len(stderr),
+			"msg", "codex banner regex did not match in stdout+stderr; leaving daemon_cli_session_id NULL (fixture drift or banner-format change — next batch will re-attempt capture)",
 		)
 		return
 	}
@@ -1424,9 +1443,10 @@ func (d *daemon) spawnGemini(ctx context.Context, prompt string) (string, error)
 			"-p",
 			prompt,
 		}
-		return d.execSpawn(ctx, "gemini", args, map[string]string{
+		stdout, _, err := d.execSpawn(ctx, "gemini", args, map[string]string{
 			"GEMINI_SESSION_ID": d.cfg.SessionKey,
 		})
+		return stdout, err
 	}
 
 	// Arch D enabled. Consult the DB for a cached UUID — fresh store
@@ -1460,9 +1480,10 @@ func (d *daemon) spawnGemini(ctx context.Context, prompt string) (string, error)
 				"-p",
 				prompt,
 			}
-			return d.execSpawn(ctx, "gemini", args, map[string]string{
+			stdout, _, err := d.execSpawn(ctx, "gemini", args, map[string]string{
 				"GEMINI_SESSION_ID": d.cfg.SessionKey,
 			})
+			return stdout, err
 		default:
 			// UUID-not-found (stale) per §6.2 Resume subsection. Clear
 			// the column + fall through to capture path below.
@@ -1500,7 +1521,7 @@ func (d *daemon) spawnGemini(ctx context.Context, prompt string) (string, error)
 		"-p",
 		prompt,
 	}
-	out, spawnErr := d.execSpawn(ctx, "gemini", args, map[string]string{
+	out, _, spawnErr := d.execSpawn(ctx, "gemini", args, map[string]string{
 		"GEMINI_SESSION_ID": d.cfg.SessionKey,
 	})
 
@@ -1616,7 +1637,8 @@ func (d *daemon) runGeminiListSessions(ctx context.Context) (map[string]int, err
 		bin = override
 	}
 
-	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeoutSec := resolveGeminiListTimeoutSec()
+	listCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(listCtx, bin, "--list-sessions")
@@ -1633,11 +1655,35 @@ func (d *daemon) runGeminiListSessions(ctx context.Context) (map[string]int, err
 
 	if err := cmd.Run(); err != nil {
 		if listCtx.Err() == context.DeadlineExceeded {
-			return nil, fmt.Errorf("gemini --list-sessions timed out after 5s")
+			return nil, fmt.Errorf("gemini --list-sessions timed out after %ds (override via AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT)", timeoutSec)
 		}
 		return nil, fmt.Errorf("gemini --list-sessions: %w", err)
 	}
 	return parseGeminiListSessions([]byte(out.String())), nil
+}
+
+// resolveGeminiListTimeoutSec returns the effective timeout (in seconds)
+// for `gemini --list-sessions`. v0.1.2 fix: real gemini 0.38.2 takes
+// ~5.3s to enumerate against an operator-sized config (E6 probe surfaced
+// the gap; v0.1's hardcoded 5s deterministically missed). Default raised
+// to 15s; AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT env var lets operators
+// tune up further (very-large session stores) or down (CI / fixture
+// runs that want fast-fail).
+//
+// Invalid values (non-int, ≤0) fall back to the 15s default with no
+// error — capture-failure path per §3.4 invariant 5 catches downstream
+// problems anyway, so a config typo here shouldn't block the daemon.
+func resolveGeminiListTimeoutSec() int {
+	const defaultSec = 15
+	v := os.Getenv("AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT")
+	if v == "" {
+		return defaultSec
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return defaultSec
+	}
+	return n
 }
 
 // lookupGeminiSessionIndex re-queries `gemini --list-sessions` and
@@ -1744,13 +1790,21 @@ func (d *daemon) clearCachedGeminiSessionID(ctx context.Context) {
 // execSpawn is the shared spawn implementation. Stdin is always
 // /dev/null (even for Claude — prevents the interactive-stdin hang
 // trap across all three). Stdout is captured for the ack-marker
-// scanner; stderr is written to the daemon's log stream.
+// scanner; stderr is captured for codex banner regex (v0.1.2 fix —
+// real codex 0.121.0 writes banner + diagnostics to stderr, not stdout)
+// AND inherited via io.MultiWriter to the daemon's own stderr so
+// operators still see CLI errors in real time.
+//
+// Returns (stdout, stderr, err). Callers that only care about stdout
+// (claude/gemini ack-marker scan, empty-response check) can _-discard
+// the stderr return; callers that need both streams (codex Arch D
+// post-spawn handling) use both.
 //
 // Per-CLI env vars are merged with the daemon-neutral vars:
 //   - AGENT_COLLAB_SESSION_KEY=<session-key>    (hook SESSION_KEY_ENV_CANDIDATES fallback)
 //   - AGENT_COLLAB_DAEMON_SPAWN=1               (§3.4 (f) hook short-circuit)
 //   - PATH                                      (inherited from daemon process)
-func (d *daemon) execSpawn(ctx context.Context, bin string, args []string, extraEnv map[string]string) (string, error) {
+func (d *daemon) execSpawn(ctx context.Context, bin string, args []string, extraEnv map[string]string) (string, string, error) {
 	// Allow tests / operator overrides: if AGENT_COLLAB_DAEMON_<bin>_BIN
 	// is set, use that path instead of PATH-resolving "claude"/etc.
 	// This is how tests/daemon-*.sh inject fake CLIs without relying
@@ -1799,11 +1853,13 @@ func (d *daemon) execSpawn(ctx context.Context, bin string, args []string, extra
 	}
 	cmd.Env = env
 
-	// Capture stdout for ack-marker scanning; inherit stderr so agent
-	// errors surface to the daemon's stderr (operator can see them).
-	var outBuf strings.Builder
+	// Capture stdout for ack-marker scanning. Capture stderr too (v0.1.2
+	// fix — codex banner lives on stderr) AND tee to the daemon's own
+	// stderr via io.MultiWriter so operators still see CLI errors in
+	// real time.
+	var outBuf, errBuf strings.Builder
 	cmd.Stdout = &outBuf
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
 
 	d.log.Info("daemon.spawn.exec",
 		"bin", bin,
@@ -1817,11 +1873,11 @@ func (d *daemon) execSpawn(ctx context.Context, bin string, args []string, extra
 	// ctx.Err()==DeadlineExceeded; normalize.
 	if runErr != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return outBuf.String(), context.DeadlineExceeded
+			return outBuf.String(), errBuf.String(), context.DeadlineExceeded
 		}
-		return outBuf.String(), runErr
+		return outBuf.String(), errBuf.String(), runErr
 	}
-	return outBuf.String(), nil
+	return outBuf.String(), errBuf.String(), nil
 }
 
 // setOrAppendEnv replaces or adds KEY=VAL in an env slice.

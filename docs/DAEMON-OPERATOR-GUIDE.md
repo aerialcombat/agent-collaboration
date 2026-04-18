@@ -251,6 +251,26 @@ AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
     agent-collab-daemon --config reviewer-gemini
   ```
 
+  **Tuning the `--list-sessions` timeout (v0.1.2 fix).** Real
+  `gemini --list-sessions` enumeration time scales with the size of the
+  session store. v0.1's hardcoded 5s timeout deterministically missed
+  on operator-sized configs (E6 probe measured ~5.3s on a typical
+  config). v0.1.2 raised the default to **15s** and added an env
+  override:
+
+  ```bash
+  # Tune --list-sessions timeout — values in seconds. Default 15s.
+  AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT=30 \
+    AGENT_COLLAB_CLI_SESSION_RESUME=1 \
+    agent-collab-daemon --config reviewer-gemini
+  ```
+
+  Bump higher for very-large session stores (operator's `~/.gemini/`
+  with thousands of sessions); bump lower for CI / fixture runs that
+  want fast-fail on enumeration. Invalid values (non-int, ≤0) silently
+  fall back to the 15s default — capture-failure is non-fatal per
+  §3.4 invariant 5, so a config typo here does not block the daemon.
+
 ### Known asymmetry: Claude
 
 `claude -p` (the form `agent-collab-daemon` uses for spawns) does not

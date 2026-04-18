@@ -802,4 +802,197 @@ grep -q "^ENV\[GEMINI_CONFIG_DIR\]=$GEMINI_CFG_DIR$" <<<"$block1" \
 
 echo "   (5f) ok — GEMINI_CONFIG_DIR propagated ($GEMINI_CFG_DIR)"
 
-echo "PASS: daemon-cli-resume-gemini — 5a/5a-translation/5b/5c/5d/5e/5f all behave per §9.3 gate 5 + §3.4 invariants 1/2/5"
+# =============================================================================
+# Subtest (5g) — v0.1.2 fix: --list-sessions timeout configurable + 15s default.
+#
+# E6 probe surfaced that real gemini 0.38.2 takes ~5.3s to enumerate
+# against an operator-sized config. v0.1's hardcoded 5s deterministically
+# missed. v0.1.2 fix: default raised to 15s; AGENT_COLLAB_DAEMON_GEMINI_
+# LIST_TIMEOUT env var lets operators tune.
+#
+# This subtest exercises the env override by setting it to a small value
+# (3s) AND making the fake stub deliberately slow (sleep 5s on
+# --list-sessions). With the override at 3s, the BEFORE snapshot must
+# fail with a timeout-shaped error message containing "timed out after 3s"
+# in the daemon log. With the env unset (default 15s) and the same 5s
+# sleep, the BEFORE snapshot succeeds and capture proceeds normally.
+# =============================================================================
+step "(5g) --list-sessions timeout: env override (AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT) + 15s default"
+
+CWD_G="$TMP/daemon-g"
+register_daemon "$CWD_G" "d-5g" "key-5g"
+
+# Build a slow fake gemini: sleeps 5 seconds before responding to
+# --list-sessions, otherwise behaves like the standard fake (state file
+# + spawn log).
+FAKE_GEMINI_SLOW="$TMP/fake-gemini-slow.sh"
+cat > "$FAKE_GEMINI_SLOW" <<'EOF'
+#!/usr/bin/env bash
+set -u
+STATE="${FAKE_GEMINI_STATE_FILE:?FAKE_GEMINI_STATE_FILE required}"
+LOG="${FAKE_GEMINI_SPAWN_LOG:?FAKE_GEMINI_SPAWN_LOG required}"
+NEW_UUID="${FAKE_GEMINI_NEW_UUID:-}"
+EXTRA_UUID="${FAKE_GEMINI_EXTRA_UUID:-}"
+SLEEP_SEC="${FAKE_GEMINI_LIST_SLEEP_SEC:-0}"
+
+is_list=0
+for a in "$@"; do
+  if [[ "$a" == "--list-sessions" ]]; then is_list=1; fi
+done
+
+if (( is_list )); then
+  if [[ "$SLEEP_SEC" != "0" ]]; then sleep "$SLEEP_SEC"; fi
+  if [[ -s "$STATE" ]]; then
+    n="$(wc -l < "$STATE" | tr -d ' ')"
+    echo "Available sessions for this project ($n):"
+    i=1
+    while IFS= read -r u; do
+      [[ -z "$u" ]] && continue
+      printf "  %d. test-prompt (now) [%s]\n" "$i" "$u"
+      i=$((i+1))
+    done < "$STATE"
+  else
+    echo "Available sessions for this project (0):"
+  fi
+  exit 0
+fi
+
+# Spawn (-p) path: append argv + env to spawn log; optionally append
+# new UUID(s) to state file; emit JSONL ack.
+{
+  echo "---SPAWN---"
+  echo "ARGV_COUNT=$#"
+  i=0
+  for a in "$@"; do
+    echo "ARGV[$i]=$a"
+    i=$((i+1))
+  done
+  for k in AGENT_COLLAB_DAEMON_SPAWN AGENT_COLLAB_SESSION_KEY GEMINI_SESSION_ID GEMINI_CONFIG_DIR; do
+    v="${!k-}"
+    echo "ENV[$k]=$v"
+  done
+} >> "$LOG"
+
+if [[ -n "$NEW_UUID" ]]; then
+  tmp_state="$(mktemp)"
+  echo "$NEW_UUID" > "$tmp_state"
+  if [[ -n "$EXTRA_UUID" ]]; then echo "$EXTRA_UUID" >> "$tmp_state"; fi
+  if [[ -s "$STATE" ]]; then cat "$STATE" >> "$tmp_state"; fi
+  mv "$tmp_state" "$STATE"
+fi
+
+( read -t 1 _ ) 2>/dev/null || true
+echo '{"peer_inbox_ack": true}'
+exit 0
+EOF
+chmod +x "$FAKE_GEMINI_SLOW"
+
+STATE_G="$TMP/state-5g.txt"
+: > "$STATE_G"
+LOG_5G_OVERRIDE="$TMP/daemon-5g-override.log"
+SPAWN_5G_OVERRIDE="$TMP/spawn-5g-override.log"
+: > "$SPAWN_5G_OVERRIDE"
+
+# Local helper: run daemon with custom ack-timeout (BEFORE snapshot's
+# blocking sleep would exceed the run_daemon_until_spawn_count helper's
+# hardcoded 5s ack-timeout, so we need a roomier window for 5g).
+# Polls for a regex in the log file; kills daemon when seen OR after
+# wait_secs elapsed.
+run_daemon_for_5g() {
+  local label="$1" cwd="$2" key="$3" dlog="$4" spawn_log="$5" want_log_re="$6" wait_secs="$7"
+  shift 7
+  python3 -c "
+import sqlite3
+c = sqlite3.connect('$DB')
+c.execute(\"UPDATE inbox SET claimed_at = NULL, completed_at = NULL WHERE to_label = '$label'\")
+c.execute(\"UPDATE sessions SET daemon_state = 'open', daemon_cli_session_id = NULL WHERE label = '$label'\")
+c.commit()
+c.close()
+"
+  (
+    export AGENT_COLLAB_DAEMON_GEMINI_BIN="$FAKE_GEMINI_SLOW"
+    export FAKE_GEMINI_SPAWN_LOG="$spawn_log"
+    for kv in "$@"; do
+      # shellcheck disable=SC2163
+      export "$kv"
+    done
+    "$DAEMON" \
+      --label "$label" \
+      --cwd "$cwd" \
+      --session-key "$key" \
+      --cli gemini \
+      --cli-session-resume \
+      --ack-timeout 30 \
+      --sweep-ttl 61 \
+      --poll-interval 1 \
+      --log-path "$dlog" \
+      >/dev/null 2>&1 &
+    echo $! > "$TMP/daemon-${label}.pid"
+  )
+  local pid; pid="$(cat "$TMP/daemon-${label}.pid")"
+
+  local waited=0
+  local found=0
+  while (( waited < wait_secs * 2 )); do
+    if [[ -f "$dlog" ]] && grep -qE "$want_log_re" "$dlog" 2>/dev/null; then
+      found=1
+      break
+    fi
+    sleep 0.5
+    waited=$((waited+1))
+  done
+  # A beat for any post-event capture writes.
+  sleep 1
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$TMP/daemon-${label}.pid"
+  return $((1 - found))
+}
+
+# (5g-i) Override = 3s, slow stub sleeps 5s → BEFORE snapshot must
+# timeout with "timed out after 3s" in the daemon log.
+UUID_G="9999cccc-bbbb-4aaa-8aaa-cccccccccccc"
+send_one "$SEND_CWD" "key-send" "d-5g" "$CWD_G" "g-msg-override"
+run_daemon_for_5g "d-5g" "$CWD_G" "key-5g" "$LOG_5G_OVERRIDE" "$SPAWN_5G_OVERRIDE" \
+  'timed out after 3s' 25 \
+  "FAKE_GEMINI_STATE_FILE=$STATE_G" \
+  "FAKE_GEMINI_NEW_UUID=$UUID_G" \
+  "FAKE_GEMINI_LIST_SLEEP_SEC=5" \
+  "AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT=3" \
+  || { tail -40 "$LOG_5G_OVERRIDE" >&2; fail "(5g-i) expected 'timed out after 3s' in daemon log; env override AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT=3 not honored"; }
+grep -q 'override via AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT' "$LOG_5G_OVERRIDE" \
+  || { tail -40 "$LOG_5G_OVERRIDE" >&2; fail "(5g-i) timeout error message must mention env var name for operator discoverability"; }
+
+echo "   (5g-i) ok — env override AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT=3 honored; BEFORE snapshot timed out cleanly"
+
+# (5g-ii) Default (env unset) + 5s sleep → BEFORE snapshot succeeds
+# (15s default >> 5s sleep). Wait until we observe a successful spawn
+# (---SPAWN--- in spawn log) which proves the BEFORE call returned
+# without timeout. Capture column gets the new UUID via delta-snapshot.
+LOG_5G_DEFAULT="$TMP/daemon-5g-default.log"
+SPAWN_5G_DEFAULT="$TMP/spawn-5g-default.log"
+: > "$SPAWN_5G_DEFAULT"
+: > "$STATE_G"
+UUID_G2="aaaaeeee-bbbb-4ccc-8ddd-aaaaaaaaaaaa"
+send_one "$SEND_CWD" "key-send" "d-5g" "$CWD_G" "g-msg-default"
+# AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT NOT set → default 15s.
+# Wait for the captured-event log line, which proves capture succeeded.
+run_daemon_for_5g "d-5g" "$CWD_G" "key-5g" "$LOG_5G_DEFAULT" "$SPAWN_5G_DEFAULT" \
+  'gemini_captured' 25 \
+  "FAKE_GEMINI_STATE_FILE=$STATE_G" \
+  "FAKE_GEMINI_NEW_UUID=$UUID_G2" \
+  "FAKE_GEMINI_LIST_SLEEP_SEC=5" \
+  || { tail -60 "$LOG_5G_DEFAULT" >&2; fail "(5g-ii) expected daemon.cli_session_capture.gemini_captured log; default 15s timeout did NOT survive 5s --list-sessions latency"; }
+
+col_default="$(get_column "$CWD_G" "d-5g")"
+[[ "$col_default" == "$UUID_G2" ]] \
+  || { tail -60 "$LOG_5G_DEFAULT" >&2; fail "(5g-ii) expected captured UUID $UUID_G2; got '$col_default'"; }
+# Negative check: default-path log must NOT mention the timeout error.
+if grep -q 'timed out after' "$LOG_5G_DEFAULT"; then
+  tail -60 "$LOG_5G_DEFAULT" >&2
+  fail "(5g-ii) default 15s should NOT timeout on a 5s sleep — but log mentions 'timed out after'"
+fi
+
+echo "   (5g-ii) ok — 15s default survived 5s --list-sessions latency; capture succeeded ($UUID_G2)"
+
+echo "PASS: daemon-cli-resume-gemini — 5a/5a-translation/5b/5c/5d/5e/5f/5g all behave per §9.3 gate 5 + §3.4 invariants 1/2/5"

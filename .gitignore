@@ -16,3 +16,7 @@ poll_messages.sh
 .agent-collab/daemon/
 *.daemon.pid
 *.daemon.log
+
+# Claude Code per-user local settings + worktrees
+.claude/settings.local.json
+.claude/worktrees/
