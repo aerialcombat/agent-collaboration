@@ -158,15 +158,31 @@ c.close()
   local bin_env_key
   case "$cli_kind" in
     claude) bin_env_key="AGENT_COLLAB_DAEMON_CLAUDE_BIN" ;;
-    codex)  bin_env_key="AGENT_COLLAB_DAEMON_CODEX_BIN" ;;
-    gemini) bin_env_key="AGENT_COLLAB_DAEMON_GEMINI_BIN" ;;
+    # v0.3 SOFT SHIM: --cli=codex / --cli=gemini route through spawnPi,
+    # so the fake binary must be bound to the PI bin-override env var.
+    # CODEX_BIN / GEMINI_BIN are retained as constants only for the
+    # claude asymmetry test, if any; under v0.3 both resolve to the pi
+    # execSpawn path.
+    codex)  bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN" ;;
+    gemini) bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN" ;;
     pi)     bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN" ;;
   esac
 
+  # v0.3: --cli=pi / codex / gemini all route through spawnPi and require
+  # pi.model (codex + gemini auto-populate pi.provider via the SOFT SHIM).
+  # Add the required pi args so the shim preflight passes in all three.
   local extra_args_str=""
-  if [[ "$cli_kind" == "pi" ]]; then
-    extra_args_str="--pi-provider zai-glm --pi-model glm-4.6 --pi-session-dir $TMP/pi-sessions-harness"
-  fi
+  case "$cli_kind" in
+    pi)
+      extra_args_str="--pi-provider zai-glm --pi-model glm-4.6 --pi-session-dir $TMP/pi-sessions-harness"
+      ;;
+    codex)
+      extra_args_str="--pi-model gpt-5.3-codex --pi-session-dir $TMP/pi-sessions-harness"
+      ;;
+    gemini)
+      extra_args_str="--pi-model gemini-3-flash --pi-session-dir $TMP/pi-sessions-harness"
+      ;;
+  esac
 
   (
     export "$bin_env_key=$fake_cli"
@@ -240,13 +256,16 @@ for cli_kind in claude codex gemini pi; do
       grep -q '^ENV\[CLAUDE_SESSION_ID\]=key-daemon$' <<<"$out" \
         || { echo "$out"; fail "$cli_kind: CLAUDE_SESSION_ID not set"; }
       ;;
-    codex)
-      grep -q '^ENV\[CODEX_SESSION_ID\]=key-daemon$' <<<"$out" \
-        || { echo "$out"; fail "$cli_kind: CODEX_SESSION_ID not set"; }
-      ;;
-    gemini)
-      grep -q '^ENV\[GEMINI_SESSION_ID\]=key-daemon$' <<<"$out" \
-        || { echo "$out"; fail "$cli_kind: GEMINI_SESSION_ID not set"; }
+    codex|gemini)
+      # v0.3 §3.2.b SOFT SHIM: codex/gemini route through spawnPi; the
+      # vendor-specific CODEX_SESSION_ID / GEMINI_SESSION_ID env vars
+      # are NOT set under the shim (spawnPi sets no per-CLI env). The
+      # pi-side surface is validated via the pi iteration's
+      # ZAI_GLM_API_KEY check. A regression where shim accidentally
+      # set CODEX_SESSION_ID would be harmless but surprising; no
+      # positive gate for the absence here (the §9.2 gate 12 revise
+      # plan covers the split assertions).
+      :
       ;;
     pi)
       # Pi has no dedicated session-ID env var (daemon owns path, not
@@ -261,27 +280,27 @@ for cli_kind in claude codex gemini pi; do
 done
 
 # =============================================================================
-# (2) codex stdin-close — stdin should be EOF immediately (daemon
-#     passed /dev/null-equivalent). The fake CLI's read -t 1 elapsed
-#     time is our fence; should be ~0s, never 1s.
+# (2) stdin-close — shared execSpawn invariant across all CLIs. The
+#     pi spawn (and pi-routed codex/gemini under v0.3 SOFT SHIM) all
+#     share the same execSpawn path, so /dev/null stdin should be
+#     uniform. Probe via the pi iteration which is the canonical
+#     non-claude path.
 # =============================================================================
-step "(2) codex stdin-close (no hang on open stdin)"
-run_one_spawn "codex" "$FAKE_SHARED"
+step "(2) pi (and pi-routed codex/gemini) stdin-close (no hang on open stdin)"
+run_one_spawn "pi" "$FAKE_SHARED"
 stdin_elapsed="$(grep '^STDIN_READ_ELAPSED_SEC=' "$FAKE_CLI_OUT" | head -1 | cut -d= -f2)"
 [[ "$stdin_elapsed" == "0" ]] \
-  || fail "codex stdin was not closed (elapsed=${stdin_elapsed}s); daemon should pass /dev/null"
-echo "   codex stdin read EOF immediately (elapsed=${stdin_elapsed}s)"
+  || fail "pi stdin was not closed (elapsed=${stdin_elapsed}s); daemon should pass /dev/null"
+echo "   pi stdin read EOF immediately (elapsed=${stdin_elapsed}s)"
 
 # =============================================================================
-# (3) codex --skip-git-repo-check present in argv
+# (3) v0.3 SOFT SHIM — codex-direct argv assertions RETIRED.
+# The v0.2 `exec` argv[0] + `--skip-git-repo-check` checks no longer
+# apply: --cli=codex routes through spawnPi, which emits
+# `--provider openai-codex --model <M> --no-session -p <prompt>`.
+# See tests/daemon-collapse-migration.sh for the shim-argv regression.
 # =============================================================================
-step "(3) codex --skip-git-repo-check present in spawn argv"
-run_one_spawn "codex" "$FAKE_SHARED"
-grep -q '^ARGV\[.\]=--skip-git-repo-check$' "$FAKE_CLI_OUT" \
-  || { cat "$FAKE_CLI_OUT"; fail "codex spawn argv missing --skip-git-repo-check"; }
-grep -q '^ARGV\[0\]=exec$' "$FAKE_CLI_OUT" \
-  || { cat "$FAKE_CLI_OUT"; fail "codex spawn argv[0] should be 'exec'"; }
-echo "   codex argv[0]=exec + --skip-git-repo-check both present"
+step "(3) RETIRED v0.3 — codex-direct argv assertions moved to daemon-collapse-migration.sh"
 
 # =============================================================================
 # (4) Claude --settings MANDATORY fixture-pin (§4 bullet 5 + §8.2

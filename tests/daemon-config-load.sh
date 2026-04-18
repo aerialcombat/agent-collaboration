@@ -98,7 +98,8 @@ cat >"$CFG_PATH" <<EOF
   "label": "d-recv",
   "cwd": "$DAEMON_CWD",
   "session_key": "key-d",
-  "cli": "codex",
+  "cli": "pi",
+  "pi": { "provider": "zai-glm", "model": "glm-4.6" },
   "ack_timeout": 1,
   "sweep_ttl": 3,
   "poll_interval": 1,
@@ -153,7 +154,8 @@ cat >"$CFG_BAD" <<EOF
   "label": "d-recv",
   "cwd": "$DAEMON_CWD",
   "session_key": "key-d",
-  "cli": "codex",
+  "cli": "pi",
+  "pi": { "provider": "zai-glm", "model": "glm-4.6" },
   "ack_timeout": 10,
   "sweep_ttl": 5
 }

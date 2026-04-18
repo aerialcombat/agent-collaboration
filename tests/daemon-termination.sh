@@ -114,16 +114,30 @@ chmod +x "$FAKE_EMPTY"
 # Stdin passed as nil; stderr + stdout combined to the log path.
 start_daemon_bg() {
   local cli="$1" fake="$2" log="$3" pause="${4:-1800}"
+  # v0.3 SOFT SHIM: codex + gemini route through spawnPi, so the fake
+  # binary binds to PI_BIN for those paths. Claude unchanged.
   local bin_env_key
+  local extra_args_str=""
   case "$cli" in
     claude) bin_env_key="AGENT_COLLAB_DAEMON_CLAUDE_BIN" ;;
-    codex)  bin_env_key="AGENT_COLLAB_DAEMON_CODEX_BIN" ;;
-    gemini) bin_env_key="AGENT_COLLAB_DAEMON_GEMINI_BIN" ;;
+    codex)
+      bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN"
+      extra_args_str="--pi-model gpt-5.3-codex --pi-session-dir $TMP/pi-sessions"
+      ;;
+    gemini)
+      bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN"
+      extra_args_str="--pi-model gemini-3-flash --pi-session-dir $TMP/pi-sessions"
+      ;;
+    pi)
+      bin_env_key="AGENT_COLLAB_DAEMON_PI_BIN"
+      extra_args_str="--pi-provider zai-glm --pi-model glm-4.6 --pi-session-dir $TMP/pi-sessions"
+      ;;
   esac
   (
     export "$bin_env_key=$fake"
     export FAKE_CLI_COUNTER="$TMP/fake-counter.txt"
     echo 0 > "$FAKE_CLI_COUNTER"
+    # shellcheck disable=SC2086
     "$DAEMON" \
       --label daemon-recv \
       --cwd "$DAEMON_CWD" \
@@ -134,6 +148,7 @@ start_daemon_bg() {
       --poll-interval 1 \
       --pause-on-idle "$pause" \
       --log-path "$log" \
+      $extra_args_str \
       >/dev/null 2>&1 &
     echo $! > "$TMP/daemon.pid"
   )

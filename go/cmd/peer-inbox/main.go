@@ -40,6 +40,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"agent-collaboration/go/pkg/store"
@@ -556,15 +557,23 @@ func runResetSession(args []string) int {
 		return exitInternal
 	}
 
-	// Topic 3 v0.2 §8.1 pi-specific file-delete side-effect. Gate on
-	// sessions.agent == 'pi' (correctness boundary — cross-CLI reset-
-	// isolation per §9.2 gate D). NotExist tolerance defends against a
-	// cached path pointing to an already-deleted file AND as a safety
-	// net in case a future refactor accidentally invoked os.Remove on
-	// a non-pi row (UUID strings from codex/gemini interpreted as
-	// $CWD-relative paths will silently no-op on NotExist).
+	// Topic 3 v0.2 §8.1 pi-specific file-delete side-effect, widened
+	// for v0.3 §3.3 Shape β WIDE + path-shape guard:
+	//   - Agent gate: sessions.agent IN {pi, codex, gemini}. Covers
+	//     shim-backed rows (--cli=codex / --cli=gemini routed through
+	//     spawnPi in v0.3) while excluding claude-direct (which stays
+	//     NULL-only per v0.1 §4.3 asymmetry).
+	//   - Path-shape guard: only invoke os.Remove when cachedPath
+	//     contains "/" (path-like). Pre-v0.3 legacy UUID values in
+	//     codex/gemini rows don't contain "/" and are skipped — this
+	//     preserves the v0.2 4e/5h cross-CLI-reset-isolation invariants
+	//     (a UUID pre-populated via test fixture stays untouched).
+	// NotExist tolerance on os.Remove handles the "path existed but
+	// file was already deleted" case; §3.4 invariant 3 guarantees
+	// reset is safe-to-spam.
 	deletedPath := ""
-	if agent == "pi" && cachedPath != "" {
+	shimmableAgent := agent == "pi" || agent == "codex" || agent == "gemini"
+	if shimmableAgent && cachedPath != "" && strings.Contains(cachedPath, "/") {
 		if err := os.Remove(cachedPath); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				// File existed, Remove failed (permission, etc.) — log
@@ -576,9 +585,7 @@ func runResetSession(args []string) int {
 					cachedPath, err,
 				)
 			}
-			// NotExist is the idempotent path — not an error, not a
-			// log line; §3.4 invariant 3 guarantees reset is safe-to-
-			// spam.
+			// NotExist is the idempotent path.
 		} else {
 			deletedPath = cachedPath
 		}

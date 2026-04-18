@@ -123,7 +123,10 @@ chmod +x "$FAKE_ACK"
 start_daemon_bg() {
   local log="$1"
   (
-    export AGENT_COLLAB_DAEMON_CODEX_BIN="$FAKE_ACK"
+    # v0.3 SOFT SHIM: --cli=codex routes through spawnPi → fake binary
+    # must be bound to PI_BIN override. Per-CLI pi fields required post-
+    # shim-preflight (§3.2.b). Codex auto-maps to openai-codex provider.
+    export AGENT_COLLAB_DAEMON_PI_BIN="$FAKE_ACK"
     export FAKE_CLI_COUNTER="$TMP/fake-counter.txt"
     echo 0 > "$FAKE_CLI_COUNTER"
     "$DAEMON" \
@@ -131,6 +134,8 @@ start_daemon_bg() {
       --cwd "$DAEMON_CWD" \
       --session-key "key-daemon" \
       --cli codex \
+      --pi-model gpt-5.3-codex \
+      --pi-session-dir "$TMP/pi-sessions" \
       --cli-session-resume \
       --ack-timeout 5 \
       --sweep-ttl 10 \

@@ -165,12 +165,16 @@ seed_one() {
 start_daemon_bg() {
   local fake="$1" log="$2" ack_timeout="${3:-5}"
   (
-    export AGENT_COLLAB_DAEMON_CODEX_BIN="$fake"
+    # v0.3 SOFT SHIM: --cli=codex routes through spawnPi → fake bin
+    # binds to PI_BIN; pi-model required per shim preflight.
+    export AGENT_COLLAB_DAEMON_PI_BIN="$fake"
     "$DAEMON" \
       --label daemon-recv \
       --cwd "$DAEMON_CWD" \
       --session-key "key-daemon" \
       --cli "codex" \
+      --pi-model gpt-5.3-codex \
+      --pi-session-dir "$TMP/pi-sessions" \
       --ack-timeout "$ack_timeout" \
       --sweep-ttl $((ack_timeout * 2 + 2)) \
       --poll-interval 1 \

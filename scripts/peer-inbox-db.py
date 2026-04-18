@@ -2442,10 +2442,20 @@ def _cmd_peer_receive_reset_session(args: argparse.Namespace) -> int:
         rowcount = _clear_daemon_cli_session_id(conn, str(self_cwd), self_label)
         conn.commit()
 
-        # Pi-specific file-delete side-effect. sessions.agent == 'pi' gate
-        # = correctness; NotExist tolerance = resilience. Defense-in-depth
-        # matches the Go reset verb behavior (§8.1).
-        if agent == "pi" and cached_path:
+        # v0.3 §3.3 Shape β WIDE + path-shape guard (Python parity with
+        # Go reset verb):
+        #   - Agent gate: sessions.agent IN {pi, codex, gemini} covers
+        #     shim-backed rows (--cli=codex / --cli=gemini route through
+        #     spawnPi in v0.3). claude stays NULL-only.
+        #   - Path-shape guard: only attempt os.unlink when cached_path
+        #     contains '/' (path-like). Pre-v0.3 legacy UUID values in
+        #     codex/gemini rows don't contain '/' and are skipped —
+        #     preserves the v0.2 4e/5h cross-CLI-reset-isolation
+        #     invariants under the widened gate.
+        # FileNotFoundError tolerance = idempotent reset per §3.4
+        # invariant 3.
+        shimmable = agent in ("pi", "codex", "gemini")
+        if shimmable and cached_path and "/" in cached_path:
             try:
                 os.unlink(cached_path)
                 deleted_path = cached_path
