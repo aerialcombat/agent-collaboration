@@ -556,15 +556,24 @@ PY
 # merge_hook_json is the generic installer for a JSON-based hook config.
 # Claude (settings.json), Codex (hooks.json), and Gemini (settings.json)
 # all expose the same hooks.<event>[].hooks[] array-of-command shape;
-# only the file path and event-name key differ. One implementation
-# reduces the B1/B8 drift class gamma/alpha flagged in Track B.
+# only the file path, event-name key, and timeout UNIT differ. One
+# implementation reduces the B1/B8 drift class gamma/alpha flagged in
+# Track B.
 #
-# Usage: merge_hook_json <settings_path> <event_name> <hook_command> <timestamp>
+# Timeout-unit caveat (found via probe-J empirical run 2026-04-18):
+# Claude's timeout is seconds (default 60s); Codex's timeout is seconds
+# (default 600s); Gemini's timeout is MILLISECONDS (default 60000ms).
+# Caller passes the raw value in the invoking CLI's native unit. Our
+# hook runs ~5-10ms on a warm box and up to a few hundred ms cold; 5s /
+# 5000ms is a safe ceiling that all three tolerate.
+#
+# Usage: merge_hook_json <settings_path> <event_name> <hook_command> <timeout> <timestamp>
 merge_hook_json() {
   local settings="$1"
   local event_name="$2"
   local hook_command="$3"
-  local timestamp="$4"
+  local timeout="$4"
+  local timestamp="$5"
 
   mkdir -p "$(dirname "$settings")"
 
@@ -572,7 +581,7 @@ merge_hook_json() {
     cp "$settings" "${settings}.bak.${timestamp}"
   fi
 
-  HOOK_COMMAND="$hook_command" SETTINGS_PATH="$settings" EVENT_NAME="$event_name" python3 <<'PY'
+  HOOK_COMMAND="$hook_command" SETTINGS_PATH="$settings" EVENT_NAME="$event_name" HOOK_TIMEOUT="$timeout" python3 <<'PY'
 import json
 import os
 import sys
@@ -581,6 +590,7 @@ from pathlib import Path
 settings_path = Path(os.environ["SETTINGS_PATH"])
 hook_command = os.environ["HOOK_COMMAND"]
 event_name = os.environ["EVENT_NAME"]
+hook_timeout = int(os.environ["HOOK_TIMEOUT"])
 
 if settings_path.exists() and settings_path.stat().st_size > 0:
     try:
@@ -614,7 +624,7 @@ def matcher_has_our_command(matcher):
 
 our_block = {
     "hooks": [
-        {"type": "command", "command": hook_command, "timeout": 5}
+        {"type": "command", "command": hook_command, "timeout": hook_timeout}
     ]
 }
 
@@ -828,11 +838,17 @@ case "$MODE" in
     # above). The hook script is schema-agnostic — all three CLIs parse
     # identically.
     if [[ -d "$HOME/.codex" ]]; then
-      merge_hook_json "$CODEX_HOOKS" "UserPromptSubmit" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+      # Codex timeout unit: seconds (default 600s per its docs).
+      merge_hook_json "$CODEX_HOOKS" "UserPromptSubmit" "$PEER_INBOX_HOOK_SCRIPT" 5 "$TIMESTAMP"
       enable_codex_hooks_flag "$CODEX_CONFIG" "$TIMESTAMP"
     fi
     if [[ -d "$HOME/.gemini" ]]; then
-      merge_hook_json "$GEMINI_SETTINGS" "BeforeAgent" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+      # Gemini timeout unit: MILLISECONDS (default 60000ms per its docs).
+      # probe-J on 2026-04-18 confirmed Gemini kills hooks at 5ms when the
+      # value is 5 (the bare number it shares with Claude/Codex sec-semantics).
+      # 60000ms = 60s matches Claude's documented default and gives ample
+      # headroom for the ~5-10ms warm-path / ~300ms cold-path hook budget.
+      merge_hook_json "$GEMINI_SETTINGS" "BeforeAgent" "$PEER_INBOX_HOOK_SCRIPT" 60000 "$TIMESTAMP"
     fi
     merge_user_mcp_server "$PEER_INBOX_CHANNEL_SCRIPT" "$TIMESTAMP"
 
