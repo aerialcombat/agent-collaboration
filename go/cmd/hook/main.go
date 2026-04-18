@@ -87,6 +87,19 @@ func main() {
 }
 
 func run() int {
+	// Topic 3 §3.4 (f): daemon-spawn short-circuit. Matches the shell
+	// hook's additive AGENT_COLLAB_FORCE_PY=1 pattern at
+	// hooks/peer-inbox-inject.sh:~126. When the daemon (W3) spawns a
+	// CLI, it exports AGENT_COLLAB_DAEMON_SPAWN=1 and delivers the
+	// peer-inbox envelope directly via prompt injection (§2.4). The
+	// hook must no-op for daemon spawns to avoid double-consumption
+	// via the interactive ReadUnread path. Correctness safety net is
+	// §3.4 (a) SQL partition (commit c96868f); this early-exit is a
+	// performance optimization that skips the DB round-trip entirely.
+	if os.Getenv("AGENT_COLLAB_DAEMON_SPAWN") == "1" {
+		return 0
+	}
+
 	start := time.Now()
 	log := obs.Logger()
 

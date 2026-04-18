@@ -27,6 +27,23 @@
 # Fail-open on every error path: the user's turn must never be blocked.
 
 set -uo pipefail
+
+# Topic 3 §3.4 (f): daemon-spawn short-circuit. When the daemon (W3)
+# spawns a CLI, it exports AGENT_COLLAB_DAEMON_SPAWN=1 and delivers the
+# peer-inbox envelope directly via prompt injection (§2.4). The hook
+# must no-op so it does NOT also run the interactive receive path and
+# consume inbox rows a second time. Additive to the existing
+# AGENT_COLLAB_FORCE_PY=1 env-flag pattern at line ~126 below.
+#
+# Correctness safety net is §3.4 (a) SQL partition (`AND claimed_at
+# IS NULL` on interactive reads, landed in commit c96868f) — if this
+# short-circuit is ever skipped the hook still cannot double-consume
+# a daemon-claimed row. This early-exit is a performance optimization
+# that avoids paying a DB round-trip for nothing on daemon spawns.
+if [[ "${AGENT_COLLAB_DAEMON_SPAWN:-0}" == "1" ]]; then
+  exit 0
+fi
+
 LOG="${AGENT_COLLAB_HOOK_LOG:-$HOME/.agent-collab/hook.log}"
 log() {
   mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
