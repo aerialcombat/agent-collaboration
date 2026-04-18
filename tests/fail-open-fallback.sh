@@ -86,26 +86,43 @@ AGENT_COLLAB_INBOX_DB="$DB" AGENT_COLLAB_SESSION_KEY="key-send" \
 # Simulate the "migration never applied" drift surface the Go hot path
 # guards against. Post-v3.0 W1 round-2: goose_db_version is the
 # authoritative version source, so dropping goose_db_version +
-# the v2-reserve columns rolls the DB back to a pre-0001 shape. On the
-# next open(), Python's apply_migrations() re-invokes peer-inbox-migrate
-# which re-applies 0001 cleanly.
+# every migration-added column rolls the DB back to a pre-0001 shape.
+# On the next open(), Python's apply_migrations() re-invokes
+# peer-inbox-migrate which re-applies 0001 + 0002 cleanly.
 python3 -c "
 import sqlite3
 c = sqlite3.connect('$DB')
 # Drop dependent indexes first — SQLite DROP COLUMN refuses while
-# an index references the column.
-for idx in ('idx_outbox_workspace_idem', 'idx_inbox_workspace_idem'):
+# an index references the column. idx_inbox_daemon_inflight is
+# Topic-3-added (0002); guard against its absence on pre-0002 DBs.
+for idx in ('idx_outbox_workspace_idem', 'idx_inbox_workspace_idem', 'idx_inbox_daemon_inflight'):
     c.execute(f'DROP INDEX IF EXISTS {idx}')
 c.execute('DROP TABLE IF EXISTS goose_db_version')
 c.execute('DROP TABLE IF EXISTS outbox')
 c.execute('DROP TABLE IF EXISTS meta')
 # SQLite can drop columns since 3.35; the legacy baseline schema had
-# none of these v2-reserve columns.
-for col in ('client_seq', 'idempotency_key', 'workspace_id', 'user_id'):
+# none of the migration-added columns. 0002 adds claimed_at /
+# completed_at / claim_owner on inbox + receive_mode / daemon_state
+# on sessions — drop all of them so the re-migrate path runs cleanly.
+# (SQLite 'ALTER TABLE ADD COLUMN' has no IF NOT EXISTS; a leftover
+# column here causes duplicate-column error on re-apply.)
+inbox_cols = ('client_seq', 'idempotency_key', 'workspace_id', 'user_id',
+              'claimed_at', 'completed_at', 'claim_owner')
+sessions_cols = ('receive_mode', 'daemon_state')
+for col in inbox_cols:
     try:
         c.execute(f'ALTER TABLE inbox DROP COLUMN {col}')
     except sqlite3.OperationalError as e:
-        raise SystemExit(f'simulated-drift setup: DROP COLUMN {col} failed: {e}')
+        # Tolerate missing columns (pre-0002 DBs) silently — the
+        # intent is best-effort rollback to pre-migration state.
+        if 'no such column' not in str(e).lower():
+            raise SystemExit(f'simulated-drift setup: DROP COLUMN inbox.{col} failed: {e}')
+for col in sessions_cols:
+    try:
+        c.execute(f'ALTER TABLE sessions DROP COLUMN {col}')
+    except sqlite3.OperationalError as e:
+        if 'no such column' not in str(e).lower():
+            raise SystemExit(f'simulated-drift setup: DROP COLUMN sessions.{col} failed: {e}')
 c.commit()
 c.close()
 "
@@ -156,7 +173,18 @@ r = c.execute(\"SELECT COALESCE(MAX(version_id), 0) FROM goose_db_version WHERE 
 print(r[0] if r else 'NONE')
 ")"
 echo "   goose_db_version after fallback: $restored_version"
-[[ "$restored_version" == "1" ]] \
-  || fail "Python fallback should have re-applied goose migration 1; got '$restored_version'"
+# Topic-3 bumped GOOSE_VERSION_REQUIRED 1 → 2. Python fallback applies
+# every migration up to the required version, so post-fallback state
+# is whatever GOOSE_VERSION_REQUIRED names in go/pkg/store/sqlite/sqlite.go
+# and scripts/peer-inbox-db.py. Read the required value from the Python
+# source-of-truth so the test tracks the constant automatically.
+expected_version="$(python3 -c "
+import re, pathlib
+src = pathlib.Path('$PROJECT_ROOT/scripts/peer-inbox-db.py').read_text()
+m = re.search(r'GOOSE_VERSION_REQUIRED\s*=\s*(\d+)', src)
+print(m.group(1) if m else 'UNKNOWN')
+")"
+[[ "$restored_version" == "$expected_version" ]] \
+  || fail "Python fallback should have re-applied goose migrations to v$expected_version; got '$restored_version'"
 
-echo "PASS: B-1 fix verified — Go returns exitFallbackWanted on ErrSchemaTooOld, bash falls back, Python delivers + re-migrates via goose"
+echo "PASS: B-1 fix verified — Go returns exitFallbackWanted on ErrSchemaTooOld, bash falls back, Python delivers + re-migrates via goose (v$expected_version)"

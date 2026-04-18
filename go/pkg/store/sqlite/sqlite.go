@@ -32,8 +32,13 @@ const (
 	// GooseVersionRequired is the minimum applied goose migration version
 	// this build expects. `goose_db_version` is the authoritative source —
 	// `meta.schema_version` is written by the same migration for legacy-
-	// compatibility only and must not be consulted here.
-	GooseVersionRequired = 1
+	// compatibility only and must not be consulted here. Bumped from 1 to 2
+	// for the Topic 3 0002 migration that adds claimed_at / completed_at /
+	// claim_owner on inbox + receive_mode / daemon_state on sessions: the
+	// hook's ReadUnread query (this file) now references claimed_at in its
+	// WHERE clause (SQL partition per Topic 3 §3.4 (a)), so pre-0002 DBs
+	// must fail-open here before reaching the SQL.
+	GooseVersionRequired = 2
 
 	sessionsDirRel = ".agent-collab/sessions"
 )
@@ -273,11 +278,20 @@ func (s *SQLiteLocal) ReadUnread(ctx context.Context, self store.Session) ([]sto
 	// it's the only writer in this tx, so no up-front BEGIN IMMEDIATE
 	// is needed (and modernc rejects a nested BEGIN anyway).
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	// SQL partition (Topic 3 §3.4 guarantee (a)): AND claimed_at IS NULL
+	// excludes daemon-mode in-flight rows from the interactive read path.
+	// Daemon-claimed rows (claimed_at set, read_at still NULL) are invisible
+	// to the hook hot-path by construction, preventing the double-consumption
+	// failure mode idle-birch surfaced during Topic 3 scoping review. Stays
+	// byte-identical to pre-Topic-3 hook output because the existing inbox
+	// state has zero rows with claimed_at NOT NULL (no daemon writers yet),
+	// so tests/hook-parity.sh fixtures remain unchanged.
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE inbox
 		SET read_at = ?
 		WHERE to_cwd = ? AND to_label = ?
 		  AND read_at IS NULL
+		  AND claimed_at IS NULL
 		RETURNING id, from_cwd, from_label, body, created_at, COALESCE(room_key, '')
 	`, now, self.CWD, self.Label)
 	if err != nil {

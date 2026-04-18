@@ -85,8 +85,12 @@ PYTHON_MIN = (3, 9)
 # authoritative source; `meta.schema_version` is written by the same
 # migration for legacy-compat only and must not be consulted for version
 # checks. GOOSE_VERSION_REQUIRED must match go/pkg/store/sqlite/sqlite.go's
-# GooseVersionRequired constant.
-GOOSE_VERSION_REQUIRED = 1
+# GooseVersionRequired constant. Bumped 1 → 2 for Topic 3's 0002 migration
+# that adds daemon-mode columns (claimed_at / completed_at / claim_owner on
+# inbox; receive_mode / daemon_state on sessions). The SQL partition in
+# cmd_peer_receive references claimed_at, so pre-0002 DBs must fail the
+# schema check before the query runs.
+GOOSE_VERSION_REQUIRED = 2
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",
@@ -1804,6 +1808,14 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
             # Atomic claim-and-mark in a writer transaction. The UPDATE ...
             # RETURNING clause guarantees no concurrent receiver can claim
             # the same rows.
+            #
+            # SQL partition (Topic 3 §3.4 guarantee (a)): AND claimed_at IS
+            # NULL excludes daemon-mode in-flight rows from the interactive
+            # read path. Mirrors the Go hook hot-path in
+            # go/pkg/store/sqlite/sqlite.go:ReadUnread; same-commit parity
+            # per item 9 migration ordering. Stays byte-identical to
+            # pre-Topic-3 hook output while existing state has no daemon-
+            # claimed rows (no daemon writers yet).
             conn.execute("BEGIN IMMEDIATE")
             now = now_iso()
             if args.since:
@@ -1813,6 +1825,7 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
                     SET read_at = ?
                     WHERE to_cwd = ? AND to_label = ?
                       AND read_at IS NULL
+                      AND claimed_at IS NULL
                       AND created_at >= ?
                     RETURNING id, from_cwd, from_label, body, created_at
                     """,
@@ -1825,6 +1838,7 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
                     SET read_at = ?
                     WHERE to_cwd = ? AND to_label = ?
                       AND read_at IS NULL
+                      AND claimed_at IS NULL
                     RETURNING id, from_cwd, from_label, body, created_at
                     """,
                     (now, str(self_cwd), self_label),
@@ -1836,7 +1850,9 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
             # last_seen_at update here — sessions that only ever inspect
             # don't need to appear active to peers. Active participation
             # (peer send, session register, mark-read receives) bumps
-            # last_seen_at; inspection is free.
+            # last_seen_at; inspection is free. Same SQL partition applied
+            # to inspect queries so `peer receive` without --mark-read
+            # shows the same unread set the hook would consume.
             if args.since:
                 rows = conn.execute(
                     """
@@ -1844,6 +1860,7 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
                     FROM inbox
                     WHERE to_cwd = ? AND to_label = ?
                       AND read_at IS NULL
+                      AND claimed_at IS NULL
                       AND created_at >= ?
                     ORDER BY created_at ASC
                     """,
@@ -1856,6 +1873,7 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
                     FROM inbox
                     WHERE to_cwd = ? AND to_label = ?
                       AND read_at IS NULL
+                      AND claimed_at IS NULL
                     ORDER BY created_at ASC
                     """,
                     (str(self_cwd), self_label),
