@@ -294,6 +294,28 @@ Persist these records alongside the v0.1 closure tag annotation OR in
 the v0.1 handoff doc — they become the empirical baseline that a future
 v0.1.x bump auditor compares against.
 
+## Last-run
+
+**2026-04-18 vs `v3.x-topic-3-v0.1.2-shipped` @ `6ec4b23`** — test-engineer supervised probe.
+
+- **codex-cli 0.121.0** — E5 (a)(b)(c) **PASS**
+  - UUID captured: `019da07f-5faf-7402-9842-b49e0f0cb6da`
+  - Batch-2 argv: `exec resume 019da07f-5faf-7402-9842-b49e0f0cb6da --skip-git-repo-check <prompt>`
+  - Batch-2 reply correctly recalled seeded context ("vermilion")
+- **gemini 0.38.2** — E6 (a)(b)(c) **PASS**
+  - UUID captured: `c52b718e-c38c-4f89-9554-91968921e0aa`
+  - UUID→index translation via `--list-sessions` re-query → argv `--resume 1 -p <prompt>`
+  - Batch-2 reply correctly recalled seeded context ("42")
+- **claude 2.1.114** — out-of-scope (Arch B asymmetry per §4.3 of scope-doc)
+- **E7 version record + fixture diff:** PASS (no structural drift in codex banner format or gemini `--list-sessions` output)
+
+Probe dirs preserved at `/tmp/e5v2-probe`, `/tmp/e6v2-probe` for the
+v0.1.2 baseline run. This run validates the v0.1.2 fixes
+(codex stdout+stderr concat capture + gemini `--list-sessions`
+timeout bump to 15s with `AGENT_COLLAB_DAEMON_GEMINI_LIST_TIMEOUT`
+env override) work end-to-end against real CLIs — the gap that v0.1.1
+shipped without closing.
+
 ## When to re-run
 
 - Before tagging `v3.x-topic-3-v0.1-shipped` — required for closure.
