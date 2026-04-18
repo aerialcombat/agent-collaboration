@@ -87,10 +87,12 @@ PYTHON_MIN = (3, 9)
 # checks. GOOSE_VERSION_REQUIRED must match go/pkg/store/sqlite/sqlite.go's
 # GooseVersionRequired constant. Bumped 1 → 2 for Topic 3's 0002 migration
 # that adds daemon-mode columns (claimed_at / completed_at / claim_owner on
-# inbox; receive_mode / daemon_state on sessions). The SQL partition in
-# cmd_peer_receive references claimed_at, so pre-0002 DBs must fail the
-# schema check before the query runs.
-GOOSE_VERSION_REQUIRED = 2
+# inbox; receive_mode / daemon_state on sessions). Bumped 2 → 3 for Topic 3
+# v0.1 (Arch D) 0003 migration that adds sessions.daemon_cli_session_id for
+# CLI-native session-resume identity persistence. Daemon's session-resume
+# verb references the column, so pre-0003 DBs must fail the schema check
+# before the query runs.
+GOOSE_VERSION_REQUIRED = 3
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",

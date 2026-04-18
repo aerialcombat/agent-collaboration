@@ -88,7 +88,7 @@ AGENT_COLLAB_INBOX_DB="$DB" AGENT_COLLAB_SESSION_KEY="key-send" \
 # authoritative version source, so dropping goose_db_version +
 # every migration-added column rolls the DB back to a pre-0001 shape.
 # On the next open(), Python's apply_migrations() re-invokes
-# peer-inbox-migrate which re-applies 0001 + 0002 cleanly.
+# peer-inbox-migrate which re-applies 0001 + 0002 + 0003 cleanly.
 python3 -c "
 import sqlite3
 c = sqlite3.connect('$DB')
@@ -103,12 +103,13 @@ c.execute('DROP TABLE IF EXISTS meta')
 # SQLite can drop columns since 3.35; the legacy baseline schema had
 # none of the migration-added columns. 0002 adds claimed_at /
 # completed_at / claim_owner on inbox + receive_mode / daemon_state
+# on sessions; 0003 (Topic 3 v0.1 Arch D) adds daemon_cli_session_id
 # on sessions — drop all of them so the re-migrate path runs cleanly.
 # (SQLite 'ALTER TABLE ADD COLUMN' has no IF NOT EXISTS; a leftover
 # column here causes duplicate-column error on re-apply.)
 inbox_cols = ('client_seq', 'idempotency_key', 'workspace_id', 'user_id',
               'claimed_at', 'completed_at', 'claim_owner')
-sessions_cols = ('receive_mode', 'daemon_state')
+sessions_cols = ('receive_mode', 'daemon_state', 'daemon_cli_session_id')
 for col in inbox_cols:
     try:
         c.execute(f'ALTER TABLE inbox DROP COLUMN {col}')

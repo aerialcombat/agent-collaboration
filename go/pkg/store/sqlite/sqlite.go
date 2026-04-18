@@ -36,9 +36,12 @@ const (
 	// for the Topic 3 0002 migration that adds claimed_at / completed_at /
 	// claim_owner on inbox + receive_mode / daemon_state on sessions: the
 	// hook's ReadUnread query (this file) now references claimed_at in its
-	// WHERE clause (SQL partition per Topic 3 §3.4 (a)), so pre-0002 DBs
-	// must fail-open here before reaching the SQL.
-	GooseVersionRequired = 2
+	// WHERE clause (SQL partition per Topic 3 §3.4 (a)). Bumped from 2 to 3
+	// for the Topic 3 v0.1 (Arch D) 0003 migration that adds
+	// sessions.daemon_cli_session_id; daemon's resume helpers read this
+	// column at spawn time, so pre-0003 DBs must fail-open here before
+	// reaching the SQL.
+	GooseVersionRequired = 3
 
 	sessionsDirRel = ".agent-collab/sessions"
 )
