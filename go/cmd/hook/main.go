@@ -149,7 +149,7 @@ func run() int {
 	if block != "" {
 		envelope := map[string]any{
 			"hookSpecificOutput": map[string]any{
-				"hookEventName":     "UserPromptSubmit",
+				"hookEventName":     hookEventName(),
 				"additionalContext": block,
 			},
 		}
@@ -191,6 +191,20 @@ func discoverSessionKey() string {
 		}
 	}
 	return ""
+}
+
+// hookEventName returns the hookSpecificOutput.hookEventName value to
+// emit in the Claude-shape envelope. Reads AGENT_COLLAB_HOOK_EVENT_NAME
+// which the bash wrapper populates from the stdin JSON's hook_event_name
+// field ("UserPromptSubmit" for Claude/Codex, "BeforeAgent" for Gemini).
+// Falls back to "UserPromptSubmit" when unset — the safe default when
+// the binary is invoked standalone (e.g. tests/hook-latency-exec.sh)
+// since Claude and Codex both use it.
+func hookEventName() string {
+	if v := os.Getenv("AGENT_COLLAB_HOOK_EVENT_NAME"); v != "" {
+		return v
+	}
+	return "UserPromptSubmit"
 }
 
 // hookBlockBudgetBytes reads AGENT_COLLAB_HOOK_BLOCK_BUDGET at runtime,

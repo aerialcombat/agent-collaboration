@@ -1882,9 +1882,16 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
     elif args.format == "hook-json":
         block = format_hook_block(list(rows))
+        # AGENT_COLLAB_HOOK_EVENT_NAME carries the invoking CLI's event name
+        # (Claude/Codex: "UserPromptSubmit"; Gemini: "BeforeAgent"). Set by
+        # hooks/peer-inbox-inject.sh from the stdin JSON. Default to the
+        # Claude/Codex value when unset.
+        hook_event_name = os.environ.get(
+            "AGENT_COLLAB_HOOK_EVENT_NAME", "UserPromptSubmit"
+        )
         envelope = {
             "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
+                "hookEventName": hook_event_name,
                 "additionalContext": block,
             }
         } if block else {}

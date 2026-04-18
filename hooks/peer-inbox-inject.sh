@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
-# peer-inbox-inject.sh — Claude UserPromptSubmit hook.
+# peer-inbox-inject.sh — unified pre-prompt hook for Claude / Codex / Gemini.
+#
+# v3.x Option J: one script handles all three CLIs. All three provide a
+# top-level stdin JSON with `session_id`, `cwd`, and `hook_event_name`
+# fields, so the schema-detection lives in the `hook_event_name` value
+# (Claude/Codex="UserPromptSubmit", Gemini="BeforeAgent"). The value is
+# propagated to the downstream emitter (Go binary or Python fallback) so
+# the hookSpecificOutput.hookEventName in our JSON output matches the
+# invoking CLI's expected event name.
 #
 # Two jobs:
-#   1. Log the Claude session_id seen in this cwd to
+#   1. Log the session_id seen in this cwd to
 #      ~/.agent-collab/claude-sessions-seen/<cwd-hash>.log so that
 #      `agent-collab session register` can later adopt it — needed when the
-#      runtime (Claude Code 2.1.78) doesn't export $CLAUDE_SESSION_ID to
-#      Bash-tool subprocesses.
+#      runtime doesn't export its session-id env var to Bash-tool
+#      subprocesses. (File path retains the `claude-` prefix for back-compat;
+#      Codex/Gemini session-ids land in the same directory.)
 #   2. Fetch unread peer messages as hookSpecificOutput.additionalContext
 #      JSON and emit to stdout.
 #
-# v3.0 — hot path is the Go `peer-inbox-hook` binary when available. We
+# Hot path is the Go `peer-inbox-hook` binary when available. We
 # short-circuit via an `~/.agent-collab/inbox-dirty` mtime marker so an
 # empty inbox exits without any database work. Fall back to the Python
 # path whenever the Go binary is missing or `AGENT_COLLAB_FORCE_PY=1`.
@@ -31,7 +40,11 @@ command -v agent-collab >/dev/null 2>&1 || { log "agent-collab not on PATH"; exi
 
 hook_stdin="$(cat 2>/dev/null || true)"
 
-# Extract session_id and the Claude-reported cwd from the stdin JSON.
+# Extract session_id, cwd, and hook_event_name from the stdin JSON. All
+# three CLIs (Claude UserPromptSubmit, Codex UserPromptSubmit, Gemini
+# BeforeAgent) put these at the same top-level keys, so one parse works
+# universally. hook_event_name disambiguates Gemini ("BeforeAgent") from
+# Claude/Codex ("UserPromptSubmit") for output-envelope emission.
 if [[ -n "$hook_stdin" ]]; then
   parsed="$(HOOK_STDIN="$hook_stdin" python3 -c '
 import json, os, sys
@@ -40,20 +53,32 @@ try:
     if isinstance(d, dict):
         print(d.get("session_id", ""))
         print(d.get("cwd", ""))
+        print(d.get("hook_event_name", ""))
 except Exception:
+    print("")
     print("")
     print("")
 ' 2>/dev/null || true)"
   session_id="$(printf '%s' "$parsed" | sed -n '1p')"
   hook_cwd="$(printf '%s' "$parsed" | sed -n '2p')"
+  hook_event_name="$(printf '%s' "$parsed" | sed -n '3p')"
 else
   session_id=""
   hook_cwd=""
+  hook_event_name=""
 fi
 
-# Use hook-reported cwd when present (Claude is authoritative about where
+# Use hook-reported cwd when present (the CLI is authoritative about where
 # the session is running); fall back to shell $PWD otherwise.
 use_cwd="${hook_cwd:-$PWD}"
+
+# Default the emitted hookEventName to "UserPromptSubmit" (Claude + Codex
+# share this value). Gemini BeforeAgent sends "BeforeAgent", which we
+# preserve verbatim. Downstream emitters (Go binary, Python CLI) read
+# AGENT_COLLAB_HOOK_EVENT_NAME and reflect it in the output envelope's
+# hookSpecificOutput.hookEventName so the consuming runtime sees the
+# value it expects.
+export AGENT_COLLAB_HOOK_EVENT_NAME="${hook_event_name:-UserPromptSubmit}"
 
 if [[ -n "$session_id" ]]; then
   export CLAUDE_SESSION_ID="$session_id"
