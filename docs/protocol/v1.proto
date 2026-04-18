@@ -1,0 +1,137 @@
+// agent-collaboration peer-inbox wire protocol, v1.
+//
+// This file is the load-bearing artifact for future-language optionality.
+// It is exercised under real traffic on the Unix socket from v3.0 day one so
+// the spec is production-tested before a cloud server ever accepts it.
+//
+// Versioning rules (see docs/protocol/v1.md):
+//   - Additive fields only. Never renumber. Never change field types.
+//   - Deprecations: mark with `[deprecated = true]`; reserve the field number
+//     via `reserved N;` after removal.
+//   - Breaking changes require a sibling v2.proto file and a new capability
+//     negotiation entry.
+//
+// Generated Go bindings live at `go/pkg/protocol/` and are regenerated via
+// `scripts/build-proto.sh`. Generated bindings are the only way transport
+// code moves bytes on the wire.
+
+syntax = "proto3";
+
+package agentcollab.v1;
+
+option go_package = "agent-collaboration/go/pkg/protocol;protocol";
+
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+
+// Envelope is the outermost wire frame for every peer-inbox message.
+//
+// Invariants:
+//   - `version` MUST equal 1 for this file's schema.
+//   - `type` MUST match a payload type declared in this file. Unknown types
+//     cause the peer to log + drop (forward-compat behavior for future
+//     types that older binaries do not know).
+//   - `payload` MUST unpack cleanly to the Go type registered for `type`.
+//   - `idempotency_key` MUST be populated by senders on every message, even
+//     on the same-machine Unix-socket path, so cross-machine dedup (v2) has
+//     a stable key without changing the caller contract.
+message Envelope {
+  uint32 version = 1;
+
+  // Fully-qualified protobuf type name of the payload, e.g. "agentcollab.v1.PeerSend".
+  // Required. Used by receivers to dispatch to the right Go handler without
+  // relying on oneof (which breaks forward-compat on exhaustive switches).
+  string type = 2;
+
+  google.protobuf.Any payload = 3;
+
+  AuthContext auth = 4;
+
+  // Caller-populated key for cross-machine dedup (v2). Senders MUST set this
+  // on every outbound message. On SQLite (v1), uniqueness is per (workspace_id,
+  // idempotency_key). Recommended shape: UUIDv7 or monotonic-client-seq+random.
+  string idempotency_key = 5;
+
+  // Monotonic per-sender sequence number. Helps receivers detect reordering
+  // under cross-machine transport (v2). Unused on Unix socket in v1.
+  uint64 client_seq = 6;
+}
+
+// AuthContext carries the sender's identity. In v1, `workspace_id` defaults
+// to "default" and `user_id` is empty — the LocalTrust Auth impl accepts any
+// combination. In v2, `user_id` is populated from a verified JWT / OIDC token
+// and `workspace_id` gates Postgres RLS.
+message AuthContext {
+  string workspace_id = 1;  // v1: always "default"
+  string user_id = 2;       // v1: empty; v2: verified user identifier
+  string session_label = 3; // sender's peer-inbox label (e.g. "coder")
+}
+
+// Hello is the first frame on every new Unix-socket connection. Both sides
+// exchange Hello before any other message. Version mismatch → disconnect
+// with a structured error frame; unknown types in `supported_types` are
+// ignored, matching the forward-compat rule for `Envelope.type`.
+message Hello {
+  uint32 version = 1;
+  repeated string supported_types = 2;  // fully-qualified type names this peer handles
+  string peer_label = 3;
+  string agent = 4;  // "claude" | "codex" | "gemini"
+}
+
+// PeerSend: direct unicast to a named peer.
+message PeerSend {
+  string to_label = 1;
+  string to_cwd = 2;      // optional: disambiguates when multiple pairs share labels
+  string body = 3;        // UTF-8, max 8 KB
+  repeated string mention = 4;
+}
+
+// PeerBroadcast: fan-out to every live peer in the sender's room.
+message PeerBroadcast {
+  repeated string cohort = 1;  // if present, multicast to named subset
+  string body = 2;
+  repeated string mention = 3;
+}
+
+// PeerReceiveRequest: pulled by the hook on UserPromptSubmit. The response
+// is a PeerReceiveResponse with unread messages + a flag indicating whether
+// the receiver has already marked-read (claimed) them.
+message PeerReceiveRequest {
+  bool mark_read = 1;
+  string since = 2;  // optional: ISO-8601; only return messages newer than this
+}
+
+message PeerReceiveResponse {
+  repeated InboxMessage messages = 1;
+}
+
+message InboxMessage {
+  int64 id = 1;
+  string from_label = 2;
+  string from_cwd = 3;
+  string body = 4;
+  string created_at = 5;  // ISO-8601 UTC
+  string room_key = 6;
+}
+
+// SessionRegister: idempotent registration for a (cwd, label) pair.
+message SessionRegister {
+  string label = 1;
+  string agent = 2;  // "claude" | "codex" | "gemini"
+  string role = 3;   // "lead" | "challenger" | "peer" | "mediator"
+  string pair_key = 4;
+  string session_key = 5;
+  google.protobuf.Timestamp started_at = 6;
+}
+
+// Error: a structured failure frame. Senders emit this when they reject an
+// inbound frame — e.g., JSON masquerading as Envelope, version mismatch,
+// unknown type. Receivers do NOT close the connection on Error; they log.
+message Error {
+  string code = 1;      // "invalid_frame" | "version_mismatch" | "unknown_type" | ...
+  string message = 2;   // human-readable
+  uint32 frame_size_bytes = 3;
+  string first_bytes_hex = 4;  // first 16 bytes, space-separated hex, for debugging
+  string expected_magic_hex = 5;
+  string peer_label = 6;
+}
