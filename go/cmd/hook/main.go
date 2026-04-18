@@ -31,12 +31,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"agent-collaboration/go/pkg/envelope"
@@ -271,77 +268,16 @@ func buildPeerInboxEnvelope(
 // render identical additionalContext strings. Callers MUST produce the
 // same output regardless of which language rendered it.
 //
-// Structured as a thin text renderer over buildPeerInboxEnvelope:
-// Topic 3 §5.2 path (a) — the canonical JSON schema is now the
-// internal data structure, but the text format is byte-identical to
-// the pre-refactor hand-rolled implementation. tests/hook-parity.sh
-// stays green; tests/envelope-round-trip.sh asserts the schema
-// round-trip preserves output.
+// Thin wrapper over envelope.RenderText (hoisted from this package
+// into go/pkg/envelope in commit 7 so the daemon binary can call the
+// same serializer without duplicating code — §5.2 single-source-of-
+// truth is now structural, not discipline-dependent). tests/hook-
+// parity.sh stays green; tests/envelope-round-trip.sh asserts byte-
+// parity across the hook + daemon consumers.
 func formatHookBlock(rows []store.InboxMessage) string {
 	if len(rows) == 0 {
 		return ""
 	}
 	env := buildPeerInboxEnvelope(rows, nil)
-	return renderEnvelopeText(env)
-}
-
-// renderEnvelopeText serializes an envelope.Envelope into the Option J
-// <peer-inbox>...</peer-inbox> text block. The text format is fixed
-// by tests/hook-parity.sh fixtures; any divergence is a path (b) scope
-// creep per §5.2 and requires re-scoping before landing.
-//
-// v0 emits only the envelope's Messages; To / ContinuitySummary /
-// State / ContentStop are not yet surfaced in the hook-text rendering.
-// The daemon prompt-injection consumer (commit 7) uses the same text
-// byte-for-byte for the message-only case; future format extensions
-// for the optional fields are a path (b) decision out of scope here.
-func renderEnvelopeText(env envelope.Envelope) string {
-	if len(env.Messages) == 0 {
-		return ""
-	}
-
-	// labels = sorted({ m.FromLabel for m in env.Messages })
-	labelSet := make(map[string]struct{}, len(env.Messages))
-	for _, m := range env.Messages {
-		labelSet[m.FromLabel] = struct{}{}
-	}
-	labels := make([]string, 0, len(labelSet))
-	for l := range labelSet {
-		labels = append(labels, l)
-	}
-	sort.Strings(labels)
-
-	budget := hookBlockBudgetBytes()
-	var b strings.Builder
-	header := fmt.Sprintf(
-		`<peer-inbox messages="%d" from-session-labels="%s">`,
-		len(env.Messages), strings.Join(labels, ","),
-	)
-	b.WriteString(header)
-	// Reserve space for the closing tag so the final block fits within
-	// budget. Truncation message (~60 bytes when triggered) is unaccounted
-	// headroom; HOOK_BLOCK_BUDGET is a 4 KiB ceiling against ~hundreds-
-	// of-bytes messages, so the approximation is safe.
-	const closingTag = "</peer-inbox>"
-	used := len(header) + len(closingTag)
-
-	included, truncated := 0, 0
-	for _, m := range env.Messages {
-		entry := fmt.Sprintf("\n[%s @ %s]\n%s\n", m.FromLabel, m.CreatedAt, m.Body)
-		if used+len(entry) > budget && included > 0 {
-			truncated = len(env.Messages) - included
-			break
-		}
-		b.WriteString(entry)
-		used += len(entry)
-		included++
-	}
-	if truncated > 0 {
-		fmt.Fprintf(&b,
-			"\n[+%d more messages truncated; run agent-collab peer receive to view]\n",
-			truncated,
-		)
-	}
-	b.WriteString("</peer-inbox>")
-	return b.String()
+	return envelope.RenderText(env, hookBlockBudgetBytes())
 }

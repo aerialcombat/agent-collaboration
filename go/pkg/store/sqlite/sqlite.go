@@ -605,5 +605,42 @@ func (s *SQLiteLocal) DaemonModeSweepWithCutoff(ctx context.Context, ttl time.Du
 	return reaped, cutoff, nil
 }
 
+// SetDaemonState flips sessions.daemon_state to the given value ('open'
+// or 'closed') for the (cwd, label) session. Topic 3 §6 Layer 1 uses
+// this to transition a daemon dormant after a content-stop sentinel
+// arrives; Layer 2 bullet 1 names the same operation. The daemon
+// calls this directly (no verb-level CLI needed in v0).
+//
+// Validates the state string against the CHECK constraint shape that
+// the 0002 migration installed (CHECK (daemon_state IN ('open',
+// 'closed'))) so callers get a clean Go-level error rather than a
+// raw SQLite constraint failure.
+func (s *SQLiteLocal) SetDaemonState(ctx context.Context, self store.Session, newState string) error {
+	switch newState {
+	case "open", "closed":
+	default:
+		return fmt.Errorf("daemon_state must be 'open' or 'closed', got %q", newState)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sessions
+		SET daemon_state = ?
+		WHERE cwd = ? AND label = ?
+	`, newState, self.CWD, self.Label)
+	if err != nil {
+		return fmt.Errorf("set daemon_state: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		// No row with this (cwd, label). Caller likely misconfigured
+		// — surface loud so operator can fix rather than silently
+		// losing the state transition.
+		return fmt.Errorf("no session row for cwd=%q label=%q", self.CWD, self.Label)
+	}
+	return nil
+}
+
 // Compile-time assertion: SQLiteLocal implements store.Store.
 var _ store.Store = (*SQLiteLocal)(nil)
