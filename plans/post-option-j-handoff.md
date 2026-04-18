@@ -95,6 +95,7 @@ From W1 round 2 + Option J post-ship:
 - **B9:** corrupt-marker `slog.Debug` + `ErrMarkerCorrupt` sentinel
 - **CG-3:** parametrized `HOOK_BLOCK_BUDGET` parity in T4
 - **NEW post-Option-J:** install-script surgical-skip should auto-heal drifted timeout values (coder's flag after the Gemini fix)
+- **NEW post-Option-J (heartbeat/reaper):** peer-inbox heartbeat + stale-marker reaper. Independent of auto-reply scope; fixes `peer list` liveness ambiguity for crashed interactive sessions today (crashed interactive ≈ idle, same presentation). Alpha's receive-semantics audit side-finding reinforces: `bump_last_seen` runs inside the receive transaction, so `peer list` shows LIVE even when the LLM call downstream hangs or crashes — liveness ≠ actually-responsive. Two-part papercut: (a) daemon/session heartbeat ping into the sessions table on an interval, (b) reaper sweep that marks stale markers + surfaces stale heartbeat in `peer list`.
 - **CG-1:** `tests/path-drift.sh` regression gate (test-engineer authoring)
 - **migrate-upgrade-path:** `tests/migrate-upgrade-path.sh` (test-engineer)
 
