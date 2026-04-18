@@ -1,0 +1,96 @@
+# hook-latency — enforce the W1 DoD wall-clock hook p99 bar.
+#
+# Per the v3.0 scope doc (plans/v3.0-go-cloud-ready-scoping.md, W1 DoD):
+#
+#   "hook p99 <15ms post-cold fresh-exec" (revised from <10ms after
+#   test-engineer's n=200 measurement in the W1 review round reported a
+#   stable 13.5ms on real exec; the <10ms target was aspirational and
+#   measured against an in-process bench that amortized Go-runtime init
+#   and the modernc.org/sqlite driver registration across iterations).
+#
+# The in-process bench (`go test -run TestHotPathP99Regression ./cmd/hook`)
+# stays in the repo as a regression check on the code-path shape. This job
+# is the DoD surface: it exercises the hook as a fresh OS process per
+# iteration and fails the build if p99 regresses over 15ms.
+#
+# Mediator's ruling (round 1 review synthesis): the DoD number is only
+# real if it's test-enforced. Hence this workflow.
+
+name: hook-latency
+
+on:
+  push:
+    paths:
+      - "go/**"
+      - "hooks/**"
+      - "scripts/peer-inbox-db.py"
+      - "scripts/agent-collab"
+      - "tests/hook-latency-exec.sh"
+      - "tests/hook-latency.sh"
+      - ".github/workflows/hook-latency.yml"
+  pull_request:
+    paths:
+      - "go/**"
+      - "hooks/**"
+      - "scripts/peer-inbox-db.py"
+      - "scripts/agent-collab"
+      - "tests/hook-latency-exec.sh"
+      - "tests/hook-latency.sh"
+      - ".github/workflows/hook-latency.yml"
+
+jobs:
+  wall-clock-p99:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # W1 DoD budget per plans/v3.0-go-cloud-ready-scoping.md. Runners
+      # are noisier than dev laptops; empirical Apple Silicon p99 is
+      # ~13.5ms, runner variance adds ~2-3ms of headroom absorption. If
+      # the number needs nudging, do it here and update the plan doc in
+      # the same commit so the evidence + bar stay in sync.
+      HOOK_LATENCY_BUDGET_MS: "15"
+      HOOK_LATENCY_ITERATIONS: "200"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: In-process regression bench (p99 code-path shape)
+        working-directory: go
+        # Distinct gate from wall-clock: catches regressions in the Open +
+        # ResolveSelf + ReadUnread inner loop before they show up at exec
+        # scale. Budget is intentionally tighter (10ms) because the inner
+        # loop has no Go-runtime init overhead to amortize.
+        run: go test -run TestHotPathP99Regression ./cmd/hook/
+
+      - name: Wall-clock fresh-exec DoD bench
+        run: bash tests/hook-latency-exec.sh
+
+      - name: Fail-open fallback (B-1 regression gate)
+        # Simulates schema drift, asserts the Go hook returns
+        # exitFallbackWanted=2 and the bash wrapper re-routes to Python.
+        # Protects the exit-code contract between go/cmd/hook/main.go and
+        # hooks/peer-inbox-inject.sh.
+        run: bash tests/fail-open-fallback.sh
+
+      - name: Ack-file label collision (A2 regression gate)
+        # Activated after coder's A2 fix: ack_hash now keys on
+        # sha256(cwd + "::" + session_key)[:16], preventing multi-label-
+        # per-cwd starvation. Test-engineer's tests/ack-collision.sh
+        # passes post-fix and fails if the multi-label shape regresses.
+        run: bash tests/ack-collision.sh
+
+      - name: UTF-8 byte-budget parity (idle-birch #3 regression gate)
+        # Activated after coder's Python-aligned-to-bytes fix. Both
+        # runtimes now count UTF-8 bytes against HOOK_BLOCK_BUDGET.
+        # Test fails if Go or Python drifts from byte-denominated
+        # truncation (e.g., regresses to Python char-count semantics).
+        run: bash tests/utf8-budget-parity.sh

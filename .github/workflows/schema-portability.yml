@@ -1,0 +1,141 @@
+# schema-portability — apply migrations/postgres/0001_reserve_v2_columns.sql
+# against a live PostgreSQL 16 container via the peer-inbox-migrate Go
+# binary (goose-backed). v3.0 ships against SQLite, but the schema must
+# stay Postgres-portable so v2 cloud can add a `PostgresRemote Store`
+# without rewriting migrations.
+#
+# This job is the load-bearing check that the per-engine migrations stay
+# in sync and that goose applies cleanly against both dialects.
+
+name: schema-portability
+
+on:
+  push:
+    paths:
+      - "migrations/**"
+      - "go/cmd/migrate/**"
+      - "go/go.mod"
+      - "go/go.sum"
+      - ".github/workflows/schema-portability.yml"
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "go/cmd/migrate/**"
+      - "go/go.mod"
+      - "go/go.sum"
+      - ".github/workflows/schema-portability.yml"
+
+jobs:
+  apply-migrations-postgres:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: agent_collab_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: ci
+      PGDATABASE: agent_collab_ci
+      PG_DSN: "postgres://postgres:ci@localhost:5432/agent_collab_ci?sslmode=disable"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build peer-inbox-migrate
+        working-directory: go
+        run: go build -o bin/peer-inbox-migrate ./cmd/migrate
+
+      - name: Seed baseline schema (pre-v3.0 tables)
+        # Goose's 0001 migration builds on tables Python's init_db()
+        # creates on first run: sessions, inbox, peer_rooms. Seeding
+        # them here matches the Postgres cloud-target shape so the
+        # migration under test exercises the real dialect.
+        run: |
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE TABLE IF NOT EXISTS sessions (
+              cwd           TEXT NOT NULL,
+              label         TEXT NOT NULL,
+              agent         TEXT NOT NULL,
+              role          TEXT,
+              session_key   TEXT,
+              channel_socket TEXT,
+              pair_key      TEXT,
+              started_at    TEXT NOT NULL,
+              last_seen_at  TEXT NOT NULL,
+              PRIMARY KEY (cwd, label)
+            );
+            CREATE TABLE IF NOT EXISTS inbox (
+              id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+              to_cwd        TEXT NOT NULL,
+              to_label      TEXT NOT NULL,
+              from_cwd      TEXT NOT NULL,
+              from_label    TEXT NOT NULL,
+              body          TEXT NOT NULL,
+              created_at    TEXT NOT NULL,
+              read_at       TEXT,
+              room_key      TEXT
+            );
+            CREATE TABLE IF NOT EXISTS peer_rooms (
+              room_key       TEXT PRIMARY KEY,
+              pair_key       TEXT,
+              turn_count     INTEGER NOT NULL DEFAULT 0,
+              terminated_at  TEXT,
+              terminated_by  TEXT
+            );
+          SQL
+
+      - name: Apply migration 0001 via goose
+        run: |
+          go/bin/peer-inbox-migrate \
+            -driver pgx \
+            -dsn "$PG_DSN" \
+            -dir migrations/postgres \
+            up
+
+      - name: Assert goose_db_version reflects applied state
+        run: |
+          applied=$(psql -t -A -c "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied")
+          echo "max applied version: $applied"
+          test "$applied" = "1" || { echo "FAIL: expected goose_db_version=1"; exit 1; }
+
+      - name: Assert meta.schema_version seeded at 10 (legacy-compat)
+        run: |
+          version=$(psql -t -A -c "SELECT value FROM meta WHERE key='schema_version'")
+          test "$version" = "10" || { echo "FAIL: expected schema_version=10"; exit 1; }
+
+      - name: Assert v2-reserve columns present on inbox
+        run: |
+          psql -t -A -c "
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'inbox' AND column_name IN
+                  ('user_id','workspace_id','idempotency_key','client_seq')
+            ORDER BY column_name
+          " | tee /tmp/cols.out
+          diff <(sort /tmp/cols.out) <(printf 'client_seq\nidempotency_key\nuser_id\nworkspace_id\n') \
+            || { echo "FAIL: v2-reserve columns missing"; exit 1; }
+
+      - name: Re-apply migration 0001 (goose idempotency check)
+        run: |
+          go/bin/peer-inbox-migrate \
+            -driver pgx \
+            -dsn "$PG_DSN" \
+            -dir migrations/postgres \
+            up
