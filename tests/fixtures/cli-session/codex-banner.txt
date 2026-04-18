@@ -1,0 +1,20 @@
+Reading additional input from stdin...
+OpenAI Codex v0.121.0 (research preview)
+--------
+workdir: /private/tmp/codex-banner-cap
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019da016-7eef-7192-b5a6-908a9c7db2f6
+--------
+user
+reply with literal text: STOP
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+STOP
+tokens used
+7,443

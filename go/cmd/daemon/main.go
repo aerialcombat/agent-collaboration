@@ -145,6 +145,14 @@ type daemonConfig struct {
 	// stays allocation-free.
 	ClaudeSettingsPath string
 	LogPath            string
+	// Topic 3 v0.1 (Architecture D) §7 — CLI-native session-resume
+	// opt-in flag. When true AND CLI in {codex, gemini}, daemon
+	// captures the CLI vendor session-ID on first spawn (§6) and
+	// passes the cached identity to subsequent spawns. When CLI=claude,
+	// the daemon emits a one-time warning at startup (§4.3) and
+	// proceeds Arch B fresh-invocation regardless. Default false
+	// preserves Topic 3 v0 behavior.
+	CLISessionResume bool
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +205,24 @@ func run(args []string) int {
 		"sweep_ttl_sec", cfg.SweepTTL.Seconds(),
 		"poll_interval_sec", cfg.Poll.Seconds(),
 		"pause_on_idle_sec", cfg.PauseOnIdle.Seconds(),
+		"cli_session_resume", cfg.CLISessionResume,
 	)
+
+	// Topic 3 v0.1 Arch D §4.3 + §3.4 invariant 4: claude + cli_session_resume
+	// is non-fatal — emit the documented warning string and proceed in
+	// fresh-invocation mode. Sub-task B/C/D will read cfg.CLISessionResume in
+	// the per-CLI spawn helpers; for cliClaude the helper ignores the flag
+	// (defensive assertion locked at the spawn-construction layer per gate
+	// 6d). Warn at startup so operators see it once, not per-spawn.
+	if cfg.CLI == cliClaude && cfg.CLISessionResume {
+		log.Warn("daemon.cli_session_resume.claude_asymmetry",
+			"label", cfg.Label,
+			"msg", "Claude has no cross-process session-resume; --cli-session-resume is a no-op for this daemon (see Arch B asymmetry note in operator guide).",
+		)
+		fmt.Fprintln(os.Stderr,
+			"Claude has no cross-process session-resume; --cli-session-resume is a no-op for this daemon (see Arch B asymmetry note in operator guide).",
+		)
+	}
 
 	// L4 heartbeat dep — see papercut 712121c (docs/plans/post-
 	// option-j-handoff.md). This daemon does NOT ship heartbeat in
@@ -234,6 +259,14 @@ type configFile struct {
 	PauseIdleSec   int    `json:"pause_on_idle,omitempty"`
 	LogPath        string `json:"log_path,omitempty"`
 	ClaudeSettings string `json:"claude_settings,omitempty"`
+	// Topic 3 v0.1 Arch D §7.1 opt-in flag. JSON boolean only in v0.1.
+	// §7.3 reserves the per-CLI object form (cli_session_resume:
+	// {codex: true, gemini: false}) for v1+; if operator passes the
+	// object form, json.Unmarshal returns a clear "cannot unmarshal
+	// object into Go struct field" error pointing at the line — that's
+	// sufficient for v0.1 since the v1+ shape is documented in §7.3.
+	// Pointer to distinguish "field absent" from "field set to false."
+	CLISessionResume *bool `json:"cli_session_resume,omitempty"`
 }
 
 // resolveConfigPath expands --config arguments:
@@ -297,8 +330,9 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		sweepTTLSec    = fs.Int("sweep-ttl", 0, "sweeper TTL in seconds — used here only for the startup TTL-ordering validator (default: config file, AGENT_COLLAB_SWEEP_TTL env, or 600)")
 		pollSec        = fs.Int("poll-interval", 0, "DB poll cadence between ticks in seconds (default: config file or 2)")
 		pauseIdleSec   = fs.Int("pause-on-idle", 0, "seconds of no activity before slowing poll frequency (default: config file or 1800)")
-		logPath        = fs.String("log-path", "", "optional slog JSON output file path")
-		claudeSettings = fs.String("claude-settings", "", "path to Claude settings.json passed via --settings on every claude spawn (default: config file, or ~/.claude/settings.json)")
+		logPath          = fs.String("log-path", "", "optional slog JSON output file path")
+		claudeSettings   = fs.String("claude-settings", "", "path to Claude settings.json passed via --settings on every claude spawn (default: config file, or ~/.claude/settings.json)")
+		cliSessionResume = fs.Bool("cli-session-resume", false, "Topic 3 v0.1 Arch D opt-in: pass the CLI vendor's native session-ID into subsequent spawns (codex/gemini only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation behavior.")
 	)
 	if err := fs.Parse(args); err != nil {
 		return daemonConfig{}, exitUsage, fmt.Errorf("parse flags: %w", err)
@@ -349,6 +383,18 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 	resolvedClaudeSettings := *claudeSettings
 	if !explicitlySet["claude-settings"] && cf.ClaudeSettings != "" {
 		resolvedClaudeSettings = cf.ClaudeSettings
+	}
+
+	// Topic 3 v0.1 Arch D §7.2 — opt-in flag precedence: CLI flag > config
+	// file > env > default. Default is false (preserves Topic 3 v0
+	// fresh-invocation behavior).
+	resolvedCLISessionResume := *cliSessionResume
+	if !explicitlySet["cli-session-resume"] {
+		if cf.CLISessionResume != nil {
+			resolvedCLISessionResume = *cf.CLISessionResume
+		} else if os.Getenv("AGENT_COLLAB_CLI_SESSION_RESUME") == "1" {
+			resolvedCLISessionResume = true
+		}
 	}
 
 	if resolvedLabel == "" {
@@ -441,6 +487,7 @@ func parseFlags(args []string) (daemonConfig, int, error) {
 		PauseOnIdle:        time.Duration(pauseResolved) * time.Second,
 		ClaudeSettingsPath: resolvedClaudeSettings,
 		LogPath:            resolvedLogPath,
+		CLISessionResume:   resolvedCLISessionResume,
 	}, exitOK, nil
 }
 
