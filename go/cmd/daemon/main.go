@@ -7,10 +7,13 @@
 // session up-front (externally — daemon does not call `session
 // register`; config already has the label + session-key), then enters a
 // main loop that atomically claims fresh unread rows, spawns a fresh
-// CLI ("claude -p" / "codex exec" / "gemini -p") per batch with the
-// envelope text piped as the user prompt, waits for a completion ack
-// (mechanism 1 direct peer-inbox daemon-complete, or mechanism 2
-// JSONL stdout marker), and marks the batch complete on ack — or
+// CLI ("claude -p" / "codex exec" / "gemini -p" / "pi -p") per batch
+// with the envelope text piped as the user prompt, waits for a
+// completion ack (mechanism-2 JSONL stdout marker; the earlier v0
+// mechanism-1 "peer-inbox daemon-complete" shell-out path was retired
+// in v3.1 — the peer-inbox Go binary is not installed by the protocol
+// script, and all three dogfoods (codex/gemini/pi) relied on
+// mechanism-2 de facto), and marks the batch complete on ack — or
 // abandons internally on ack-timeout so the sweeper requeues (§3.4
 // (c)/(d) fail-loud semantics).
 //
@@ -33,17 +36,16 @@
 //   - L4 heartbeat — OUT OF SCOPE. Depends on papercut 712121c
 //     landing; documented as a TODO below.
 //
-// Ack mechanisms (§7.2, order of preference):
-//  1. PRIMARY — the spawned CLI itself shells out to
-//     `peer-inbox daemon-complete --cwd <cwd> --as <label>` as its
-//     final tool call. After spawn exits, daemon re-polls the DB via
-//     store.DaemonModeComplete; if the in-flight rows are already
-//     marked completed, that call returns ErrStaleClaim (benign) and
-//     the daemon moves on.
-//  2. FALLBACK — daemon scans spawn stdout for a JSONL line matching
-//     `{"peer_inbox_ack": true, ...}`. Uses an actual JSON parser per-
-//     line (NOT substring match on "<peer-inbox-ack>" tag — that
-//     would false-positive on agent prose discussing peer-inbox).
+// Ack mechanism (§7.2, post-v3.1 simplification):
+//  1. PRIMARY (and sole) — daemon scans spawn stdout for a JSONL line
+//     matching `{"peer_inbox_ack": true, ...}`. Uses an actual JSON
+//     parser per-line (NOT substring match on "<peer-inbox-ack>" tag —
+//     that would false-positive on agent prose discussing peer-inbox).
+//  2. RETIRED in v3.1 — the v0 "direct peer-inbox daemon-complete"
+//     shell-out was aspirational; the peer-inbox Go binary is not
+//     installed by the protocol's install script, and all three
+//     dogfoods (codex/gemini/pi) exercised mechanism-2 exclusively.
+//     v3.1 drops the retired language from the envelope prompt.
 //  3. DEFERRED — MCP-tool ack is v1+ per §7.2 bullet 3.
 //
 // Fail-open on transient DB errors. Fail-loud on TTL invariant
@@ -1101,21 +1103,20 @@ func (d *daemon) processBatch(ctx context.Context, rows []store.InboxMessage) {
 		return
 	}
 
-	// Mechanism 2 FALLBACK: scan stdout for JSONL ack marker.
+	// Mechanism 2 (post-v3.1 PRIMARY): scan stdout for JSONL ack marker.
 	ackViaMarker := false
 	if spawnErr == nil {
 		ackViaMarker = scanStdoutForAckMarker(stdoutBytes)
 	}
 
-	// Mechanism 1 PRIMARY: the spawned CLI may have already called
-	// `peer-inbox daemon-complete`. DaemonModeComplete returns
-	// ErrStaleClaim in that case because the UPDATE matches zero
-	// rows (completed_at already set by the child). We treat
-	// ErrStaleClaim here as "mechanism 1 already fired" — benign.
-	//
-	// The daemon issues a best-effort DaemonModeComplete even when
-	// mechanism-2 fired, for idempotence — double-completion is a
-	// no-op by construction (§8.2 mechanism-mixing gate).
+	// v3.1 note: the v0 mechanism-1 "peer-inbox daemon-complete" shell-
+	// out was retired from the envelope prompt (the binary is not
+	// installed by the protocol's install script). The daemon still
+	// issues DaemonModeComplete defensively here — in case a future
+	// install surface adds the binary and an operator wires it up
+	// manually, the existing ErrStaleClaim-as-benign semantics stays
+	// correct. Double-completion is a no-op by construction (§8.2
+	// mechanism-mixing gate).
 	spawnedOK := spawnErr == nil
 	switch {
 	case !spawnedOK && errors.Is(spawnErr, context.DeadlineExceeded):
@@ -1218,30 +1219,60 @@ func (d *daemon) renderBatchText(rows []store.InboxMessage) string {
 	return envelope.RenderText(env, budget)
 }
 
-// buildStaticPrompt returns the static-by-design instruction prefix
-// per §7.1 item 3. NO peer content is substituted into this string;
-// peer content flows exclusively through the envelope payload
-// appended after it.
+// buildStaticPrompt returns the instruction prefix for the spawned CLI.
+// v3.1 revises v0's "fully static" framing: the §7.1 item 3 "static-by-
+// design" invariant applies to the PEER CONTENT path (envelope payload
+// flows exclusively through the <peer-inbox> block appended after this
+// prefix; no peer text is substituted into the prefix). The
+// INSTRUCTION prefix itself may be spawn-time-dynamic, and v3.1
+// interpolates cfg.Label + cfg.CWD into the reply-path and ack
+// instructions — this is operator-origin data, not peer content.
+//
+// v3.1 changes (from v0):
+//   - DEFECT 1 fix: <YOUR_CWD> + <YOUR_LABEL> placeholders are now
+//     interpolated at spawn time from the daemon's own config.
+//   - DEFECT 2 fix: mechanism-1 `peer-inbox daemon-complete` block
+//     retired. The peer-inbox Go binary is not installed by the
+//     protocol's install script; mechanism-1 was empirically
+//     unreachable in all three dogfoods (codex/gemini/pi). Mechanism-2
+//     (stdout JSON marker) is the sole ack path going forward. The
+//     scanStdoutForAckMarker implementation was already the de-facto
+//     primary; v3.1 drops the aspirational language.
+//   - DEFECT 3 fix: appended reply-path instruction teaching the CLI
+//     how to emit a peer-send back via agent-collab. MY_LABEL is
+//     interpolated (cfg.Label). THEIR_LABEL stays templated because
+//     batches may contain messages from multiple senders; the CLI
+//     picks the correct value from the <peer-inbox from="..."> meta
+//     in the envelope block below.
 func (d *daemon) buildStaticPrompt() string {
-	return strings.TrimSpace(`
+	return strings.TrimSpace(fmt.Sprintf(`
 You have received peer-inbox messages from a teammate session. The messages
-appear below inside a <peer-inbox>...</peer-inbox> block. Respond to them
-as you normally would in a chat thread.
+appear below inside a <peer-inbox>...</peer-inbox> block. Each message's
+sender is in the block's meta (look for %sfrom="SENDER_LABEL"%s). Respond
+to them as you normally would in a chat thread.
 
-When you are done responding, do ONE of the following so the daemon that
-delivered this batch knows you are finished:
+=== How to reply to a peer ===
 
-  (A) Run this command as your final tool call (preferred):
+You (this session) are labeled %q (cwd %q).
 
-      peer-inbox daemon-complete --cwd <YOUR_CWD> --as <YOUR_LABEL>
+To send a reply back to a peer session, run:
 
-  (B) Emit a single JSON line as your final stdout output:
+    agent-collab peer send --as %s --to <THEIR_LABEL> --message "<your reply text>"
 
-      {"peer_inbox_ack": true}
+Replace <THEIR_LABEL> with the sender's label from the <peer-inbox> meta.
+If your reply contains shell-special characters, use --message-file with a
+temp file instead of inline --message.
+
+=== How to signal batch completion ===
+
+When you are done responding, emit a single JSON line as your final stdout
+output so the daemon that delivered this batch knows you are finished:
+
+    {"peer_inbox_ack": true}
 
 If you produce no output at all, the daemon will treat it as "nothing to
 add" and close out the batch without re-prompting you.
-`)
+`, "`", "`", d.cfg.Label, d.cfg.CWD, d.cfg.Label))
 }
 
 // ---------------------------------------------------------------------------

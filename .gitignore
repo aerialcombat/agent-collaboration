@@ -20,3 +20,6 @@ poll_messages.sh
 # Claude Code per-user local settings + worktrees
 .claude/settings.local.json
 .claude/worktrees/
+
+# pi-mono per-repo scratch (messenger / etc.)
+.pi/
