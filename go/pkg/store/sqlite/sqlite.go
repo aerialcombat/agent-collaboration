@@ -645,5 +645,91 @@ func (s *SQLiteLocal) SetDaemonState(ctx context.Context, self store.Session, ne
 	return nil
 }
 
+// SetDaemonCLISessionID persists the captured CLI-vendor session-ID for
+// the (cwd, label) session. Topic 3 v0.1 (Architecture D) §5.2: the
+// daemon's spawn helpers call this on first capture (codex regex-banner
+// per §6.1; gemini --list-sessions delta-snapshot per §6.2).
+//
+// The ID is opaque from the daemon's perspective — UUIDs for both
+// codex and gemini in current CLI versions, but the column is TEXT so
+// future CLI vendors can use any string identity. Daemon NEVER
+// introspects the CLI vendor's session-store contents (§3.4 invariant 2,
+// pointer-only).
+func (s *SQLiteLocal) SetDaemonCLISessionID(ctx context.Context, self store.Session, sessionID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sessions
+		SET daemon_cli_session_id = ?
+		WHERE cwd = ? AND label = ?
+	`, sessionID, self.CWD, self.Label)
+	if err != nil {
+		return fmt.Errorf("set daemon_cli_session_id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("no session row for cwd=%q label=%q", self.CWD, self.Label)
+	}
+	return nil
+}
+
+// GetDaemonCLISessionID reads the persisted CLI session-ID for the
+// (cwd, label) session. Returns empty string + nil when the column is
+// NULL (no captured session yet, or explicitly reset). Returns
+// non-nil error only on SQL failure or session-not-found.
+//
+// Daemon's resume-helper calls this at every batch start: empty string
+// means "spawn fresh + capture"; non-empty means "use this session-ID
+// in the spawn argv per §4.1/§4.2".
+func (s *SQLiteLocal) GetDaemonCLISessionID(ctx context.Context, self store.Session) (string, error) {
+	var id sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT daemon_cli_session_id
+		FROM sessions
+		WHERE cwd = ? AND label = ?
+	`, self.CWD, self.Label).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("no session row for cwd=%q label=%q", self.CWD, self.Label)
+		}
+		return "", fmt.Errorf("get daemon_cli_session_id: %w", err)
+	}
+	if !id.Valid {
+		return "", nil
+	}
+	return id.String, nil
+}
+
+// ClearDaemonCLISessionID NULLs the persisted CLI session-ID for the
+// (cwd, label) session. Used by the operator reset verb
+// (peer-inbox daemon-reset-session per §8.1) and by the auto-GC hook on
+// L1 content-stop in transitionClosed (§8.2).
+//
+// Idempotent per §3.4 invariant 3: clearing an already-NULL column
+// returns nil (success) — operators recovering from confused state
+// shouldn't need to know the prior state. The "row matched but value
+// was already NULL" case is indistinguishable from "row matched and
+// value was non-NULL" via RowsAffected on UPDATE in SQLite (always 1
+// when the WHERE matches), so the idempotency is structural.
+func (s *SQLiteLocal) ClearDaemonCLISessionID(ctx context.Context, self store.Session) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sessions
+		SET daemon_cli_session_id = NULL
+		WHERE cwd = ? AND label = ?
+	`, self.CWD, self.Label)
+	if err != nil {
+		return fmt.Errorf("clear daemon_cli_session_id: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("no session row for cwd=%q label=%q", self.CWD, self.Label)
+	}
+	return nil
+}
+
 // Compile-time assertion: SQLiteLocal implements store.Store.
 var _ store.Store = (*SQLiteLocal)(nil)

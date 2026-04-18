@@ -1973,6 +1973,57 @@ def _sessions_daemon_state(conn: sqlite3.Connection, cwd: str, label: str) -> st
         return "open"
 
 
+def _set_daemon_cli_session_id(conn: sqlite3.Connection, cwd: str, label: str, session_id: str) -> int:
+    """Persist captured CLI-vendor session-ID for (cwd, label).
+
+    Topic 3 v0.1 (Architecture D) §5.3 — Python parity for the Go
+    SetDaemonCLISessionID. Returns the number of rows updated; caller
+    decides on zero (typically: raise / err with EXIT_NOT_FOUND).
+    """
+    cur = conn.execute(
+        "UPDATE sessions SET daemon_cli_session_id = ? WHERE cwd = ? AND label = ?",
+        (session_id, cwd, label),
+    )
+    return cur.rowcount
+
+
+def _get_daemon_cli_session_id(conn: sqlite3.Connection, cwd: str, label: str) -> Optional[str]:
+    """Read persisted CLI session-ID for (cwd, label).
+
+    Returns None when the column is NULL (no captured session yet, or
+    explicitly reset) OR when no session row exists. Distinguishing
+    those two cases is the caller's responsibility (query the row first
+    if needed).
+    """
+    row = conn.execute(
+        "SELECT daemon_cli_session_id FROM sessions WHERE cwd = ? AND label = ?",
+        (cwd, label),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        val = row["daemon_cli_session_id"]
+    except (KeyError, IndexError):
+        return None
+    return val if val else None
+
+
+def _clear_daemon_cli_session_id(conn: sqlite3.Connection, cwd: str, label: str) -> int:
+    """NULL the persisted CLI session-ID for (cwd, label).
+
+    Used by the operator reset verb (`peer receive --reset-session`) and
+    by the auto-GC hook on L1 content-stop in the daemon (§8.2). Returns
+    the number of rows updated; idempotent per §3.4 invariant 3 — caller
+    treats rowcount=1 with prior-NULL as success (operator perspective).
+    Rowcount=0 means no session row, which is a separate failure mode.
+    """
+    cur = conn.execute(
+        "UPDATE sessions SET daemon_cli_session_id = NULL WHERE cwd = ? AND label = ?",
+        (cwd, label),
+    )
+    return cur.rowcount
+
+
 def _default_sweep_ttl_seconds() -> int:
     """Resolve sweep TTL from env or fall back to 10-minute production default.
 
@@ -2001,10 +2052,11 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
         getattr(args, "daemon_mode", False),
         getattr(args, "complete", False),
         getattr(args, "sweep", False),
+        getattr(args, "reset_session", False),
     ]
     if sum(1 for m in sub_modes if m) > 1:
         err(
-            "peer receive: --mark-read, --daemon-mode, --complete, --sweep are mutually exclusive",
+            "peer receive: --mark-read, --daemon-mode, --complete, --sweep, --reset-session are mutually exclusive",
             EXIT_USAGE,
         )
 
@@ -2012,6 +2064,8 @@ def cmd_peer_receive(args: argparse.Namespace) -> int:
         return _cmd_peer_receive_sweep(args)
     if getattr(args, "complete", False):
         return _cmd_peer_receive_complete(args)
+    if getattr(args, "reset_session", False):
+        return _cmd_peer_receive_reset_session(args)
     if getattr(args, "daemon_mode", False):
         return _cmd_peer_receive_daemon_mode(args)
 
@@ -2316,6 +2370,57 @@ def _cmd_peer_receive_complete(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
     else:
         print(f"completed: {len(completed)} row(s); ids={[r['id'] for r in completed]}")
+    return EXIT_OK
+
+
+def _cmd_peer_receive_reset_session(args: argparse.Namespace) -> int:
+    """peer receive --reset-session --as <label>: clear daemon CLI session-ID.
+
+    Topic 3 v0.1 (Architecture D) §8.1 PRIMARY reset primitive — Python
+    parity for `peer-inbox daemon-reset-session`. NULLs
+    sessions.daemon_cli_session_id for the named label so the next
+    daemon spawn allocates a fresh CLI vendor session-ID.
+
+    Idempotent per §3.4 invariant 3: safe to spam — clearing an already-
+    NULL column returns success with the same payload (no exit-non-zero
+    on already-cleared state).
+
+    Exit codes:
+        0  success (reset applied)
+        6  no session row for (cwd, label) — operator misconfigured the
+           label, or the session was never registered.
+    """
+    cwd = resolve_cwd(args.cwd)
+    self_cwd, self_label = resolve_self(args.as_label, cwd)
+
+    conn = open_db()
+    try:
+        rowcount = _clear_daemon_cli_session_id(conn, str(self_cwd), self_label)
+        conn.commit()
+    finally:
+        conn.close()
+
+    if rowcount == 0:
+        err(
+            f"no session row for cwd={str(self_cwd)!r} label={self_label!r} — "
+            f"operator misconfigured the label, or the session was never registered. "
+            f"Run `agent-collab session register --cwd {self_cwd} --label {self_label} "
+            f"--receive-mode daemon` first.",
+            EXIT_NOT_FOUND,
+        )
+
+    if args.format == "json":
+        json.dump(
+            {"reset": True, "label": self_label},
+            sys.stdout,
+            ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(
+            f"daemon-reset-session: cleared daemon_cli_session_id for ({self_cwd}, {self_label}); "
+            f"next spawn will allocate a fresh CLI session"
+        )
     return EXIT_OK
 
 
@@ -3900,6 +4005,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "Returns JSON of reaped rows for audit. Run on a timer (cron / systemd-timer).")
     pr.add_argument("--sweep-ttl", dest="sweep_ttl", type=int,
                     help="Sweep TTL in seconds; overrides AGENT_COLLAB_SWEEP_TTL env (default 600s = 10m production).")
+    # Topic 3 v0.1 (Arch D) §8.1 — PRIMARY reset primitive. NULLs the captured
+    # CLI vendor session-ID for the named label; next daemon spawn allocates
+    # fresh. Mutually exclusive with the other --* sub-modes (cmd_peer_receive
+    # validates at runtime).
+    pr.add_argument("--reset-session", dest="reset_session", action="store_true",
+                    help="Daemon Arch D operator reset: NULL daemon_cli_session_id for the label "
+                         "(forces next spawn to allocate a fresh CLI vendor session). Idempotent. "
+                         "Topic 3 v0.1 §8.1 PRIMARY reset primitive.")
     pr.set_defaults(func=cmd_peer_receive)
 
     pl = sub.add_parser("peer-list")

@@ -32,6 +32,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -49,6 +50,7 @@ const (
 	exitOK       = 0
 	exitUsage    = 64 // sysexits EX_USAGE
 	exitDataErr  = 65 // sysexits EX_DATAERR — Topic 3 fail-loud contract violation
+	exitNotFound = 6  // matches Python EXIT_NOT_FOUND — session row not found by (cwd, label)
 	exitInternal = 1
 
 	// defaultSweepTTLSeconds mirrors Python's
@@ -75,6 +77,8 @@ func run(args []string) int {
 		return runComplete(rest)
 	case "daemon-sweep":
 		return runSweep(rest)
+	case "daemon-reset-session":
+		return runResetSession(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
@@ -86,14 +90,16 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: peer-inbox <daemon-claim|daemon-complete|daemon-sweep> [flags]
+	fmt.Fprintf(os.Stderr, `usage: peer-inbox <daemon-claim|daemon-complete|daemon-sweep|daemon-reset-session> [flags]
 
-  daemon-claim    --cwd DIR --as LABEL [--format json|plain]
-  daemon-complete --cwd DIR --as LABEL [--format json|plain]
-  daemon-sweep    [--cwd DIR] [--sweep-ttl SECS] [--format json|plain]
+  daemon-claim         --cwd DIR --as LABEL [--format json|plain]
+  daemon-complete      --cwd DIR --as LABEL [--format json|plain]
+  daemon-sweep         [--cwd DIR] [--sweep-ttl SECS] [--format json|plain]
+  daemon-reset-session --cwd DIR --as LABEL [--format json|plain]
 
 Go parity for the Python daemon-mode verbs in scripts/peer-inbox-db.py.
-Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation.
+Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation,
+6 = session not found.
 `)
 }
 
@@ -442,4 +448,112 @@ func runSweep(args []string) int {
 			r.ID, r.ToCWD, r.ToLabel, r.ClaimOwner)
 	}
 	return exitOK
+}
+
+// ---------------------------------------------------------------------------
+// daemon-reset-session
+// ---------------------------------------------------------------------------
+
+// resetSessionPayload mirrors the Python verb's JSON byte shape: emits
+// {"reset": true, "label": "..."}` so downstream observability can
+// trivially confirm the operation succeeded.
+type resetSessionPayload struct {
+	Reset bool   `json:"reset"`
+	Label string `json:"label"`
+}
+
+// runResetSession implements `peer-inbox daemon-reset-session --cwd DIR
+// --as LABEL [--format json|plain]` per Topic 3 v0.1 (Architecture D)
+// §8.1 PRIMARY reset primitive. NULLs sessions.daemon_cli_session_id
+// for the named label so the next daemon spawn allocates a fresh CLI
+// vendor session-ID.
+//
+// Idempotent per §3.4 invariant 3: safe to spam — clearing an already-
+// NULL column returns success with the same payload.
+//
+// Exit codes:
+//
+//	0  success (reset applied; column may have been NULL or non-NULL)
+//	64 missing/invalid --as
+//	6  no session row for (cwd, label) — operator misconfigured the label
+func runResetSession(args []string) int {
+	fs := flag.NewFlagSet("daemon-reset-session", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var (
+		cwd    = fs.String("cwd", "", "session cwd (default: process cwd)")
+		asLbl  = fs.String("as", "", "session label to reset (required)")
+		format = fs.String("format", "plain", "output format: json | plain")
+	)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *asLbl == "" {
+		fmt.Fprintln(os.Stderr, "daemon-reset-session: --as <label> is required")
+		return exitUsage
+	}
+	fmtStr, err := parseFormat(*format)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-reset-session: %v\n", err)
+		return exitUsage
+	}
+	resolvedCWD, err := resolveCWD(*cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-reset-session: resolve cwd: %v\n", err)
+		return exitInternal
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "daemon-reset-session: open store: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	self := store.Session{CWD: resolvedCWD, Label: *asLbl}
+	if err := st.ClearDaemonCLISessionID(ctx, self); err != nil {
+		// Distinguish "no session row" from other SQL errors so the
+		// operator gets a clean exit code per §8.1.
+		if errors.Is(err, sql.ErrNoRows) || stringContains(err.Error(), "no session row") {
+			fmt.Fprintf(os.Stderr,
+				"daemon-reset-session: no session row for cwd=%q label=%q — "+
+					"operator misconfigured the label, OR the session was never "+
+					"registered. Run `agent-collab session register --cwd %s --label %s "+
+					"--receive-mode daemon` first.\n",
+				resolvedCWD, *asLbl, resolvedCWD, *asLbl,
+			)
+			return exitNotFound
+		}
+		fmt.Fprintf(os.Stderr, "daemon-reset-session: %v\n", err)
+		return exitInternal
+	}
+
+	if fmtStr == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(resetSessionPayload{Reset: true, Label: *asLbl}); err != nil {
+			fmt.Fprintf(os.Stderr, "daemon-reset-session: encode json: %v\n", err)
+			return exitInternal
+		}
+		return exitOK
+	}
+	// plain — clear, operator-facing message; consistent wording with
+	// the Python verb + the doc'd SQL escape hatch (§8.3).
+	fmt.Printf("daemon-reset-session: cleared daemon_cli_session_id for (%s, %s); "+
+		"next spawn will allocate a fresh CLI session\n", resolvedCWD, *asLbl)
+	return exitOK
+}
+
+// stringContains is a tiny helper to avoid importing "strings" just for
+// substring checks in error-path branches. Kept inline to match the file's
+// minimal-deps style.
+func stringContains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
