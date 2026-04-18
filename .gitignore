@@ -11,3 +11,8 @@ go/bin/
 
 # Scratch / ad-hoc polling
 poll_messages.sh
+
+# Topic 3 daemon runtime artifacts (v3.x auto-reply-driver)
+.agent-collab/daemon/
+*.daemon.pid
+*.daemon.log
