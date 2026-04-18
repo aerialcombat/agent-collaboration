@@ -74,12 +74,29 @@ PAIR_KEY_NOUNS = (
     "tide", "tiger", "trail", "tulip", "valley", "vista", "willow", "wolf",
     "wren", "zebra", "zenith", "zephyr",
 )
-MAX_BODY_BYTES = 8 * 1024
-HOOK_BLOCK_BUDGET = 4 * 1024
+MAX_BODY_BYTES = int(os.environ.get("AGENT_COLLAB_MAX_BODY_BYTES", 8 * 1024))
+HOOK_BLOCK_BUDGET = int(os.environ.get("AGENT_COLLAB_HOOK_BLOCK_BUDGET", 4 * 1024))
 STALE_THRESHOLD_SECS = 30 * 60
 IDLE_THRESHOLD_SECS = 5 * 60
 SQLITE_MIN_VERSION = (3, 35, 0)
 PYTHON_MIN = (3, 9)
+
+# v3.0 (W1 round-2): goose owns migration state. `goose_db_version` is the
+# authoritative source; `meta.schema_version` is written by the same
+# migration for legacy-compat only and must not be consulted for version
+# checks. GOOSE_VERSION_REQUIRED must match go/pkg/store/sqlite/sqlite.go's
+# GooseVersionRequired constant.
+GOOSE_VERSION_REQUIRED = 1
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MIGRATE_BINARY_CANDIDATES = (
+    Path.home() / ".local" / "bin" / "peer-inbox-migrate",
+    PROJECT_ROOT / "go" / "bin" / "peer-inbox-migrate",
+)
+MIGRATIONS_SQLITE_DIR = PROJECT_ROOT / "migrations" / "sqlite"
+
+# v3.0: dirty-marker file touched by every send path. The Go hook binary
+# stats this file to short-circuit empty-inbox invocations at ~1ms.
+INBOX_DIRTY_MARKER = Path.home() / ".agent-collab" / "inbox-dirty"
 SESSION_KEY_ENV_CANDIDATES = (
     "AGENT_COLLAB_SESSION_KEY",
     "CLAUDE_SESSION_ID",
@@ -357,6 +374,96 @@ def migrate_inbox_room_key(conn: sqlite3.Connection) -> None:
     )
 
 
+def _find_migrate_binary() -> Optional[Path]:
+    """Locate the peer-inbox-migrate binary. Tries PATH first, then known
+    install locations. Returns None if nothing is found."""
+    import shutil
+    on_path = shutil.which("peer-inbox-migrate")
+    if on_path:
+        return Path(on_path)
+    for candidate in MIGRATE_BINARY_CANDIDATES:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _goose_version(conn: sqlite3.Connection) -> int:
+    """Return max applied goose migration version, or 0 if none/table missing."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='goose_db_version'"
+    ).fetchone()
+    if row is None:
+        return 0
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version_id), 0) FROM goose_db_version WHERE is_applied = 1"
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def apply_migrations(path: Path) -> None:
+    """Run `peer-inbox-migrate up` against the SQLite DB at `path`.
+
+    Called by `open_db()` when goose_db_version is missing or stale. Errors
+    with a clear install hint if the migrate binary is not on PATH or at
+    one of the known locations."""
+    import subprocess
+    binary = _find_migrate_binary()
+    if binary is None:
+        err(
+            "peer-inbox-migrate binary not found; "
+            "install it via `go install ./go/cmd/migrate` (from the repo root) "
+            f"or place the built binary at one of: "
+            f"{', '.join(str(p) for p in MIGRATE_BINARY_CANDIDATES)}",
+            EXIT_CONFIG_ERROR,
+        )
+    cmd = [
+        str(binary),
+        "-driver", "sqlite",
+        "-dsn", str(path),
+        "-dir", str(MIGRATIONS_SQLITE_DIR),
+        "up",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        err(f"peer-inbox-migrate failed to start: {e}", EXIT_CONFIG_ERROR)
+    if result.returncode != 0:
+        err(
+            f"peer-inbox-migrate exited {result.returncode}: {result.stderr.strip()}",
+            EXIT_CONFIG_ERROR,
+        )
+
+
+def check_schema_version(conn: sqlite3.Connection) -> None:
+    """Refuse to run if goose_db_version < required.
+
+    Called after open_db() has already attempted apply_migrations; firing
+    here means migrate_binary succeeded but didn't advance the version,
+    which is a bug-class we want to surface rather than limp past."""
+    current = _goose_version(conn)
+    if current < GOOSE_VERSION_REQUIRED:
+        err(
+            f"goose_db_version {current} < required {GOOSE_VERSION_REQUIRED}; "
+            "apply_migrations() should have advanced this — check logs",
+            EXIT_CONFIG_ERROR,
+        )
+
+
+def mark_inbox_dirty() -> None:
+    """Touch the dirty-marker file so the Go hook's fast-path knows to run.
+
+    Best-effort: failures (permission, full disk) are silently swallowed
+    because a stale marker only costs an extra <10ms hook invocation.
+    """
+    try:
+        INBOX_DIRTY_MARKER.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        INBOX_DIRTY_MARKER.touch(exist_ok=True)
+        now = time.time()
+        os.utime(INBOX_DIRTY_MARKER, (now, now))
+    except OSError:
+        pass
+
+
 def migrate_peer_rooms(conn: sqlite3.Connection) -> None:
     """Create peer_rooms table for room-level turn counting + termination.
 
@@ -383,21 +490,35 @@ def migrate_peer_rooms(conn: sqlite3.Connection) -> None:
     )
 
 
+def _connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def open_db() -> sqlite3.Connection:
     path = db_path()
     if not path.exists():
         init_db(path)
-    conn = sqlite3.connect(str(path), isolation_level=None)
-    # Apply runtime pragmas on every open. WAL persists per-DB but setting it
-    # here is idempotent and cheap; busy_timeout is per-connection.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.row_factory = sqlite3.Row
+    conn = _connect(path)
+    # Legacy idempotent migrations (pre-goose column additions, room tables,
+    # etc.) — these pre-date the v3.0 goose-owned schema and stay Python-
+    # applied for the coexistence window. Goose only owns migrations/0001+.
     migrate_sessions_session_key(conn)
     migrate_sessions_channel_socket(conn)
     migrate_sessions_pair_key(conn)
     migrate_inbox_room_key(conn)
     migrate_peer_rooms(conn)
+    # Goose-owned migrations from 0001 onward. If goose_db_version is absent
+    # or behind, auto-invoke peer-inbox-migrate (A3 ruling (a)). We close the
+    # Python conn first so the migrate binary owns the writer lock cleanly.
+    if _goose_version(conn) < GOOSE_VERSION_REQUIRED:
+        conn.close()
+        apply_migrations(path)
+        conn = _connect(path)
+    check_schema_version(conn)
     return conn
 
 
@@ -930,6 +1051,7 @@ def emit_system_event(
         conn.execute("COMMIT")
     finally:
         conn.close()
+    mark_inbox_dirty()
 
     push_meta_base: dict[str, str] = {"system": kind}
     if extra_meta:
@@ -1412,6 +1534,7 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         recipient_socket = target["channel_socket"]
     finally:
         conn.close()
+    mark_inbox_dirty()
 
     members = _room_members(str(self_cwd), self_label, self_pair_key)
     mentions = _resolve_mentions(
@@ -1590,6 +1713,7 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
         conn.execute("COMMIT")
     finally:
         conn.close()
+    mark_inbox_dirty()
 
     members = _room_members(str(self_cwd), self_label, self_pair_key)
     mentions = _resolve_mentions(
@@ -1628,24 +1752,38 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
 
 
 def format_hook_block(rows: list[sqlite3.Row]) -> str:
-    """Compose the <peer-inbox>...</peer-inbox> block, capped at HOOK_BLOCK_BUDGET."""
+    """Compose the <peer-inbox>...</peer-inbox> block, capped at HOOK_BLOCK_BUDGET.
+
+    Budget counts UTF-8 bytes on both runtimes (W1 review idle-birch #3
+    ruling: align Python to Go — bytes is the real constraint surface).
+    Previously Python measured ``len(str)`` chars against a byte budget;
+    multi-byte content (e.g. Korean, Chinese, emoji) under-counted, so
+    Python included ~3× more content than Go at the same cap."""
     if not rows:
         return ""
     labels = sorted({r["from_label"] for r in rows})
-    parts = [
+    header = (
         f'<peer-inbox messages="{len(rows)}" '
         f'from-session-labels="{",".join(labels)}">'
-    ]
-    used = sum(len(p) + 1 for p in parts)
+    )
+    parts = [header]
+    # Reserve space for the closing tag so the final block fits within
+    # budget. Truncation message (~60 bytes when triggered) is unaccounted
+    # headroom; HOOK_BLOCK_BUDGET is a 4 KiB ceiling against ~hundreds-
+    # of-bytes messages, so the approximation is safe. Keep this in sync
+    # with go/cmd/hook/main.go format_hook_block's accounting.
+    closing_tag = "</peer-inbox>"
+    used = len(header.encode("utf-8")) + len(closing_tag.encode("utf-8"))
     included = 0
     truncated = 0
     for r in rows:
         entry = f"\n[{r['from_label']} @ {r['created_at']}]\n{r['body']}\n"
-        if used + len(entry) > HOOK_BLOCK_BUDGET and included > 0:
+        entry_bytes = len(entry.encode("utf-8"))
+        if used + entry_bytes > HOOK_BLOCK_BUDGET and included > 0:
             truncated = len(rows) - included
             break
         parts.append(entry)
-        used += len(entry)
+        used += entry_bytes
         included += 1
     if truncated:
         parts.append(
