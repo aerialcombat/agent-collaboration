@@ -15,12 +15,13 @@ Go binary at `go/cmd/daemon/`).
 1. [What this is](#what-this-is)
 2. [Quick start](#quick-start)
 3. [Config reference](#config-reference)
-4. [How it works (architecture)](#how-it-works-architecture)
-5. [Termination stack](#termination-stack)
-6. [Completion-ack contract](#completion-ack-contract)
-7. [Troubleshooting](#troubleshooting)
-8. [Security surface](#security-surface)
-9. [Cost model](#cost-model)
+4. [Architecture D — CLI-native session-ID pass-through (v0.1, opt-in)](#architecture-d--cli-native-session-id-pass-through-v01-opt-in)
+5. [How it works (architecture)](#how-it-works-architecture)
+6. [Termination stack](#termination-stack)
+7. [Completion-ack contract](#completion-ack-contract)
+8. [Troubleshooting](#troubleshooting)
+9. [Security surface](#security-surface)
+10. [Cost model](#cost-model)
 
 ---
 
@@ -170,6 +171,185 @@ catalogued in scope doc §4:
   (Gemini's hook-timeout-in-milliseconds quirk is handled at install
   time by `scripts/install-global-protocol`; the daemon doesn't
   re-specify it).
+
+---
+
+## Architecture D — CLI-native session-ID pass-through (v0.1, opt-in)
+
+**Status:** v0.1 (default OFF). Topic 3 v0 ships fresh-invocation per
+batch (Architecture B). Architecture D layers an opt-in extension that
+passes each CLI's native session-ID into subsequent spawn invocations,
+giving cross-spawn context continuity for `codex` and `gemini` daemons
+without the operational complexity of long-running CLI shells.
+
+Scope-doc reference: `plans/v3.x-topic-3-arch-d-scoping.md`. Manual
+operator probe protocol: [DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md).
+
+### When to enable
+
+Enable Arch D when:
+- The daemon's spawned CLI benefits from carrying conversation/state
+  across batches (multi-message threads, on-going code-review work,
+  any reactive role where prior context aids responsiveness).
+- You accept the trust-boundary trade: untrusted CLI-side state crosses
+  spawns. One bad spawn can poison subsequent ones until a reset
+  (operator opt-in is the explicit acceptance lever — scope §3.1).
+
+Leave Arch D OFF when:
+- Each batch should be independent (stateless review, fresh context per
+  message).
+- You're managing a `claude` daemon (asymmetry — see below).
+
+### How to enable
+
+Three equivalent surfaces, with precedence: CLI flag > config file > env > default false.
+
+```bash
+# CLI flag (one-off)
+agent-collab-daemon --cli-session-resume --label reviewer-codex --cwd ... --cli codex --session-key ...
+
+# Config file (~/.agent-collab/daemons/<label>.json)
+{ "label": "reviewer-codex", ..., "cli_session_resume": true }
+
+# Env var (shared-shell pattern)
+AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
+```
+
+### Per-CLI behavior
+
+- **Codex (`--cli codex`)**: daemon spawns first batch with
+  `codex exec --skip-git-repo-check <prompt>` and captures the
+  session-ID from the stdout banner regex
+  `(?i)session id:\s*([0-9a-f-]{36})`. Subsequent batches spawn
+  `codex exec resume --skip-git-repo-check <UUID> <prompt>`. Session-ID
+  persisted in `sessions.daemon_cli_session_id`.
+
+- **Gemini (`--cli gemini`)**: daemon snapshots `gemini --list-sessions`
+  before/after first spawn; new UUID = set-difference.
+  **Important: gemini 0.38.2's `--resume` flag is documented as
+  accepting `"latest"` or `<index>`, NOT UUIDs.** The daemon stores the
+  UUID for stable identity but translates UUID → current-index via
+  `--list-sessions` re-query at each resume invocation
+  (`gemini --resume <N> -p <prompt>`). This is a v3 amendment to the
+  scope doc per Checkpoint 1 finding (direct-UUID-resume works
+  empirically in 0.38.2 but is undocumented; v0.1 builds on the
+  documented index-addressing API).
+
+  **Concurrent-gemini race**: if `--list-sessions` shows multiple new
+  UUIDs after the daemon's first spawn (another gemini session was
+  created elsewhere), the daemon **does NOT pick a winner** — it logs
+  a warning and leaves the column NULL. Daemon falls through to
+  Arch B fresh-invocation that batch (recoverable). To prevent this
+  by construction, set `GEMINI_CONFIG_DIR=$HOME/.gemini-daemon-<LABEL>`
+  in the daemon's environment so its session store is isolated from
+  any operator interactive gemini sessions.
+
+  ```bash
+  # Race-by-construction prevention (recommended for production)
+  GEMINI_CONFIG_DIR=$HOME/.gemini-daemon-reviewer-gemini \
+    AGENT_COLLAB_CLI_SESSION_RESUME=1 \
+    agent-collab-daemon --config reviewer-gemini
+  ```
+
+### Known asymmetry: Claude
+
+`claude -p` (the form `agent-collab-daemon` uses for spawns) does not
+expose a stable cross-process session-resume mechanism analogous to
+`codex exec resume <UUID>` or `gemini --resume <N>`. `claude --continue`
+operates per-process within a single CLI run, not across separate `-p`
+invocations.
+
+Setting `--cli-session-resume` on a Claude daemon is **non-fatal** — the
+daemon emits a one-time warning at startup and proceeds in Arch B
+fresh-invocation mode:
+
+```
+Claude has no cross-process session-resume; --cli-session-resume is a no-op for this daemon (see Arch B asymmetry note in operator guide).
+```
+
+This ergonomics decision (warn-not-fail) lets operators apply a single
+`cli_session_resume: true` field across a config used by multiple
+daemons of mixed CLI kinds. Claude daemons silently ignore the flag;
+codex + gemini honor it. Scope §4.3 + §3.4 invariant 4.
+
+If `claude -p` gains a stable cross-process session-resume in a future
+release, v1+ will extend Arch D to include claude.
+
+### Reset primitives
+
+When the captured CLI session goes wrong (poisoned context, vendor-side
+expiry, operator wants a clean slate), three reset paths in order of
+preference:
+
+1. **PRIMARY — operator verb (recommended):**
+
+   ```bash
+   # Go fast-path
+   peer-inbox daemon-reset-session --cwd <CWD> --as <LABEL>
+
+   # Python equivalent
+   agent-collab peer receive --reset-session --as <LABEL>
+   ```
+
+   Both NULL `sessions.daemon_cli_session_id` for the named label. The
+   next daemon spawn allocates a fresh CLI vendor session-ID and
+   captures it per the per-CLI flow above. Idempotent — safe to spam
+   even when the column is already NULL.
+
+   Exit codes: `0` success; `64` missing/invalid `--as`; `6` no session
+   row for `(cwd, label)`.
+
+2. **SECONDARY — auto-GC on L1 content-stop:** when a delivered batch
+   contains the L1 content-stop sentinel (see Termination stack §
+   below), the daemon clears `daemon_cli_session_id` automatically as
+   part of the same `transitionClosed` operation that flips
+   `daemon_state='closed'`. Reopening the daemon (operator flips
+   `daemon_state` back to `'open'`) gets a fresh CLI session by
+   construction.
+
+3. **TERTIARY — SQL escape hatch (always-available recovery):**
+
+   ```sql
+   -- Drop the captured CLI session-ID for a daemon-managed label.
+   -- Next spawn will allocate a fresh session.
+   UPDATE sessions
+   SET daemon_cli_session_id = NULL
+   WHERE cwd = '/path/to/cwd' AND label = 'reviewer-codex';
+   ```
+
+   No new code needed; safe fallback if the Go binary or Python verb is
+   unreachable.
+
+**Important: external SQL flip of `daemon_state='closed'` does NOT
+auto-GC the captured CLI session-ID.** L2 dormancy and Arch D capture
+are distinct concerns: `daemon_state` controls whether the daemon
+claims new batches; `daemon_cli_session_id` controls whether the next
+claim resumes or starts fresh. To clear both at once, run the operator
+reset verb in addition to the SQL flip.
+
+### Trust boundary trade
+
+Architecture D moves cross-spawn untrusted-state carryover from
+"impossible by construction" (Arch B) to "operator-acceptable behind an
+opt-in flag." The daemon **owns the pointer** (`sessions.daemon_cli_session_id`)
+but does **not introspect the contents** (`~/.codex/sessions/<UUID>/*`
+or equivalent for gemini are vendor-internal — daemon never reads
+them). Per scope §3.4 invariants:
+
+1. The envelope payload is still load-bearing per batch — the daemon
+   ALWAYS serializes and passes the full claimed-batch envelope as the
+   spawn's prompt. Resume affects argv shape, not prompt content.
+   Prevents the "CLI remembers, daemon skips delivery" bug class.
+2. Daemon never opens or parses CLI-vendor session-store files.
+3. Reset is idempotent (safe-to-spam, no error on already-NULL state).
+4. `--cli claude --cli-session-resume` is non-fatal (warn + Arch B).
+5. Capture-failure is non-fatal (regex no-match, gemini race, etc. all
+   fall through to Arch B for that batch — daemon never blocks).
+
+A richer alternative — daemon-controlled `ContinuitySummary` envelope-
+bridging where the daemon manages context content directly — is
+deferred to v1+. Arch D is the lighter-weight intermediate that uses
+each CLI's own session-management, with the trust trade made explicit.
 
 ---
 
@@ -613,11 +793,19 @@ when Topic 2 ships.
   truth for daemon behavior (§2.2 binary shape, §3.4 five-guarantee
   contract, §4 harness requirements, §6 termination stack, §7.2
   completion-ack).
+- `plans/v3.x-topic-3-arch-d-scoping.md` — Arch D (v0.1) scope-doc:
+  CLI-native session-ID pass-through, opt-in flag, per-CLI capture +
+  resume strategies, claude asymmetry, reset primitives.
 - [PEER-INBOX-GUIDE.md](./PEER-INBOX-GUIDE.md) — per-CLI hook-parity
   baseline; auto-reply daemon section.
 - [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md) — owner-supervised
   E2E probe protocol for daemon-mode shipping (E1-E4).
+- [DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md)
+  — Arch D operator probe protocol (E5-E7) for codex banner drift +
+  gemini --list-sessions serialization + CLI-version drift detection.
 - [HOOK-PARITY-VALIDATION.md](./HOOK-PARITY-VALIDATION.md) — Option J
   E2E probe protocol (template for the daemon probes).
 - `tests/daemon-harness.sh`, `tests/daemon-termination.sh`,
   `tests/daemon-completion-ack.sh` — shape-2 CI gates (persistent).
+- `tests/daemon-cli-resume-codex.sh`, `tests/daemon-cli-resume-gemini.sh`,
+  `tests/daemon-auto-gc-on-content-stop.sh` — Arch D shape-2 CI gates.

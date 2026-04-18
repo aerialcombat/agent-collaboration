@@ -401,12 +401,17 @@ Claude-Channels-paired session.
 **Full operator guide:** [DAEMON-OPERATOR-GUIDE.md](./DAEMON-OPERATOR-GUIDE.md).
 Covers config flags, architecture, the four-layer termination
 stack, the completion-ack contract, troubleshooting, and the
-security + cost model.
+security + cost model. **Topic 3 v0.1 adds Architecture D** (opt-in
+CLI-native session-ID pass-through for cross-spawn context continuity
+on codex + gemini; claude asymmetry documented) — see the operator
+guide's Arch D section.
 
-**Validation protocol:** [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md).
-Four owner-supervised E2E probes (E1-E4) run at ship time to
-validate live-CLI delivery — complements the shape-2 CI gates at
-`tests/daemon-*.sh`.
+**Validation protocols:** [DAEMON-VALIDATION.md](./DAEMON-VALIDATION.md)
+covers v0 E2E probes (E1-E4) for live-CLI delivery;
+[DAEMON-CLI-SESSION-VALIDATION.md](./DAEMON-CLI-SESSION-VALIDATION.md)
+covers v0.1 Arch D probes (E5-E7) for codex banner regex + gemini
+`--list-sessions` parser drift detection. Both run at ship time to
+complement the shape-2 CI gates at `tests/daemon-*.sh`.
 
 ---
 
@@ -418,6 +423,7 @@ validate live-CLI delivery — complements the shape-2 CI gates at
 | Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Yes, via `UserPromptSubmit` hook | Yes, via `BeforeAgent` hook |
 | Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Not yet (see [Codex issue #18056](https://github.com/openai/codex/issues/18056) for upstream MCP notifications tracking) | Not supported (architectural; see Gemini issue #3052) |
 | Auto-reply via daemon | Yes (`agent-collab-daemon --cli claude`; usually unnecessary given hook + Channels coverage) | Yes (`agent-collab-daemon --cli codex`) | Yes (`agent-collab-daemon --cli gemini`) |
+| Cross-spawn context (Arch D opt-in, v0.1) | No — `claude -p` has no stable cross-process session-resume; daemon emits warn + falls back to Arch B | Yes — `codex exec resume <UUID>` | Yes — `gemini --resume <index>` (UUID stored, translated to current index at resume time) |
 | Peer send | identical | identical | identical |
 
 Installing the hook on all three CLIs is a single `scripts/install-global-protocol` run — it detects which CLI homes exist (`~/.claude`, `~/.codex`, `~/.gemini`) and registers the unified `hooks/peer-inbox-inject.sh` into each. Codex additionally gets `[features] codex_hooks = true` appended to `~/.codex/config.toml` (required by Codex for hooks to fire).

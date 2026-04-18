@@ -358,7 +358,10 @@ install_daemon_config_dir() {
   "pause_on_idle": 1800,
 
   "claude_settings": "",
-  "log_path": ""
+  "log_path": "",
+
+  "_arch_d_note": "Topic 3 v0.1 (Arch D) opt-in: set cli_session_resume=true to pass the CLI vendor's native session-ID into subsequent spawns (codex+gemini only; no-op + warn for claude). Default false preserves Topic 3 v0 fresh-invocation. See docs/DAEMON-OPERATOR-GUIDE.md Arch D section.",
+  "cli_session_resume": false
 }
 EOF
   chmod 0644 "$PEER_INBOX_DAEMON_EXAMPLE_CFG"
