@@ -373,10 +373,12 @@ in its running context **without a user prompt**.
 
 | Need to… | Claude Code | Codex CLI | Gemini CLI |
 |---|---|---|---|
-| Register | bare `session register` (hook provides session key) | `export AGENT_COLLAB_SESSION_KEY="$(uuidgen)"` first | same as Codex |
-| Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Not yet — call `peer receive` manually | Not yet — `BeforeAgent` hook planned for v1.6 |
-| Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Not yet | Not yet |
+| Register | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) |
+| Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Yes, via `UserPromptSubmit` hook | Yes, via `BeforeAgent` hook |
+| Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Not yet (see [Codex issue #18056](https://github.com/openai/codex/issues/18056) for upstream MCP notifications tracking) | Not supported (architectural; see Gemini issue #3052) |
 | Peer send | identical | identical | identical |
+
+Installing the hook on all three CLIs is a single `scripts/install-global-protocol` run — it detects which CLI homes exist (`~/.claude`, `~/.codex`, `~/.gemini`) and registers the unified `hooks/peer-inbox-inject.sh` into each. Codex additionally gets `[features] codex_hooks = true` appended to `~/.codex/config.toml` (required by Codex for hooks to fire).
 
 ---
 
@@ -577,9 +579,13 @@ schema.
 
 - **Same machine only.** SQLite is local. Cross-host sync is
   out-of-scope for v1.x.
-- **Codex and Gemini have no auto-inject** yet. Manual `peer receive`
-  is required for those runtimes until their hook surfaces are wired
-  (Gemini `BeforeAgent` planned for v1.6).
+- **Mid-turn async push is Claude-only today.** All three CLIs
+  auto-inject on turn start via the unified hook (Claude
+  `UserPromptSubmit`, Codex `UserPromptSubmit`, Gemini `BeforeAgent`).
+  Mid-turn notifications that arrive while an agent is working
+  surface in Claude via the peer-inbox MCP channel but not in Codex
+  (blocked on [Codex issue #18056](https://github.com/openai/codex/issues/18056))
+  or Gemini (structurally declined per their issue #3052).
 - **Message bodies are UTF-8 text**, 8 KB max. Binary / `\0` bytes
   are not supported — base64-encode externally if needed.
 - **No archive or retention.** V1 retains every message forever.
