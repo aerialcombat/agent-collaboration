@@ -379,7 +379,7 @@ EOF
   else
     cat >"$PEER_INBOX_DAEMON_PI_EXAMPLE_CFG" <<'EOF'
 {
-  "_note": "Topic 3 v0.2 pi daemon config template (multi-provider via badlogic/pi-mono). Copy to <label>.json, set pi.provider + pi.model to your chosen pair, ensure operator env has the matching provider auth (e.g. ZAI_API_KEY for zai-glm). Invoke: agent-collab-daemon --config <label>",
+  "_note": "Topic 3 v0.2 pi daemon config template (multi-provider via badlogic/pi-mono). Copy to <label>.json, set pi.provider + pi.model to your chosen pair, ensure operator env has the matching provider auth (e.g. ZAI_GLM_API_KEY for zai-glm plugin — see docs/DAEMON-OPERATOR-GUIDE.md Arch D pi sub-section for the built-in-vs-plugin env-var table). Invoke: agent-collab-daemon --config <label>",
 
   "label": "CHANGEME-reviewer-pi",
   "cwd":   "CHANGEME-/absolute/path/to/workspace",
@@ -395,7 +395,7 @@ EOF
 
   "cli_session_resume": true,
 
-  "_pi_note": "Topic 3 v0.2: pi.provider + pi.model MANDATORY; startup exits 64 if either is missing. session_dir optional (default $HOME/.agent-collab/pi-sessions). If pi.model is provider-qualified (e.g. 'openai/gpt-4o'), its prefix MUST match pi.provider or daemon startup rejects with exit 64. Env vars (operator responsibility): ZAI_API_KEY (zai-glm) / OPENAI_API_KEY (openai-codex) / ANTHROPIC_API_KEY (anthropic) / GEMINI_API_KEY (google) — run `pi --help` for the canonical env-var table. See docs/DAEMON-OPERATOR-GUIDE.md Architecture D pi sub-section.",
+  "_pi_note": "Topic 3 v0.2: pi.provider + pi.model MANDATORY; startup exits 64 if either is missing. session_dir optional (default $HOME/.agent-collab/pi-sessions). If pi.model is provider-qualified (e.g. 'openai/gpt-4o'), its prefix MUST match pi.provider or daemon startup rejects with exit 64. Env vars (operator responsibility): ZAI_GLM_API_KEY (zai-glm, plugin) / OPENAI_API_KEY (openai-codex, built-in) / ANTHROPIC_API_KEY (anthropic, built-in) / GEMINI_API_KEY (google, built-in). `pi --help` lists built-in provider env vars; plugin providers (e.g. pi-zai-glm) are NOT in --help — read the plugin's registerProvider() call for its env-var name. See docs/DAEMON-OPERATOR-GUIDE.md Architecture D pi sub-section.",
   "pi": {
     "provider":    "zai-glm",
     "model":       "glm-4.6",

@@ -100,7 +100,7 @@ OUT="${FAKE_CLI_OUT:-/dev/null}"
     echo "ARGV[$i]=$a"
     i=$((i+1))
   done
-  for k in AGENT_COLLAB_DAEMON_SPAWN AGENT_COLLAB_SESSION_KEY CLAUDE_SESSION_ID CODEX_SESSION_ID GEMINI_SESSION_ID ZAI_API_KEY PATH; do
+  for k in AGENT_COLLAB_DAEMON_SPAWN AGENT_COLLAB_SESSION_KEY CLAUDE_SESSION_ID CODEX_SESSION_ID GEMINI_SESSION_ID ZAI_GLM_API_KEY PATH; do
     v="${!k-}"
     echo "ENV[$k]=$v"
   done
@@ -221,10 +221,12 @@ make_fake_cli "$FAKE_SHARED"
 # For claude/codex/gemini the original registration (--agent claude) is
 # sufficient because the daemon's --cli flag is what picks the spawn path.
 
-# Topic 3 v0.2 §9.2 gate 7: provider API env vars (ZAI_API_KEY as the
-# canonical operator-shell export) must survive daemon spawn into pi
-# process env. We export it here once; every subtest inherits it.
-export ZAI_API_KEY="test-fixture-zai"
+# Topic 3 v0.2 §9.2 gate 7 (v0.2.1 env-var correction): provider API env
+# vars must survive daemon spawn into pi process env. For zai-glm the
+# plugin pi-zai-glm reads ZAI_GLM_API_KEY (NOT ZAI_API_KEY, which is a
+# different pi-mono built-in env slot). We export the plugin's env var
+# here once; every subtest inherits it.
+export ZAI_GLM_API_KEY="test-fixture-zai-glm"
 
 for cli_kind in claude codex gemini pi; do
   run_one_spawn "$cli_kind" "$FAKE_SHARED"
@@ -251,8 +253,8 @@ for cli_kind in claude codex gemini pi; do
       # vendor UUID). Instead assert the provider API key survives the
       # os.Environ() inheritance — the canonical operator-shell pattern
       # per §4.4 "provider auth" paragraph.
-      grep -q '^ENV\[ZAI_API_KEY\]=test-fixture-zai$' <<<"$out" \
-        || { echo "$out"; fail "pi: ZAI_API_KEY did not survive daemon spawn (§9.2 gate 7 provider-env propagation)"; }
+      grep -q '^ENV\[ZAI_GLM_API_KEY\]=test-fixture-zai-glm$' <<<"$out" \
+        || { echo "$out"; fail "pi: ZAI_GLM_API_KEY did not survive daemon spawn (§9.2 gate 7 provider-env propagation; v0.2.1 env-var correction)"; }
       ;;
   esac
   echo "   $cli_kind: env propagation ok"

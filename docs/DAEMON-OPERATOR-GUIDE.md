@@ -321,17 +321,29 @@ AGENT_COLLAB_CLI_SESSION_RESUME=1 agent-collab-daemon --config reviewer-codex
   canonical list on your pi version). Common mappings (confirmed
   against pi 0.67.68):
 
-  | provider            | env var                                      |
-  |---------------------|----------------------------------------------|
-  | `zai-glm`           | `ZAI_API_KEY`                                |
-  | `openai-codex`      | `OPENAI_API_KEY`                             |
-  | `anthropic`         | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` |
-  | `google` (Gemini)   | `GEMINI_API_KEY`                             |
-  | `google-antigravity`| OAuth (no direct env var); see pi-mono docs |
-  | `groq`              | `GROQ_API_KEY`                               |
-  | `xai`               | `XAI_API_KEY`                                |
-  | `openrouter`        | `OPENROUTER_API_KEY`                         |
-  | `mistral`           | `MISTRAL_API_KEY`                            |
+  | provider            | env var                                      | source                           |
+  |---------------------|----------------------------------------------|----------------------------------|
+  | `zai-glm`           | `ZAI_GLM_API_KEY`                            | plugin `pi-zai-glm` (v0.2.1 fix) |
+  | `openai-codex`      | `OPENAI_API_KEY`                             | pi-mono built-in                 |
+  | `anthropic`         | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` | pi-mono built-in              |
+  | `google` (Gemini)   | `GEMINI_API_KEY`                             | pi-mono built-in                 |
+  | `google-antigravity`| OAuth (no direct env var); see pi-mono docs  | pi-mono built-in                 |
+  | `groq`              | `GROQ_API_KEY`                               | pi-mono built-in                 |
+  | `xai`               | `XAI_API_KEY`                                | pi-mono built-in                 |
+  | `openrouter`        | `OPENROUTER_API_KEY`                         | pi-mono built-in                 |
+  | `mistral`           | `MISTRAL_API_KEY`                            | pi-mono built-in                 |
+
+  **Verifying a provider's env var (built-in vs plugin):** `pi --help`
+  enumerates env vars for **built-in** providers only. If your provider
+  is served by a third-party pi plugin (identified by the plugin having
+  its own npm package, e.g. `pi-zai-glm`), its env-var name is NOT in
+  `pi --help` — you must read the plugin's source (specifically its
+  `pi.registerProvider('<provider>', { apiKey: '<ENV_VAR>', ... })`
+  call) to learn the correct name. v0.2 originally recorded
+  `ZAI_API_KEY` for zai-glm based on `pi --help` reading; v0.2.1
+  corrected to `ZAI_GLM_API_KEY` per the plugin's actual registration
+  (the 401 surfaces in the daemon log + stderr tee as a normal spawn
+  error — the token is valid but set under the wrong env-var name).
 
   **Reset semantics for pi** (extension of the PRIMARY / SECONDARY /
   TERTIARY ladder below): because the daemon owns the path, pi reset

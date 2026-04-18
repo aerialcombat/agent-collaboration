@@ -282,8 +282,13 @@ subsequent spawn recalls context via the same path. Additionally validate
 pi reset deletes the file from disk (§8.1 pi-specific extension). Topic
 3 v0.2 §9.2 gate 6 + test-engineer §10.1 (E) add.
 
-**Prerequisites:** `pi --version` ≥ `0.67.68`, `ZAI_API_KEY` exported,
-operator has connectivity to GLM provider.
+**Prerequisites:** `pi --version` ≥ `0.67.68`, `ZAI_GLM_API_KEY` exported
+(zai-glm is served by the `pi-zai-glm` plugin; the plugin reads
+`ZAI_GLM_API_KEY`, NOT `ZAI_API_KEY` — `pi --help`'s env table
+enumerates built-in providers only and is blind to plugin env vars; see
+operator guide § Arch D pi sub-section for the built-in-vs-plugin
+distinction. v0.2.1 correction), operator has connectivity to GLM
+provider.
 
 > **Do NOT override `$HOME` for E8 isolation** — pi reads provider-auth
 > config from `~/.pi/agent/`; a re-pointed `$HOME` hides the operator's
