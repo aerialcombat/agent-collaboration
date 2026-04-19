@@ -3572,6 +3572,53 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
 """
 
 
+def cmd_room_create(args: argparse.Namespace) -> int:
+    """Create an empty room (mint a pair_key, pre-seed peer_rooms).
+
+    The room has no members. Peers join later via
+      agent-collab session register --pair-key <key> ...
+
+    If --pair-key is supplied, use that key instead of minting one; fails
+    if the key already exists in peer_rooms.
+    """
+    if args.pair_key:
+        validate_pair_key(args.pair_key)
+        pair_key = args.pair_key
+    else:
+        pair_key = generate_pair_key()
+
+    room_key = f"pk:{pair_key}"
+
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT 1 FROM peer_rooms WHERE room_key = ?",
+            (room_key,),
+        ).fetchone()
+        if existing is not None:
+            conn.execute("ROLLBACK")
+            err(
+                f"room {pair_key!r} already exists",
+                EXIT_LABEL_COLLISION,
+            )
+        conn.execute(
+            "INSERT INTO peer_rooms (room_key, pair_key, turn_count) "
+            "VALUES (?, ?, 0)",
+            (room_key, pair_key),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    print(f"created: {pair_key} (empty room)")
+    print(
+        f"  join: agent-collab session register --pair-key {pair_key} "
+        "--agent <claude|codex|gemini|pi>"
+    )
+    return EXIT_OK
+
+
 def cmd_peer_reset(args: argparse.Namespace) -> int:
     """Clear the termination flag + turn counter for a room.
 
@@ -4116,6 +4163,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--since", help="ISO-8601 UTC; skip messages older than this")
     pr.add_argument("--out", help="output path (defaults to .agent-collab/replay-<ts>.html)")
     pr.set_defaults(func=cmd_peer_replay)
+
+    rc = sub.add_parser("room-create")
+    rc.add_argument("--pair-key", dest="pair_key",
+                    help="use this pair key instead of minting one (must be unused)")
+    rc.set_defaults(func=cmd_room_create)
 
     prst = sub.add_parser("peer-reset")
     prst.add_argument("--cwd")

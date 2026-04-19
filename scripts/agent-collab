@@ -78,6 +78,12 @@ Usage:
                                 Emit self-contained HTML transcript of
                                 messages in the current cwd (or narrowed to
                                 a label's conversations).
+  agent-collab room create [--pair-key <k>]
+                                Mint an empty room (no members yet).
+                                Prints the pair_key. Peers join later via
+                                `session register --pair-key <k>`. Pass
+                                --pair-key to use a specific key instead
+                                of minting a random slug.
   agent-collab peer reset (--to <label> | --pair-key <k> | --room-key <k>)
                                 Clear termination flag + turn counter for
                                 a room. Use after [[end]] or after hitting
@@ -784,7 +790,7 @@ case "$MODE" in
     exit 0
     ;;
   challenge|verify) ;;
-  session|peer|hook)
+  session|peer|hook|room)
     dispatch_peer_inbox "$MODE" "$@"
     ;;
   *)
