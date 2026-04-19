@@ -13,6 +13,8 @@ END_MARKER="<!-- END agent-collaboration -->"
 
 PEER_INBOX_HOME="$HOME/.agent-collab"
 PEER_INBOX_SCRIPTS_DIR="$PEER_INBOX_HOME/scripts"
+PI_EXTENSIONS_DIR="$HOME/.pi/agent/extensions"
+PI_PEER_INBOX_EXTENSION="$PI_EXTENSIONS_DIR/peer-inbox-pi.ts"
 PEER_INBOX_HOOKS_DIR="$PEER_INBOX_HOME/hooks"
 PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
 PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
@@ -1014,6 +1016,9 @@ case "$MODE" in
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-db.py" "$PEER_INBOX_DB_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-channel.py" "$PEER_INBOX_CHANNEL_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
+    # pi-coding-agent extension: gives any pi session a channel_socket for
+    # realtime peer-inbox integration. Safe no-op if pi isn't installed.
+    install_peer_inbox_file "$PROJECT_ROOT/extensions/peer-inbox-pi.ts" "$PI_PEER_INBOX_EXTENSION"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
     # Register the same unified hook with Codex and Gemini if their homes
     # exist (detected via $HOME/.{codex,gemini} already ensured by mkdir
@@ -1070,6 +1075,8 @@ case "$MODE" in
     [[ -f "$GEMINI_SETTINGS" ]] && echo "             $GEMINI_SETTINGS (BeforeAgent)"
     echo "  channel: $PEER_INBOX_CHANNEL_SCRIPT (launch claude with --dangerously-load-development-channels server:peer-inbox)"
     echo "  db:      $PEER_INBOX_HOME/sessions.db (created on first session register)"
+    echo "  pi-ext:  $PI_PEER_INBOX_EXTENSION"
+    echo "           /peer-join <label> [pair-key] inside pi, or set PEER_INBOX_LABEL/PEER_INBOX_PAIR_KEY for auto-join (rpc mode)"
     if [[ -x "$PEER_INBOX_DAEMON_BIN" || -x "$PEER_INBOX_GO_CLI" ]]; then
       echo "auto-reply daemon (Topic 3 v0):"
       [[ -x "$PEER_INBOX_DAEMON_BIN" ]] && echo "  daemon:    $PEER_INBOX_DAEMON_BIN"
@@ -1109,6 +1116,7 @@ case "$MODE" in
     remove_peer_inbox_file "$PEER_INBOX_HOOK_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_CHANNEL_SCRIPT"
     remove_peer_inbox_file "$PEER_INBOX_DB_SCRIPT"
+    remove_peer_inbox_file "$PI_PEER_INBOX_EXTENSION"
     # Topic 3 v0: remove daemon binaries + example config. Operator-
     # authored daemon configs in $PEER_INBOX_DAEMONS_DIR are preserved
     # — uninstall mirrors the sessions.db treatment (user data stays).
