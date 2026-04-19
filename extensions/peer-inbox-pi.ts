@@ -15,6 +15,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -254,6 +255,115 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("broadcast sent", "info");
 			} catch (err) {
 				ctx.ui.notify(`broadcast failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+			}
+		},
+	});
+
+	// Tool equivalents of the slash commands, callable by pi's LLM. Tools let
+	// pi autonomously decide to send/broadcast/etc. without the operator
+	// typing a /peer-* command. Same semantics, different consumer.
+	pi.registerTool({
+		name: "peer_join",
+		label: "Peer Join",
+		description: "Register this pi session with peer-inbox under a label, optionally joining a pair_key-scoped room. Opens a socket so other agents can DM this session.",
+		parameters: Type.Object({
+			label: Type.String({ description: "unique label for this session in the room" }),
+			pair_key: Type.Optional(Type.String({ description: "pair_key to join; omit for cwd-only scope" })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			const messages: string[] = [];
+			await join(
+				params.label,
+				params.pair_key || null,
+				(m) => { messages.push(m); },
+			);
+			const text = messages.join("\n") || (state ? `joined as ${state.label}` : "join failed");
+			return { content: [{ type: "text", text }], details: { state } };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_leave",
+		label: "Peer Leave",
+		description: "Leave the peer-inbox channel: tear down listener and clear the session's channel_socket registration.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, _ctx) {
+			if (!state) return { content: [{ type: "text", text: "not joined" }] };
+			const label = state.label;
+			teardown();
+			return { content: [{ type: "text", text: `left ${label}` }] };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_status",
+		label: "Peer Status",
+		description: "Report the current peer-inbox registration (label, pair_key, socket path) or 'not joined'.",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, _ctx) {
+			if (!state) return { content: [{ type: "text", text: "not joined" }] };
+			const text = `label=${state.label} pair_key=${state.pairKey || "-"} socket=${state.socketPath}`;
+			return { content: [{ type: "text", text }], details: { state } };
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_send",
+		label: "Peer Send",
+		description: "DM another peer in the current room. Use when the user asks you to message a specific labelled peer, or when a response should reach only one addressee. Requires prior peer_join.",
+		promptSnippet: "DM a peer-inbox peer by label",
+		promptGuidelines: [
+			"Use peer_send(to, message) to DM another agent in the current peer-inbox room by label.",
+			"Never run `peer-send` or `agent-collab peer send` via bash — those are slash-command / CLI forms; the tool is peer_send.",
+			"If the user says 'say hi to claude2' or 'DM pi-ext', call peer_send with {to: <label>, message: <text>}.",
+		],
+		parameters: Type.Object({
+			to: Type.String({ description: "recipient label (e.g. 'claude2', 'codex-agent')" }),
+			message: Type.String({ description: "message body" }),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!state) return { content: [{ type: "text", text: "error: not joined; call peer_join first" }] };
+			try {
+				execFileSync("python3", [
+					DB_SCRIPT, "peer-send",
+					"--cwd", state.cwd,
+					"--as", state.label,
+					"--to", params.to,
+					"--message", params.message,
+				], { timeout: 10000 });
+				return { content: [{ type: "text", text: `sent to ${params.to}` }] };
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				return { content: [{ type: "text", text: `send failed: ${msg}` }] };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "peer_broadcast",
+		label: "Peer Broadcast",
+		description: "Broadcast a message to every peer in the current room. Use when announcing something room-wide; prefer peer_send for a single addressee. Requires prior peer_join.",
+		promptSnippet: "Broadcast a message to the whole peer-inbox room",
+		promptGuidelines: [
+			"Use peer_broadcast(message) to fan out to every peer in the current room.",
+			"Prefer peer_send(to, message) when a single addressee is intended; broadcast only for room-wide announcements.",
+		],
+		parameters: Type.Object({
+			message: Type.String({ description: "message body" }),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			if (!state) return { content: [{ type: "text", text: "error: not joined; call peer_join first" }] };
+			try {
+				execFileSync("python3", [
+					DB_SCRIPT, "peer-broadcast",
+					"--cwd", state.cwd,
+					"--as", state.label,
+					"--message", params.message,
+				], { timeout: 10000 });
+				return { content: [{ type: "text", text: "broadcast sent" }] };
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				return { content: [{ type: "text", text: `broadcast failed: ${msg}` }] };
 			}
 		},
 	});
