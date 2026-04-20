@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>peer-inbox — rooms</title>
+<style>
+  :root {
+    /* Kraken palette: jet black + deep purple. */
+    --bg:#111111; --fg:#FFFFFF; --muted:#8A8A8A; --accent:#5841D8;
+    --panel:#1A1A1A; --border:rgba(128,128,128,0.22);
+    --hover:rgba(128,128,128,0.08); --unread:#5841D8;
+    --terminated:#f59e0b;
+  }
+  * { box-sizing:border-box }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif; }
+  .wrap { max-width:880px; margin:0 auto; padding:32px 24px 64px; }
+  header { display:flex; align-items:center; gap:10px;
+    padding-bottom:16px; border-bottom:1px solid var(--border);
+    margin-bottom:20px; }
+  header .dot { width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 6px var(--accent);
+    animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+  header h1 { margin:0; font-size:13px; font-weight:600;
+    letter-spacing:.04em; text-transform:uppercase; }
+  header .sub { color:var(--muted); font-size:12px; margin-left:auto; }
+  header button { background:transparent; color:var(--muted);
+    border:1px solid var(--border); border-radius:4px; padding:4px 10px;
+    font:inherit; font-size:11px; cursor:pointer; margin-left:10px; }
+  header button:hover:not(:disabled) { color:var(--fg);
+    border-color:var(--accent); }
+  header button:disabled { opacity:.4; cursor:not-allowed; }
+  header button.danger { color:#ef4444; border-color:rgba(239,68,68,0.3); }
+  header button.danger:hover:not(:disabled) { color:#ffffff;
+    background:#ef4444; border-color:#ef4444; }
+  .toast { position:fixed; bottom:24px; left:50%;
+    transform:translateX(-50%); background:var(--panel);
+    border:1px solid var(--border); border-radius:4px;
+    padding:10px 16px; font-size:12px; color:var(--fg);
+    box-shadow:0 4px 12px rgba(0,0,0,0.4); z-index:100; }
+  .section-label { margin:20px 0 6px; font-size:11px; color:var(--muted);
+    letter-spacing:.12em; text-transform:uppercase; }
+  .room { display:block; padding:12px 16px;
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:4px; text-decoration:none; color:var(--fg);
+    margin-bottom:8px; transition:background .1s; }
+  .room:hover { background:var(--hover); }
+  .room.terminated { opacity:.55; }
+  .room .top { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .pair-key { font:13px/1.2 SF Mono,Menlo,Consolas,monospace;
+    font-weight:600; color:var(--fg); }
+  .badge { margin-left:auto; min-width:18px;
+    padding:1px 6px; border-radius:9px; background:var(--unread);
+    color:#0e1015; font-size:10px; font-weight:600; text-align:center; }
+  .badge:empty { display:none; }
+  .meta { display:flex; gap:10px; flex-wrap:wrap;
+    color:var(--muted); font-size:11px; margin-top:6px; }
+  .activity-dot { width:6px; height:6px; border-radius:50%;
+    display:inline-block; margin-right:5px; vertical-align:1px; }
+  .activity-dot.active { background:#22c55e }
+  .activity-dot.idle   { background:#eab308 }
+  .activity-dot.stale  { background:#6b7280 }
+  .activity-dot.terminated { background:var(--terminated) }
+  .activity-dot.unknown { background:#4b5563 }
+  .members { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+  .pill { color:#FFFFFF; padding:2px 8px; border-radius:4px;
+    font-weight:600; font-size:10px; }
+  .empty { text-align:center; padding:64px 20px; color:var(--muted); }
+  .loading { color:var(--muted); padding:24px 0; font-size:13px; }
+  .err { color:#ef4444; font-size:12px; margin-top:6px; }
+</style>
+<body>
+<div class=wrap>
+  <header>
+    <span class=dot></span>
+    <h1>peer-inbox · rooms</h1>
+    <span class=sub id=sub></span>
+    <label title="Terminated rooms hidden by default. Reversible via: agent-collab peer reset --pair-key K">
+      <input type=checkbox id=showTerminated>
+      <span style="font-size:11px;color:var(--muted);margin-left:4px;">show terminated</span>
+    </label>
+    <button class=danger id=clearInactive disabled>clear inactive</button>
+  </header>
+  <div id=rooms class=loading>loading /api/index …</div>
+</div>
+<script>
+(() => {
+  const roomsEl = document.getElementById('rooms');
+  const subEl = document.getElementById('sub');
+
+  function hue(label) {
+    let h = 0;
+    for (const c of label || '') h = (h * 31 + c.charCodeAt(0)) % 360;
+    return h;
+  }
+  function pill(label) {
+    const el = document.createElement('span');
+    el.className = 'pill';
+    el.style.background = `hsl(${hue(label)}, 65%, 25%)`;
+    el.style.border = `1px solid hsl(${hue(label)}, 65%, 45%)`;
+    el.textContent = label;
+    return el;
+  }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const lastSeenIdByKey = {};
+
+  function renderRooms(data) {
+    roomsEl.classList.remove('loading');
+    roomsEl.innerHTML = '';
+    const allRooms = data.rooms || [];
+    const showTerminated = document.getElementById('showTerminated').checked;
+    const rooms = showTerminated
+      ? allRooms
+      : allRooms.filter(r => r.activity !== 'terminated');
+    const hiddenCount = allRooms.length - rooms.length;
+    if (!rooms.length && !hiddenCount) {
+      roomsEl.appendChild(el('div', 'empty',
+        'no rooms yet. `agent-collab room create` to mint one, '
+        + 'or `session register --pair-key K` to join an existing key.'));
+      return;
+    }
+    if (!rooms.length && hiddenCount > 0) {
+      roomsEl.appendChild(el('div', 'empty',
+        `all ${hiddenCount} rooms are terminated. ` +
+        `toggle "show terminated" to view.`));
+      return;
+    }
+    const byActivity = { active: [], idle: [], stale: [], terminated: [], unknown: [] };
+    for (const r of rooms) {
+      (byActivity[r.activity] || byActivity.unknown).push(r);
+    }
+    const order = ['active', 'idle', 'stale', 'terminated', 'unknown'];
+    for (const section of order) {
+      const group = byActivity[section] || [];
+      if (!group.length) continue;
+      roomsEl.appendChild(el('div', 'section-label', section));
+      for (const r of group) {
+        const card = document.createElement('a');
+        card.className = 'room';
+        if (section === 'terminated') card.classList.add('terminated');
+        card.href = '/view?scope=pair_key&key=' + encodeURIComponent(r.pair_key);
+
+        const top = el('div', 'top');
+        const dot = el('span', 'activity-dot ' + (r.activity || 'unknown'));
+        top.appendChild(dot);
+        top.appendChild(el('span', 'pair-key', r.pair_key));
+        const unread = Math.max(0, (r.last_id || 0) - (lastSeenIdByKey[r.pair_key] || 0));
+        if (unread > 0) {
+          const b = el('span', 'badge', unread > 99 ? '99+' : String(unread));
+          top.appendChild(b);
+        }
+        card.appendChild(top);
+
+        const meta = el('div', 'meta');
+        meta.appendChild(el('span', '', r.activity + ' · '
+          + (r.total || 0) + ' msg · ' + (r.turn_count || 0) + ' turns'));
+        if (r.last_at) {
+          meta.appendChild(el('span', '', 'last ' + r.last_at));
+        }
+        if (r.terminated_at) {
+          meta.appendChild(el('span', '',
+            'ended by ' + r.terminated_by + ' at ' + r.terminated_at));
+        }
+        card.appendChild(meta);
+
+        if (r.members && r.members.length) {
+          const mm = el('div', 'members');
+          for (const m of r.members) {
+            mm.appendChild(pill(m.label));
+          }
+          card.appendChild(mm);
+        }
+
+        if (r.error) {
+          card.appendChild(el('div', 'err', 'load error: ' + r.error));
+        }
+        roomsEl.appendChild(card);
+      }
+    }
+    subEl.textContent = rooms.length + ' room' + (rooms.length === 1 ? '' : 's');
+    if (hiddenCount > 0) {
+      subEl.textContent += ` (${hiddenCount} terminated hidden)`;
+    }
+    if (data.locked) subEl.textContent += ' · --only-pair-key locked';
+
+    // Enable/count the "clear inactive" button. Stale = activity
+    // bucket (no member seen in ≥30 min). Disabled when zero stale
+    // rooms exist, or when the server is lock-scoped (cross-scope
+    // bulk ops rejected by the endpoint anyway).
+    const staleCount = rooms.filter(r => r.activity === 'stale').length;
+    const btn = document.getElementById('clearInactive');
+    btn.disabled = data.locked || staleCount === 0;
+    btn.textContent = staleCount > 0
+      ? `clear inactive (${staleCount})`
+      : 'clear inactive';
+  }
+
+  function showToast(msg, ms) {
+    const t = document.createElement('div');
+    t.className = 'toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), ms || 3000);
+  }
+
+  async function clearInactive() {
+    const btn = document.getElementById('clearInactive');
+    const n = (btn.textContent.match(/\((\d+)\)/) || [])[1] || '?';
+    if (!confirm(
+      `Terminate ${n} inactive room${n === '1' ? '' : 's'}? ` +
+      `They'll be marked terminated in peer_rooms (data preserved). ` +
+      `Reversible via: agent-collab peer reset --pair-key <K>`
+    )) return;
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/rooms/terminate-inactive',
+        { method: 'POST' });
+      const data = await r.json();
+      if (r.ok) {
+        showToast(`terminated ${data.terminated_count} room` +
+          (data.terminated_count === 1 ? '' : 's'));
+        tick();
+      } else {
+        showToast('error: ' + (data.error || 'unknown'), 5000);
+        btn.disabled = false;
+      }
+    } catch (e) {
+      showToast('network error: ' + e.message, 5000);
+      btn.disabled = false;
+    }
+  }
+  document.getElementById('clearInactive')
+    .addEventListener('click', clearInactive);
+
+  async function tick() {
+    try {
+      const r = await fetch('/api/index', { cache: 'no-store' });
+      const data = await r.json();
+      renderRooms(data);
+    } catch (e) {
+      roomsEl.classList.remove('loading');
+      roomsEl.innerHTML = '';
+      roomsEl.appendChild(el('div', 'empty', 'load failed: ' + e.message));
+    }
+  }
+  // Persist "show terminated" across reloads so the operator's choice
+  // sticks. Default off (terminated rooms hidden).
+  const showTerminatedCheckbox = document.getElementById('showTerminated');
+  showTerminatedCheckbox.checked =
+    localStorage.getItem('peer-web:showTerminated') === '1';
+  showTerminatedCheckbox.addEventListener('change', () => {
+    localStorage.setItem('peer-web:showTerminated',
+      showTerminatedCheckbox.checked ? '1' : '0');
+    tick();
+  });
+
+  tick();
+  // Remember last_id per room so the badge reflects unread-since-last-visit.
+  window.addEventListener('focus', tick);
+  setInterval(tick, 3000);
+})();
+</script>

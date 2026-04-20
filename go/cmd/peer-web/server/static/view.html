@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>__TITLE__</title>
+<style>
+  :root {
+    /* Kraken palette: jet black + deep purple, crypto-fintech precision */
+    --bg:#111111; --fg:#FFFFFF; --muted:#8A8A8A; --accent:#5841D8;
+    --panel:#1A1A1A; --border:rgba(128,128,128,0.22); --sidebar-bg:#0B0B0B;
+    --hover:rgba(128,128,128,0.08); --selected:rgba(88,65,216,0.15); --unread:#5841D8;
+    --terminated:#f59e0b;
+  }
+  * { box-sizing:border-box }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif;
+    height:100%; }
+  .app { display:grid; grid-template-columns:280px 1fr; height:100vh;
+    overflow:hidden; }
+
+  /* Sidebar */
+  aside { background:var(--sidebar-bg); border-right:1px solid var(--border);
+    overflow-y:auto; }
+  aside .brand { padding:16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:8px; }
+  aside .brand h1 { margin:0; font-size:13px; font-weight:600;
+    letter-spacing:.04em; text-transform:uppercase; color:var(--fg); }
+  aside .brand .dot { width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 6px var(--accent);
+    animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+  aside .cwd { padding:0 16px 12px; color:var(--muted); font-size:11px;
+    word-break:break-all; border-bottom:1px solid var(--border); }
+  aside .section-label { padding:12px 16px 4px; font-size:11px;
+    color:var(--muted); letter-spacing:.12em; text-transform:uppercase; }
+  .pair-item { display:block; padding:8px 16px; cursor:pointer;
+    border-left:2px solid transparent; color:var(--fg);
+    text-decoration:none; user-select:none; }
+  .pair-item:hover { background:var(--hover); }
+  .pair-item.selected { background:var(--selected);
+    border-left-color:var(--accent); }
+  .pair-item.terminated .labels,
+  .pair-item.terminated .meta-row { opacity:.55;
+    text-decoration:line-through; }
+  .pair-item .labels { display:flex; align-items:center; gap:6px;
+    font-size:13px; font-weight:500; }
+  .pair-item .labels .sep { color:var(--muted); font-size:11px; }
+  .pair-item .unread-badge { margin-left:auto; min-width:18px;
+    padding:1px 6px; border-radius:9px; background:var(--unread);
+    color:#0e1015; font-size:10px; font-weight:600; text-align:center;
+    display:none; }
+  .pair-item.has-unread .unread-badge { display:inline-block }
+  .pair-item .meta-row { display:flex; gap:8px; font-size:11px;
+    color:var(--muted); margin-top:2px; }
+  .activity-dot { width:6px; height:6px; border-radius:50%;
+    display:inline-block; margin-right:4px; }
+  .activity-dot.active { background:#22c55e }
+  .activity-dot.idle { background:#eab308 }
+  .activity-dot.stale { background:#6b7280 }
+  .activity-dot.terminated { background:var(--terminated) }
+  .activity-dot.unknown { background:#4b5563 }
+
+  /* Rooms nav — lists every pair-key on the machine so the viewer
+     can jump between rooms without going back to the index. Current
+     room is highlighted; activity dot mirrors the index colors. */
+  .rooms-nav { max-height:40vh; overflow-y:auto;
+    border-bottom:1px solid var(--border); padding:4px 0; }
+  .rooms-nav .section-label { padding:8px 16px 4px; font-size:11px;
+    color:var(--muted); letter-spacing:.12em; text-transform:uppercase; }
+  .room-nav { display:flex; align-items:center; gap:6px;
+    padding:5px 16px; text-decoration:none; color:var(--fg);
+    font-size:12px; cursor:pointer; border-left:2px solid transparent;
+    user-select:none; }
+  .room-nav:hover { background:var(--hover); }
+  .room-nav.current { background:var(--selected);
+    border-left-color:var(--accent); }
+  .room-nav .room-key { font:12px/1.3 SF Mono,Menlo,Consolas,monospace;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    flex:1; min-width:0; }
+  .room-nav .room-unread { margin-left:auto; min-width:16px;
+    padding:0 5px; border-radius:8px; background:var(--unread);
+    color:#0e1015; font-size:10px; font-weight:600; text-align:center; }
+  .room-nav .room-unread:empty { display:none; }
+  .room-nav.terminated { opacity:.55; }
+  .rooms-nav .loading { padding:8px 16px; font-size:11px; color:var(--muted); }
+
+  /* Turn-cap meter — yellow at ≥80% of max_pair_turns. */
+  .turn-cap { color:var(--muted); }
+  .turn-cap.warn { color:#eab308; font-weight:600; }
+
+  /* Stale-filter toggle pinned to the top of the sidebar. */
+  .stale-toggle { padding:8px 16px; color:var(--muted); font-size:11px;
+    display:flex; align-items:center; gap:6px; border-bottom:1px solid var(--border);
+    cursor:pointer; user-select:none; }
+  .stale-toggle:hover { background:var(--hover); color:var(--fg); }
+  .stale-toggle input { margin:0; }
+
+  /* Main pane */
+  main { display:flex; flex-direction:column; overflow:hidden; }
+  .pair-header { padding:14px 24px; border-bottom:1px solid var(--border);
+    background:var(--bg); }
+  .pair-header h2 { margin:0; font-size:15px; font-weight:500;
+    display:flex; align-items:center; gap:8px; }
+  .pair-header .sub { color:var(--muted); font-size:12px; margin-top:4px;
+    display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .pill { color:#FFFFFF; padding:2px 8px; border-radius:4px;
+    font-weight:600; font-size:11px; }
+  .arrow { color:var(--muted) }
+
+  .stream { flex:1; overflow-y:auto; padding:16px 24px 40px; }
+  .empty { color:var(--muted); text-align:center; padding:60px 20px;
+    font-size:13px; }
+  .day { color:var(--muted); text-align:center; margin:20px 0 8px;
+    font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
+  .msg { margin:10px 0; padding:10px 14px; background:var(--panel);
+    border:1px solid var(--border); border-radius:4px; max-width:760px; }
+  .msg.new { animation:flash 1.2s ease-out; }
+  @keyframes flash { 0% { background:var(--selected) } 100% { background:var(--panel) } }
+  .msg.end-marker { border-color:var(--terminated);
+    background:rgba(245,158,11,.08); }
+  .meta { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    font-size:11px; color:var(--muted); margin-bottom:5px; }
+  .time { margin-left:auto; font-family:SF Mono,Menlo,monospace; }
+  .id { font-family:SF Mono,Menlo,monospace; opacity:.5 }
+  .body { margin:0; white-space:pre-wrap; word-wrap:break-word;
+    color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }
+  .term-banner { margin:16px 0; padding:10px 14px;
+    background:rgba(245,158,11,.08); border:1px dashed var(--terminated);
+    border-radius:4px; color:var(--terminated); font-size:12px;
+    text-align:center; }
+
+  .scroll-btn { position:absolute; bottom:96px; right:32px; padding:6px 12px;
+    background:var(--panel); color:var(--fg); border:1px solid var(--border);
+    border-radius:4px; cursor:pointer; font-size:12px; display:none; }
+  .scroll-btn.show { display:block }
+
+  /* Composer */
+  .composer { border-top:1px solid var(--border); background:var(--sidebar-bg);
+    padding:10px 16px 12px; display:none; flex-direction:column; gap:6px; }
+  .composer.active { display:flex; }
+  .composer .row { display:flex; gap:8px; align-items:center;
+    font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .composer select { background:var(--panel); color:var(--fg);
+    border:1px solid var(--border); border-radius:4px; padding:3px 6px;
+    font:inherit; font-size:12px; }
+  .composer select:focus { outline:1px solid var(--accent);
+    outline-offset:-1px; }
+  .composer textarea { width:100%; min-height:52px; max-height:220px;
+    resize:vertical; padding:8px 10px; background:var(--panel);
+    color:var(--fg); border:1px solid var(--border); border-radius:4px;
+    font:13px/1.5 SF Mono,Menlo,Consolas,monospace; }
+  .composer textarea:focus { outline:1px solid var(--accent);
+    outline-offset:-1px; }
+  .composer .actions { display:flex; gap:8px; align-items:center;
+    justify-content:space-between; }
+  .composer .hint { color:var(--muted); font-size:11px; }
+  .composer button { background:var(--accent); color:#FFFFFF;
+    border:none; border-radius:4px; padding:6px 14px; font-weight:600;
+    font-size:12px; cursor:pointer; }
+  .composer button:disabled { opacity:.4; cursor:not-allowed; }
+  .composer .status { font-size:11px; padding:4px 8px; border-radius:4px;
+    display:none; white-space:pre-wrap; }
+  .composer .status.show { display:inline-block; }
+  .composer .status.ok { color:#22c55e; }
+  .composer .status.err { color:#ef4444;
+    background:rgba(239,68,68,.08); }
+</style>
+<body>
+<div class=app>
+  <aside>
+    <div class=brand>
+      <span class=dot></span>
+      <h1>peer-inbox</h1>
+    </div>
+    <div class=cwd id=cwd>__CWD__</div>
+    <div class=rooms-nav id=roomsNav></div>
+    <label class=stale-toggle id=staleToggle title="Hide members with last_seen_at older than 10 min">
+      <input type=checkbox id=staleCheckbox>
+      <span>show stale members</span>
+    </label>
+    <div id=sidebar></div>
+  </aside>
+  <main>
+    <div class=pair-header id=pairHeader>
+      <h2>select a pair</h2>
+      <div class=sub id=pairSub>from the sidebar →</div>
+    </div>
+    <div class=stream id=stream>
+      <div class=empty id=emptyMain>pick a conversation on the left to view its messages</div>
+    </div>
+    <button class=scroll-btn id=scrollBtn>↓ new messages</button>
+    <div class=composer id=composer>
+      <div class=row>
+        <label>from</label>
+        <select id=fromPicker></select>
+        <label>to</label>
+        <select id=toPicker></select>
+        <span class="status" id=sendStatus></span>
+      </div>
+      <textarea id=composerBody
+        placeholder="type a message (Enter to send · Shift+Enter for newline)"></textarea>
+      <div class=actions>
+        <span class=hint id=composerHint></span>
+        <button id=sendBtn>Send</button>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+(() => {
+  const sidebar = document.getElementById('sidebar');
+  const pairHeader = document.getElementById('pairHeader');
+  const pairSub = document.getElementById('pairSub');
+  const stream = document.getElementById('stream');
+  const emptyMain = document.getElementById('emptyMain');
+  const scrollBtn = document.getElementById('scrollBtn');
+
+  const state = {
+    mode: null,               // 'cwd' | 'pair_key'
+    pairKey: null,            // scope pair_key in pair_key mode
+    cwd: null,                // scope cwd in cwd mode (Go multi-room only)
+    pairs: {},                // key -> metadata (edge pair in cwd mode, room in pair_key mode)
+    selectedKey: null,
+    messagesByPair: {},       // key -> [messages]
+    lastIdByPair: {},         // key -> highest seen id
+    lastSeenIdByPair: {},     // key -> id up to which the viewer has seen
+    autoScroll: true,
+    maxPairTurns: 100,        // from /api/scope (AGENT_COLLAB_MAX_PAIR_TURNS); 80% triggers warn
+    staleThresholdSecs: 600,  // from /api/scope (10min default)
+    showStale: false,         // stale-filter toggle — hide members older than threshold
+  };
+  const originalTitle = document.title;
+
+  function hue(label) {
+    let h = 0;
+    for (const c of label || '') h = (h * 31 + c.charCodeAt(0)) % 360;
+    return h;
+  }
+  function isStale(iso) {
+    if (!iso) return true;
+    const ageSecs = (Date.now() - Date.parse(iso)) / 1000;
+    return ageSecs > (state.staleThresholdSecs || 600);
+  }
+  function pill(label) {
+    const el = document.createElement('span');
+    el.className = 'pill';
+    el.style.background = `hsl(${hue(label)}, 65%, 25%)`;
+    el.style.border = `1px solid hsl(${hue(label)}, 65%, 45%)`;
+    el.textContent = label;
+    return el;
+  }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function renderSidebar() {
+    const items = Object.values(state.pairs);
+    const byActivity = { active: [], idle: [], stale: [], terminated: [], unknown: [] };
+    for (const p of items) (byActivity[p.activity] || byActivity.unknown).push(p);
+
+    const order = ['active', 'idle', 'stale', 'terminated'];
+    sidebar.innerHTML = '';
+    let anyShown = false;
+    const sectionTitle = state.mode === 'pair_key' ? 'room' : null;
+    for (const section of order) {
+      const group = byActivity[section] || [];
+      if (!group.length) continue;
+      anyShown = true;
+      sidebar.appendChild(el('div', 'section-label', sectionTitle || section));
+      for (const p of group) {
+        const item = document.createElement('a');
+        item.className = 'pair-item';
+        item.classList.toggle('selected', p.key === state.selectedKey);
+        if (section === 'terminated') item.classList.add('terminated');
+        const unread = Math.max(0, p.last_id - (state.lastSeenIdByPair[p.key] || 0));
+        if (unread > 0 && p.key !== state.selectedKey) item.classList.add('has-unread');
+        item.href = '#' + p.key;
+
+        const labels = el('div', 'labels');
+        if (state.mode === 'pair_key') {
+          const members = p.members || [];
+          members.forEach((m, i) => {
+            if (i > 0) labels.appendChild(el('span', 'sep', '·'));
+            labels.appendChild(pill(m.label));
+          });
+        } else {
+          labels.appendChild(pill(p.a));
+          labels.appendChild(el('span', 'sep', '↔'));
+          labels.appendChild(pill(p.b));
+        }
+        const badge = el('span', 'unread-badge', unread > 99 ? '99+' : String(unread));
+        labels.appendChild(badge);
+        item.appendChild(labels);
+
+        const metaRow = el('div', 'meta-row');
+        const dot = el('span', 'activity-dot ' + (p.activity || 'unknown'));
+        metaRow.appendChild(dot);
+        const turnLabel = state.mode === 'pair_key'
+          ? p.total + ' msg'
+          : p.total + ' msg · ' + p.turn_count + ' turns';
+        metaRow.appendChild(el('span', '', turnLabel));
+        item.appendChild(metaRow);
+
+        item.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          selectPair(p.key);
+        });
+        sidebar.appendChild(item);
+      }
+    }
+    if (!anyShown) {
+      sidebar.appendChild(el('div', 'empty',
+        state.mode === 'pair_key' ? 'no room members yet' : 'no pairs yet'));
+    }
+  }
+
+  function renderPairHeader(p) {
+    pairHeader.innerHTML = '';
+    if (!p) {
+      pairHeader.appendChild(el('h2', '',
+        state.mode === 'pair_key' ? 'loading room…' : 'select a pair'));
+      pairHeader.appendChild(el('div', 'sub',
+        state.mode === 'pair_key' ? '' : 'from the sidebar →'));
+      return;
+    }
+    const h = document.createElement('h2');
+    if (state.mode === 'pair_key') {
+      const members = p.members || [];
+      members.forEach((m, i) => {
+        if (i > 0) h.appendChild(el('span', 'arrow', '·'));
+        h.appendChild(pill(m.label));
+      });
+    } else {
+      h.appendChild(pill(p.a));
+      h.appendChild(el('span', 'arrow', '↔'));
+      h.appendChild(pill(p.b));
+    }
+    pairHeader.appendChild(h);
+
+    const sub = el('div', 'sub');
+    const ad = el('span', 'activity-dot ' + (p.activity || 'unknown'));
+    sub.appendChild(ad);
+    const summary = state.mode === 'pair_key'
+      ? `${p.activity} · ${p.total} messages`
+      : `${p.activity} · ${p.total} messages · ${p.turn_count} turns`;
+    sub.appendChild(el('span', '', summary));
+
+    // Turn-cap meter: yellow at ≥80% of AGENT_COLLAB_MAX_PAIR_TURNS
+    // so the operator sees convergence pressure before hitting the
+    // cap mid-broadcast (brainstorm §v3.2-papercuts, 3-peer
+    // confluence: gamma, alpha, test-engineer).
+    const cap = state.maxPairTurns || 100;
+    const tc = p.turn_count || 0;
+    if (tc > 0) {
+      const pct = Math.round((tc / cap) * 100);
+      const warn = pct >= 80;
+      const meter = el('span', 'turn-cap' + (warn ? ' warn' : ''),
+        `· ${tc}/${cap} turns (${pct}%)`);
+      sub.appendChild(meter);
+    }
+
+    if (p.terminated_at) {
+      sub.appendChild(el('span', '',
+        `· ended by ${p.terminated_by} at ${p.terminated_at}`));
+    }
+    if (state.mode === 'pair_key') {
+      const members = (p.members || []).filter(m =>
+        state.showStale || !isStale(m.last_seen_at));
+      const hiddenCount = (p.members || []).length - members.length;
+      for (const m of members) {
+        const tag = el('span', '', m.label + ': ' + (m.agent || '?') +
+          (m.channel ? ' · channel' : '') +
+          (m.role ? ' · ' + m.role : ''));
+        sub.appendChild(tag);
+      }
+      if (hiddenCount > 0) {
+        sub.appendChild(el('span', '',
+          `+ ${hiddenCount} stale (toggle sidebar to show)`));
+      }
+    } else {
+      for (const who of [p.a, p.b]) {
+        const info = p.peers && p.peers[who];
+        if (info) {
+          const tag = el('span', '', who + ': ' + (info.agent || '?') +
+            (info.channel ? ' · channel' : '') +
+            (info.role ? ' · ' + info.role : ''));
+          sub.appendChild(tag);
+        }
+      }
+    }
+    pairHeader.appendChild(sub);
+  }
+
+  function groupRoomMessages(messages) {
+    // Collapse rows that are the same logical send (same sender, same
+    // created_at, same body) into one card with a recipient list.
+    // Broadcasts and multicasts arrive as N inbox rows; this makes one
+    // conceptual message show as one card.
+    const groups = [];
+    let cur = null;
+    for (const m of messages) {
+      if (cur &&
+          cur.from === m.from &&
+          cur.created_at === m.created_at &&
+          cur.body === m.body) {
+        cur.recipients.push(m.to);
+        cur.ids.push(m.id);
+      } else {
+        cur = {
+          from: m.from, body: m.body, created_at: m.created_at,
+          recipients: [m.to], ids: [m.id],
+        };
+        groups.push(cur);
+      }
+    }
+    return groups;
+  }
+
+  function renderStream(pairKey) {
+    stream.innerHTML = '';
+    const messages = state.messagesByPair[pairKey] || [];
+    if (!messages.length) {
+      stream.appendChild(el('div', 'empty', 'no messages yet'));
+      return;
+    }
+    const p = state.pairs[pairKey];
+    const isRoom = state.mode === 'pair_key';
+    const groups = isRoom ? groupRoomMessages(messages)
+                          : messages.map(m => ({
+                              from: m.from, body: m.body, created_at: m.created_at,
+                              recipients: [m.to], ids: [m.id],
+                            }));
+    const roomSize = isRoom && p && p.members ? p.members.length : 0;
+
+    let prevDay = null;
+    for (const g of groups) {
+      const day = (g.created_at || '').slice(0, 10);
+      if (day && day !== prevDay) {
+        stream.appendChild(el('div', 'day', day));
+        prevDay = day;
+      }
+      const wrap = el('div', 'msg');
+      wrap.dataset.id = g.ids[0];
+      if ((g.body || '').toLowerCase().includes('[[end]]')) wrap.classList.add('end-marker');
+      const meta = el('div', 'meta');
+      meta.appendChild(pill(g.from || '?'));
+      meta.appendChild(el('span', 'arrow', '→'));
+
+      // Recipient rendering:
+      //   1 recipient           → pill(to)
+      //   everyone in room - 1  → "@room" badge
+      //   otherwise             → comma-separated pills (multicast)
+      if (g.recipients.length === 1) {
+        meta.appendChild(pill(g.recipients[0] || '?'));
+      } else if (roomSize && g.recipients.length >= roomSize - 1) {
+        const room = el('span', 'pill');
+        room.style.background = 'var(--accent)';
+        room.style.border = '1px solid rgba(255,255,255,0.18)';
+        room.textContent = '@room (' + g.recipients.length + ')';
+        meta.appendChild(room);
+      } else {
+        g.recipients.forEach((r, i) => {
+          if (i > 0) meta.appendChild(el('span', 'sep', ','));
+          meta.appendChild(pill(r));
+        });
+      }
+      meta.appendChild(el('span', 'time', g.created_at || ''));
+      meta.appendChild(el('span', 'id', '#' + g.ids[0] +
+        (g.ids.length > 1 ? '+' + (g.ids.length - 1) : '')));
+      wrap.appendChild(meta);
+      wrap.appendChild(el('pre', 'body', g.body || ''));
+      stream.appendChild(wrap);
+    }
+    if (p && p.terminated_at) {
+      const banner = el('div', 'term-banner',
+        `terminated by ${p.terminated_by} at ${p.terminated_at}`);
+      stream.appendChild(banner);
+    }
+  }
+
+  function selectPair(key) {
+    state.selectedKey = key;
+    state.lastSeenIdByPair[key] = state.pairs[key] ? state.pairs[key].last_id : 0;
+    renderSidebar();
+    renderPairHeader(state.pairs[key]);
+    renderStream(key);
+    if (key && !state.messagesByPair[key]) {
+      fetchPairMessages(key);
+    }
+    renderComposer();
+    state.autoScroll = true;
+    requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
+  }
+
+  // Composer: `owner` is a reserved first-class identity (the human in
+  // the loop). `@room` broadcasts. Any other existing member can be
+  // impersonated or DM'd.
+  const composer = document.getElementById('composer');
+  const fromPicker = document.getElementById('fromPicker');
+  const toPicker = document.getElementById('toPicker');
+  const composerBody = document.getElementById('composerBody');
+  const sendBtn = document.getElementById('sendBtn');
+  const sendStatus = document.getElementById('sendStatus');
+  const composerHint = document.getElementById('composerHint');
+
+  function memberLabels(p) {
+    if (!p) return [];
+    if (state.mode === 'pair_key') return (p.members || []).map(m => m.label);
+    return [p.a, p.b];
+  }
+  let lastComposerKey = null;    // signature of last rendered composer
+  function renderComposer() {
+    const p = state.selectedKey ? state.pairs[state.selectedKey] : null;
+    if (!p) { composer.classList.remove('active'); lastComposerKey = null; return; }
+    composer.classList.add('active');
+    const members = memberLabels(p).filter(Boolean);
+    // Skip rebuild when the membership set hasn't changed — otherwise the
+    // 1s poll would collapse an open dropdown mid-selection. Key includes
+    // the selected pair so switching rooms still re-renders.
+    const sig = state.selectedKey + '|' + members.slice().sort().join(',');
+    if (sig === lastComposerKey) return;
+    lastComposerKey = sig;
+    const prevFrom = fromPicker.value;
+    const prevTo = toPicker.value;
+    // From: owner first, then any existing members. Auto-register fires
+    // server-side on first send if owner isn't in the DB yet.
+    fromPicker.innerHTML = '';
+    const fromOpts = ['owner', ...members.filter(m => m !== 'owner')];
+    for (const m of fromOpts) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m === 'owner' ? 'owner (you)' : m;
+      fromPicker.appendChild(opt);
+    }
+    fromPicker.value = fromOpts.includes(prevFrom) ? prevFrom : 'owner';
+    // To: @room, then each member except the current `from`.
+    function refreshToOptions() {
+      const from = fromPicker.value;
+      const prev = toPicker.value;
+      toPicker.innerHTML = '';
+      const roomOpt = document.createElement('option');
+      roomOpt.value = '@room';
+      roomOpt.textContent = '@room (broadcast)';
+      toPicker.appendChild(roomOpt);
+      for (const m of members) {
+        if (m === from) continue;
+        const opt = document.createElement('option');
+        opt.value = m; opt.textContent = m;
+        toPicker.appendChild(opt);
+      }
+      const candidates = Array.from(toPicker.options).map(o => o.value);
+      toPicker.value = candidates.includes(prev) ? prev : '@room';
+    }
+    refreshToOptions();
+    fromPicker.onchange = refreshToOptions;
+    composerHint.textContent = state.mode === 'pair_key'
+      ? `room: ${state.pairKey}` : 'cwd-scoped conversation';
+  }
+  async function doSend() {
+    const from = fromPicker.value;
+    const to = toPicker.value;
+    const body = composerBody.value;
+    if (!body.trim()) return;
+    sendBtn.disabled = true;
+    sendStatus.className = 'status show';
+    sendStatus.textContent = 'sending…';
+    try {
+      const r = await fetch('/api/send?' + scopeQS(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to, body }),
+      });
+      const data = await r.json();
+      if (r.ok && data.ok) {
+        composerBody.value = '';
+        sendStatus.className = 'status show ok';
+        sendStatus.textContent = (data.stdout || 'sent').split('\\n')[0];
+        setTimeout(() => { sendStatus.className = 'status'; }, 2500);
+        // Poll immediately so the new message shows up.
+        tick();
+      } else {
+        sendStatus.className = 'status show err';
+        sendStatus.textContent = data.error
+          || data.stderr || data.stdout || 'send failed';
+      }
+    } catch (e) {
+      sendStatus.className = 'status show err';
+      sendStatus.textContent = 'network error: ' + e.message;
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+  sendBtn.addEventListener('click', doSend);
+  composerBody.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    if (ev.shiftKey) return;             // Shift+Enter → newline (default)
+    if (ev.isComposing) return;          // IME composition → don't send
+    ev.preventDefault();
+    doSend();
+  });
+
+  // Scope resolution.
+  //
+  // Python server bakes scope at startup (--pair-key or --cwd flag) and
+  // the client reads /scope.json to learn what it was serving. Go
+  // server is multi-room by default, so the client picks scope from
+  // the URL query params (?scope=pair_key&key=K or ?scope=cwd&path=P).
+  // /api/scope is still consulted as a self-check — if the server is
+  // locked to --only-pair-key, the response tells us so and we
+  // override the URL-derived scope with the server lock.
+  function parseUrlScope() {
+    const p = new URLSearchParams(location.search);
+    const scope = p.get('scope');
+    if (scope === 'pair_key') {
+      const key = p.get('key');
+      if (key) { state.mode = 'pair_key'; state.pairKey = key; state.cwd = null; return true; }
+    }
+    if (scope === 'cwd') {
+      const path = p.get('path');
+      if (path) { state.mode = 'cwd'; state.cwd = path; state.pairKey = null; return true; }
+    }
+    return false;
+  }
+  async function fetchScope() {
+    // URL wins first; /api/scope is only used for server-lock detection
+    // and for the Python-compat fallback when the server embeds scope.
+    parseUrlScope();
+    try {
+      const r = await fetch('/api/scope', { cache: 'no-store' });
+      const data = await r.json();
+      if (data.max_pair_turns) state.maxPairTurns = data.max_pair_turns;
+      if (data.stale_threshold_secs) state.staleThresholdSecs = data.stale_threshold_secs;
+      // Server-locked (--only-pair-key): override any URL scope.
+      if (data.only_pair_key) {
+        state.mode = 'pair_key';
+        state.pairKey = data.only_pair_key;
+        state.cwd = null;
+        return;
+      }
+      // Python-compat: server baked a single scope.
+      if (data.multi_room === false || data.implementation !== 'go') {
+        if (data.mode === 'pair_key' && data.pair_key) {
+          state.mode = 'pair_key'; state.pairKey = data.pair_key;
+        } else if (data.mode === 'cwd' && data.cwd) {
+          state.mode = 'cwd'; state.cwd = data.cwd;
+        }
+      }
+    } catch (e) {
+      if (!state.mode) state.mode = 'cwd';  // best-effort fallback
+    }
+  }
+  function scopeQS() {
+    if (state.mode === 'pair_key') {
+      return 'pair_key=' + encodeURIComponent(state.pairKey);
+    }
+    return 'cwd=' + encodeURIComponent(state.cwd || '');
+  }
+
+  async function fetchPairs() {
+    try {
+      const base = state.mode === 'pair_key' ? '/api/rooms' : '/api/pairs';
+      const url = base + '?' + scopeQS();
+      const listKey = state.mode === 'pair_key' ? 'rooms' : 'pairs';
+      const r = await fetch(url, { cache: 'no-store' });
+      const data = await r.json();
+      const pairs = {};
+      let totalUnread = 0;
+      for (const p of data[listKey] || []) {
+        pairs[p.key] = p;
+        const unread = Math.max(0, p.last_id - (state.lastSeenIdByPair[p.key] || 0));
+        if (p.key !== state.selectedKey) totalUnread += unread;
+      }
+      state.pairs = pairs;
+      renderSidebar();
+      if (state.selectedKey && pairs[state.selectedKey]) {
+        renderPairHeader(pairs[state.selectedKey]);
+        // Re-render composer so from/to pickers reflect new members.
+        // renderComposer preserves prev selection so dropdowns stay stable
+        // while adding any new peers.
+        renderComposer();
+      }
+      // Pair-key mode auto-selects the single room so the user lands on
+      // the stream without a click.
+      if (state.mode === 'pair_key' && !state.selectedKey) {
+        const only = Object.keys(pairs)[0];
+        if (only) selectPair(only);
+      }
+      document.title = (totalUnread ? '(' + totalUnread + ') ' : '') + originalTitle;
+    } catch (e) {
+      console.warn('scope poll failed', e);
+    }
+  }
+
+  async function fetchPairMessages(pairKey, after) {
+    if (!pairKey) return;
+    const since = typeof after === 'number' ? after :
+                  (state.lastIdByPair[pairKey] || 0);
+    const p = state.pairs[pairKey];
+    if (!p) return;
+    let url = '/api/messages?' + scopeQS() + '&after=' + since;
+    if (state.mode !== 'pair_key') {
+      // cwd mode narrows by the selected pair's (a, b).
+      url += '&a=' + encodeURIComponent(p.a) + '&b=' + encodeURIComponent(p.b);
+    }
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      const data = await r.json();
+      if (!(data.messages && data.messages.length)) return;
+      const arr = state.messagesByPair[pairKey] || [];
+      let maxId = state.lastIdByPair[pairKey] || 0;
+      const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
+      for (const m of data.messages) {
+        arr.push(m);
+        if (m.id > maxId) maxId = m.id;
+      }
+      state.messagesByPair[pairKey] = arr;
+      state.lastIdByPair[pairKey] = maxId;
+      if (pairKey === state.selectedKey) {
+        renderStream(pairKey);
+        state.lastSeenIdByPair[pairKey] = maxId;
+        if (state.autoScroll || atBottom) {
+          requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
+          scrollBtn.classList.remove('show');
+        } else {
+          scrollBtn.classList.add('show');
+        }
+      }
+    } catch (e) {
+      console.warn('messages poll failed', e);
+    }
+  }
+
+  stream.addEventListener('scroll', () => {
+    const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
+    state.autoScroll = atBottom;
+    if (atBottom) scrollBtn.classList.remove('show');
+  });
+  scrollBtn.addEventListener('click', () => {
+    state.autoScroll = true;
+    stream.scrollTop = stream.scrollHeight;
+    scrollBtn.classList.remove('show');
+  });
+
+  async function tick() {
+    await fetchPairs();
+    if (state.selectedKey) await fetchPairMessages(state.selectedKey);
+  }
+
+  // Rooms nav — list every pair_key on the machine in the left rail.
+  // Poll less aggressively than pair-level data (index changes slowly;
+  // room membership + messages change fast). Unread count across rooms
+  // is tracked in lastSeenIdByRoomKey so new traffic in OTHER rooms
+  // lights up the nav badge.
+  const lastSeenIdByRoomKey = {};
+  async function fetchRoomsNav() {
+    try {
+      const r = await fetch('/api/index', { cache: 'no-store' });
+      const data = await r.json();
+      renderRoomsNav(data.rooms || []);
+    } catch (e) {
+      // leave prior render in place on transient failure
+    }
+  }
+  function renderRoomsNav(rooms) {
+    const nav = document.getElementById('roomsNav');
+    nav.innerHTML = '';
+
+    // Match index-page default: hide terminated rooms unless the
+    // operator has opted in via the same localStorage key.
+    const showTerminated =
+      localStorage.getItem('peer-web:showTerminated') === '1';
+    const allRooms = rooms;
+    const visible = showTerminated
+      ? allRooms
+      : allRooms.filter(r =>
+          r.activity !== 'terminated' || r.pair_key === state.pairKey);
+    const hiddenCount = allRooms.length - visible.length;
+
+    const label = el('div', 'section-label',
+      'rooms' + (hiddenCount > 0 ? ` (${hiddenCount} hidden)` : ''));
+    nav.appendChild(label);
+    if (!visible.length) {
+      nav.appendChild(el('div', 'loading', 'no rooms'));
+      return;
+    }
+    const order = { active: 0, idle: 1, stale: 2, terminated: 3, unknown: 4 };
+    const sorted = visible.slice().sort((a, b) => {
+      // Current room pinned top regardless of activity.
+      if (a.pair_key === state.pairKey) return -1;
+      if (b.pair_key === state.pairKey) return 1;
+      const da = order[a.activity] ?? 5, db = order[b.activity] ?? 5;
+      if (da !== db) return da - db;
+      return (a.pair_key || '').localeCompare(b.pair_key || '');
+    });
+    for (const r of sorted) {
+      const a = document.createElement('a');
+      a.className = 'room-nav' + (r.pair_key === state.pairKey ? ' current' : '');
+      if (r.activity === 'terminated') a.classList.add('terminated');
+      a.href = '/view?scope=pair_key&key=' + encodeURIComponent(r.pair_key);
+      const dot = el('span', 'activity-dot ' + (r.activity || 'unknown'));
+      a.appendChild(dot);
+      a.appendChild(el('span', 'room-key', r.pair_key));
+      const unread = Math.max(0,
+        (r.last_id || 0) - (lastSeenIdByRoomKey[r.pair_key] || 0));
+      if (r.pair_key === state.pairKey) {
+        // Entering the current room zeroes its unread count.
+        lastSeenIdByRoomKey[r.pair_key] = r.last_id || 0;
+      } else if (unread > 0) {
+        a.appendChild(el('span', 'room-unread',
+          unread > 99 ? '99+' : String(unread)));
+      }
+      nav.appendChild(a);
+    }
+  }
+
+  // Support deep-link #a+b to preselect
+  const initialHash = (location.hash || '').replace(/^#/, '');
+
+  // Stale-filter checkbox wiring. Persists across reloads via
+  // localStorage so operators don't re-toggle every session.
+  const staleCheckbox = document.getElementById('staleCheckbox');
+  const storedShowStale = localStorage.getItem('peer-web:showStale') === '1';
+  state.showStale = storedShowStale;
+  staleCheckbox.checked = storedShowStale;
+  staleCheckbox.addEventListener('change', () => {
+    state.showStale = staleCheckbox.checked;
+    localStorage.setItem('peer-web:showStale', state.showStale ? '1' : '0');
+    // Re-render the header so hidden members re-appear without waiting
+    // for the next 1s poll.
+    if (state.selectedKey && state.pairs[state.selectedKey]) {
+      renderPairHeader(state.pairs[state.selectedKey]);
+    }
+  });
+
+  fetchScope().then(() => tick()).then(() => {
+    if (initialHash && state.pairs[initialHash]) {
+      selectPair(initialHash);
+    }
+  });
+  setInterval(tick, 1000);
+
+  // Rooms nav polls less often — room-set changes slowly and /api/index
+  // fans out N FetchRooms queries. Every 3s balances freshness vs load.
+  fetchRoomsNav();
+  setInterval(fetchRoomsNav, 3000);
+})();
+</script>

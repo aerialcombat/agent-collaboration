@@ -89,10 +89,17 @@ Usage:
                                 a room. Use after [[end]] or after hitting
                                 the max-turns cap. --to resets a cwd-only
                                 edge; --pair-key resets the shared room.
-  agent-collab peer web [--as <label>] [--port 8787]
-                                Serve a live-updating browser view of the
-                                current cwd's peer messages. Blocks until
-                                Ctrl-C. Open http://127.0.0.1:8787.
+  agent-collab peer web [--port 8787] [--pair-key K | --only-pair-key K
+                                | --cwd PATH]
+                                Serve a live browser view. Go binary (if
+                                built at go/bin/peer-web) renders a
+                                multi-room index at /; --pair-key is a
+                                deep-link shortcut, --only-pair-key locks
+                                the server to one room. Falls back to the
+                                Python single-scope viewer if the binary
+                                is missing or AGENT_COLLAB_WEB_IMPL=python
+                                is set. Blocks until Ctrl-C.
+                                Default: http://127.0.0.1:8787.
   agent-collab help
 
 Session-key discovery for peer-inbox (register and self-resolution):
@@ -755,6 +762,39 @@ resolve_peer_inbox_script() {
   err "peer-inbox-db.py not found (checked: AGENT_COLLAB_PEER_INBOX_DB_SCRIPT, $self_dir, ~/.agent-collab/scripts/)"
 }
 
+# resolve_peer_web_binary — returns the path to the Go peer-web binary
+# if present, empty string otherwise. Search order matches the other
+# Go binaries already dispatched from this script:
+#   1. $AGENT_COLLAB_PEER_WEB_BIN (explicit override)
+#   2. $repo/go/bin/peer-web (dev builds)
+#   3. $HOME/.local/bin/peer-web (installed)
+#   4. peer-web on PATH
+resolve_peer_web_binary() {
+  if [[ -n "${AGENT_COLLAB_PEER_WEB_BIN:-}" ]]; then
+    if [[ -x "$AGENT_COLLAB_PEER_WEB_BIN" ]]; then
+      printf '%s\n' "$AGENT_COLLAB_PEER_WEB_BIN"
+    fi
+    return
+  fi
+  local self_dir
+  self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  local repo_root
+  repo_root="$(cd "$self_dir/.." && pwd -P 2>/dev/null || true)"
+  if [[ -n "$repo_root" && -x "$repo_root/go/bin/peer-web" ]]; then
+    printf '%s\n' "$repo_root/go/bin/peer-web"
+    return
+  fi
+  if [[ -x "$HOME/.local/bin/peer-web" ]]; then
+    printf '%s\n' "$HOME/.local/bin/peer-web"
+    return
+  fi
+  local on_path
+  on_path="$(command -v peer-web 2>/dev/null || true)"
+  if [[ -n "$on_path" ]]; then
+    printf '%s\n' "$on_path"
+  fi
+}
+
 dispatch_peer_inbox() {
   local top_mode="$1"
   shift
@@ -762,6 +802,26 @@ dispatch_peer_inbox() {
   [[ $# -ge 1 ]] || err "missing subcommand for '$top_mode' (try: register, close, list, send, receive)"
   local sub="$1"
   shift
+
+  # `peer web` routes to the Go binary when present — multi-room index
+  # + no --pair-key lock + Python-free serving path (v3.2 frontend-go-
+  # rewrite). Falls back to Python if the binary isn't built, or if
+  # AGENT_COLLAB_WEB_IMPL=python forces the fallback for bug-report
+  # reproducibility.
+  if [[ "$top_mode" == "peer" && "$sub" == "web" ]]; then
+    if [[ "${AGENT_COLLAB_WEB_IMPL:-}" != "python" ]]; then
+      local peer_web_bin
+      peer_web_bin="$(resolve_peer_web_binary)"
+      if [[ -n "$peer_web_bin" ]]; then
+        REPO_ROOT="$(detect_repo_root)"
+        load_config "$REPO_ROOT/.agent-collab.env"
+        if [[ -n "$CONFIG_INBOX_DB" && -z "${AGENT_COLLAB_INBOX_DB:-}" ]]; then
+          export AGENT_COLLAB_INBOX_DB="$CONFIG_INBOX_DB"
+        fi
+        exec "$peer_web_bin" "$@"
+      fi
+    fi
+  fi
 
   local python_cmd
   if command -v python3 >/dev/null 2>&1; then
