@@ -69,6 +69,58 @@ func (s *SQLiteLocal) ListPendingOutbound(
 	return out, rows.Err()
 }
 
+// EnqueueOutbound persists a failed remote-send for later retry.
+// Idempotent on message_id — a retry that also fails updates the
+// attempts counter in place rather than duplicating the row. Matches
+// Python _enqueue_outbound (peer-inbox-db.py:902-947).
+func (s *SQLiteLocal) EnqueueOutbound(
+	ctx context.Context,
+	messageID, homeHost, pairKey, fromLabel, toLabel, body, lastError string,
+) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("EnqueueOutbound: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	var existingID int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM pending_outbound WHERE message_id = ?`,
+		messageID,
+	).Scan(&existingID)
+	switch err {
+	case nil:
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE pending_outbound
+			   SET attempts = attempts + 1,
+			       last_attempt_at = ?,
+			       last_error = ?
+			 WHERE id = ?`,
+			now, lastError, existingID,
+		); err != nil {
+			return fmt.Errorf("EnqueueOutbound: bump attempt: %w", err)
+		}
+	case sql.ErrNoRows:
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO pending_outbound
+			  (message_id, home_host, pair_key, from_label, to_label, body,
+			   created_at, attempts, last_attempt_at, last_error)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+			messageID, homeHost, pairKey, fromLabel, toLabel, body,
+			now, now, lastError,
+		); err != nil {
+			return fmt.Errorf("EnqueueOutbound: insert: %w", err)
+		}
+	default:
+		return fmt.Errorf("EnqueueOutbound: probe: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("EnqueueOutbound: commit: %w", err)
+	}
+	return nil
+}
+
 // DropPendingOutbound removes a row by id. Used after a successful
 // flush replay or a TTL-drop.
 func (s *SQLiteLocal) DropPendingOutbound(ctx context.Context, id int64) error {

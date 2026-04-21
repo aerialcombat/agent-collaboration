@@ -141,11 +141,8 @@ func runPeerSend(args []string) int {
 	}
 
 	// v3.3 federation short-circuit: if the room's home_host is a remote,
-	// Python POSTS to that remote's /api/send. The Go CLI client for that
-	// path is not part of Phase 3 (peer-web's /api/send handler — the
-	// *server* side — is already in Go via Phase 1). Surface a clear
-	// error rather than silently writing locally, which would split the
-	// room state across hosts.
+	// POST to that remote's /api/send instead of writing locally.
+	// Mirrors Python cmd_peer_send's _peer_send_remote path.
 	if selfPairKey != "" {
 		homeHost, err := st.GetRoomHomeHost(ctx, "pk:"+selfPairKey)
 		if err != nil {
@@ -153,11 +150,19 @@ func runPeerSend(args []string) int {
 			return exitInternal
 		}
 		if homeHost != "" && homeHost != selfHostLabel() {
-			fmt.Fprintf(os.Stderr,
-				"error: room home_host=%s is remote (self=%s); federation client not yet ported to Go — "+
-					"fall back to the Python CLI (AGENT_COLLAB_IMPL=python)\n",
-				homeHost, selfHostLabel())
-			return exitInternal
+			msgID := *messageID
+			if msgID == "" {
+				msgID = sqlitestore.NewULID(time.Now().UTC())
+			}
+			return runPeerSendRemote(ctx, st, remoteSendArgs{
+				pairKey:   selfPairKey,
+				homeHost:  homeHost,
+				messageID: msgID,
+				toLabel:   toLabel,
+				body:      body,
+				selfLabel: self.Label,
+				jsonOut:   *jsonOut,
+			})
 		}
 	}
 
