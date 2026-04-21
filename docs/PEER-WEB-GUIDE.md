@@ -93,10 +93,67 @@ checked. Preference shared between pages via the
 `peer-web:showTerminated` localStorage key. Subheader shows
 `(N terminated hidden)` when filter is active.
 
+## Tailnet exposure (v3.3)
+
+For federation — laptop agents participating in orange-hosted rooms and
+vice versa — both hosts need to reach each other's peer-web. Both hosts
+expose peer-web through Tailscale; the default `127.0.0.1` bind stays.
+
+**Orange (always-on server):**
+
+```
+tailscale serve --bg --https=443 http://localhost:8787
+# reachable at https://orange-1.<tailnet>.ts.net/
+```
+
+**Laptop (intermittent):**
+
+```
+tailscale serve --bg --https=443 http://localhost:8787
+# reachable at https://laptop-name.<tailnet>.ts.net/ when awake
+```
+
+Laptop-hosted rooms are only reachable while the laptop is awake. This
+is by design — plan `v3.3-symmetric-federation-scoping.md` commits to
+"unreachable home host = unreachable room, full stop" rather than
+invent a cross-host replication path. Orange-hosted rooms stay up
+through laptop sleep; laptop-hosted rooms pause through laptop sleep.
+
+Once both hosts are reachable, configure `~/.agent-collab/remotes.json`
+on each side with the other's base URL + auth token env var (see §Auth
+below) and register sessions with `--home-host HOST` so peer-send
+routes correctly. End-to-end verification: `tests/federation-smoke.sh`.
+
+## Auth (v3.3)
+
+`/api/send` enforces a per-session bearer token for every non-owner
+sender. `session-register` mints and prints a 256-bit token exactly
+once; copy it to the client host's environment and reference via
+`remotes.json`:
+
+```json
+{
+  "orange": {
+    "base_url": "https://orange-1.<tailnet>.ts.net",
+    "auth_token_env": "AGENT_COLLAB_TOKEN_ORANGE"
+  }
+}
+```
+
+Then `export AGENT_COLLAB_TOKEN_ORANGE=<token>` on the sender host.
+`owner` remains the one tokenless path — the web-UI human who
+auto-registers on first send.
+
+Threat model: tailnet = transport trust, not identity. A compromised
+but tailnet-authorized device cannot impersonate arbitrary agents
+without the relevant session token. Tokens rotate on explicit
+re-registration; a future `--force-rotate-token` flag will add
+in-place rotation.
+
 ## Safety
 
-- **Localhost-only.** Binds `127.0.0.1` — no network exposure beyond the
-  machine.
+- **Localhost-only by default.** Binds `127.0.0.1` — tailnet exposure is
+  opt-in via `tailscale serve` (see §Tailnet exposure).
 - **`--only-pair-key K`** locks the server to a single room so
   operators wanting narrow localhost exposure can replicate Python's
   single-scope semantic. Cross-scope reads, sends, and bulk-ops all
