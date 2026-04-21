@@ -40,7 +40,7 @@ type SessionRegisterResult struct {
 	PairKey       string // "" when cwd-scope
 	AuthToken     string // new token if minted; else the preserved one
 	AuthTokenNew  bool   // true = first time this row had a token (print it)
-	ChannelPaired bool   // always false in Phase 3 (channel-pair deferred)
+	ChannelPaired bool   // true when the caller passed a non-empty ChannelSocket
 	IsNewJoin     bool   // pair-key room join event (caller may emit)
 }
 
@@ -60,15 +60,15 @@ var ErrHomeHostImmutable = errors.New("store: home_host is immutable — use a d
 // (when a pair-key is set) ensures a peer_rooms row with the right
 // home_host. Returns the result carrying the output-print inputs.
 //
-// Scope: core path only. Phase 3 deferrals (not in this port):
-//   - find_pending_channel_for_self (channel socket pairing)
+// Scope: core path + channel-socket binding. Still deferred
+// (Phase 5.1 follow-ups):
 //   - emit_system_event (room-join announcements)
-//   - write_marker / sweep_stale_markers_for_label (marker file writes)
+//   - sweep_stale_markers_for_label (marker cleanup after register)
 //   - recent_seen_sessions fallback (hook-log-session bridge)
 //
-// Those land in Phase 4 edge-verb work; the operator workflow for
-// Phase 3 is "pass --session-key explicitly" and "write markers via
-// the Python CLI until markers port lands".
+// Callers resolve ChannelSocket themselves (e.g. the CLI walks its
+// process tree for a pending-channel file). The store just persists
+// whatever it's handed — keeps RegisterSession OS-agnostic for tests.
 func (s *SQLiteLocal) RegisterSession(ctx context.Context, p SessionRegisterParams) (SessionRegisterResult, error) {
 	if p.CWD == "" || p.Label == "" || p.Agent == "" || p.SessionKey == "" {
 		return SessionRegisterResult{}, fmt.Errorf("register: cwd, label, agent, session_key required")
@@ -253,7 +253,7 @@ func (s *SQLiteLocal) RegisterSession(ctx context.Context, p SessionRegisterPara
 		Label: p.Label, Agent: p.Agent, Role: p.Role, CWD: p.CWD,
 		SessionKey: p.SessionKey, PairKey: pairKey,
 		AuthToken: authToken, AuthTokenNew: authTokenNew,
-		ChannelPaired: false, IsNewJoin: isNewJoin,
+		ChannelPaired: p.ChannelSocket != "", IsNewJoin: isNewJoin,
 	}, nil
 }
 

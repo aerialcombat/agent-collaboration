@@ -15,15 +15,13 @@ import (
 )
 
 // runSessionRegister ports cmd_session_register from
-// scripts/peer-inbox-db.py. Phase 3 scope includes label autogen, pair-
+// scripts/peer-inbox-db.py. Scope now includes label autogen, pair-
 // key resolution (--pair-key / --new-pair / preserve), receive-mode,
-// home-host federation seed, and auth-token mint (v3.3 Item 7).
+// home-host federation seed, auth-token mint (v3.3 Item 7), and
+// channel-socket pairing via the parent-process walk.
 //
-// Deferred for Phase 4 (edge work, per plans/v3.4-python-removal-
-// scoping.md §5): channel-socket pairing, recent-seen-sessions
-// fallback, system-event emission on join, stale-marker sweep. Phase 3
-// marker writing still lands here because the Go hook path depends on
-// it to resolve sessions.
+// Still deferred (Phase 5.1 backlog): recent-seen-sessions fallback,
+// system-event emission on join, stale-marker sweep.
 func runSessionRegister(args []string) int {
 	fs := flag.NewFlagSet("session-register", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -120,9 +118,15 @@ func runSessionRegister(args []string) int {
 	}
 	defer st.Close()
 
+	// Pair with the channel MCP server Claude spawned at session start.
+	// Best-effort: silently no-op when no channel is live (e.g. codex /
+	// gemini sessions, or a Claude session whose channel exited).
+	channelSocket := findPendingChannelSocket()
+
 	res, err := st.RegisterSession(ctx, sqlitestore.SessionRegisterParams{
 		CWD: resolvedCWD, Label: finalLabel, Agent: *agent, Role: *role,
-		SessionKey: sk, PairKey: *pairKey, NewPair: *newPair,
+		SessionKey: sk, ChannelSocket: channelSocket,
+		PairKey: *pairKey, NewPair: *newPair,
 		ReceiveMode: *receiveMode, HomeHost: *homeHost, Force: *force,
 	})
 	if err != nil {
@@ -145,6 +149,9 @@ func runSessionRegister(args []string) int {
 		role4Print = "peer"
 	}
 	channelNote := " [channel: none]"
+	if channelSocket != "" {
+		channelNote = " [channel: paired]"
+	}
 	pairNote := ""
 	if res.PairKey != "" {
 		pairNote = fmt.Sprintf(" [pair_key=%s]", res.PairKey)
