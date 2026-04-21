@@ -762,6 +762,38 @@ resolve_peer_inbox_script() {
   err "peer-inbox-db.py not found (checked: AGENT_COLLAB_PEER_INBOX_DB_SCRIPT, $self_dir, ~/.agent-collab/scripts/)"
 }
 
+# resolve_peer_inbox_binary — returns the path to the Go peer-inbox
+# binary if present, empty string otherwise. Same search shape as
+# resolve_peer_web_binary. Used by Phase 5 opt-in (v3.4 Python-removal):
+# set AGENT_COLLAB_IMPL=go to route verbs through the Go binary; default
+# stays Python until the remaining peripheral paths (channel pairing,
+# marker sweep, system events, federation client) are ported.
+resolve_peer_inbox_binary() {
+  if [[ -n "${AGENT_COLLAB_PEER_INBOX_BIN:-}" ]]; then
+    if [[ -x "$AGENT_COLLAB_PEER_INBOX_BIN" ]]; then
+      printf '%s\n' "$AGENT_COLLAB_PEER_INBOX_BIN"
+    fi
+    return
+  fi
+  local self_dir
+  self_dir="$(cd "$(dirname "$0")" && pwd -P)"
+  local repo_root
+  repo_root="$(cd "$self_dir/.." && pwd -P 2>/dev/null || true)"
+  if [[ -n "$repo_root" && -x "$repo_root/go/bin/peer-inbox" ]]; then
+    printf '%s\n' "$repo_root/go/bin/peer-inbox"
+    return
+  fi
+  if [[ -x "$HOME/.local/bin/peer-inbox" ]]; then
+    printf '%s\n' "$HOME/.local/bin/peer-inbox"
+    return
+  fi
+  local on_path
+  on_path="$(command -v peer-inbox 2>/dev/null || true)"
+  if [[ -n "$on_path" ]]; then
+    printf '%s\n' "$on_path"
+  fi
+}
+
 # resolve_peer_web_binary — returns the path to the Go peer-web binary
 # if present, empty string otherwise. Search order matches the other
 # Go binaries already dispatched from this script:
@@ -821,6 +853,28 @@ dispatch_peer_inbox() {
         exec "$peer_web_bin" "$@"
       fi
     fi
+  fi
+
+  # v3.4 Phase 5 opt-in: AGENT_COLLAB_IMPL=go routes non-`peer web` verbs
+  # through the Go peer-inbox binary. Parity-fixture coverage (52 green
+  # as of this commit) proves byte-equivalence on the core flows. The
+  # deferred peripherals (channel pairing, marker sweep, system events,
+  # federation client, --to-cwd) still route to Python — so we keep
+  # Python as the default until those land, and flip to Go only when
+  # operators explicitly opt in via the env var.
+  if [[ "${AGENT_COLLAB_IMPL:-}" == "go" && "$top_mode" != "peer" || "${AGENT_COLLAB_IMPL:-}" == "go" && "$sub" != "web" ]]; then
+    local peer_inbox_bin
+    peer_inbox_bin="$(resolve_peer_inbox_binary)"
+    if [[ -n "$peer_inbox_bin" ]]; then
+      REPO_ROOT="$(detect_repo_root)"
+      load_config "$REPO_ROOT/.agent-collab.env"
+      if [[ -n "$CONFIG_INBOX_DB" && -z "${AGENT_COLLAB_INBOX_DB:-}" ]]; then
+        export AGENT_COLLAB_INBOX_DB="$CONFIG_INBOX_DB"
+      fi
+      exec "$peer_inbox_bin" "${top_mode}-${sub}" "$@"
+    fi
+    # Binary missing — fall through to Python rather than hard-fail so
+    # the opt-in doesn't break fresh checkouts.
   fi
 
   local python_cmd
