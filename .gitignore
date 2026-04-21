@@ -23,3 +23,7 @@ poll_messages.sh
 
 # pi-mono per-repo scratch (messenger / etc.)
 .pi/
+
+# v3.4 parity harness debug snapshots — written by tests/parity/run.sh
+# on failing runs; never checked in.
+tests/fixtures/parity/**/*.actual.json
