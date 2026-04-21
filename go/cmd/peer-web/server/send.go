@@ -40,9 +40,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		From string `json:"from"`
-		To   string `json:"to"`
-		Body string `json:"body"`
+		From      string `json:"from"`
+		To        string `json:"to"`
+		Body      string `json:"body"`
+		MessageID string `json:"message_id"` // v3.3 client-generated ULID for idempotent retry
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -50,6 +51,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	body.From = trimLabel(body.From)
 	body.To = trimLabel(body.To)
+	body.MessageID = trimLabel(body.MessageID)
 	if body.From == "" || body.Body == "" {
 		writeJSONError(w, http.StatusBadRequest, "from + body required")
 		return
@@ -83,6 +85,9 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	verb := "peer-send"
 	args := []string{"--cwd", sendCWD, "--as", body.From, "--to", body.To, "--message-stdin", "--json"}
+	if body.MessageID != "" {
+		args = append(args, "--message-id", body.MessageID)
+	}
 	broadcast := false
 	if body.To == "" || body.To == "@room" {
 		verb = "peer-broadcast"

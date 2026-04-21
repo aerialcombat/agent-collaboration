@@ -323,6 +323,62 @@ def format_room_id(home_host: str, pair_key: str) -> str:
     return f"{home_host}:{pair_key}"
 
 
+DEFAULT_REMOTES_PATH = Path.home() / ".agent-collab" / "remotes.json"
+
+
+def _remotes_path() -> Path:
+    override = os.environ.get("AGENT_COLLAB_REMOTES")
+    return Path(override) if override else DEFAULT_REMOTES_PATH
+
+
+def load_remotes() -> dict[str, dict[str, str]]:
+    """Load the federation remotes config.
+
+    Format: `{"<host_label>": {"base_url": "...", "auth_token_env": "..."}}`
+    - `base_url` is the remote peer-web HTTP root (tailnet or https).
+    - `auth_token_env` names the env var holding the bearer token. Item 7
+      (per-session bearer tokens) wires this up; pre-Item-7 callers may
+      pass a fixed token by inlining `auth_token` in the config entry.
+
+    Missing file returns {}; parse errors raise with a clear pointer so
+    operators can fix the config. Called only when routing decides a
+    send is remote — local-only users never read this file.
+    """
+    p = _remotes_path()
+    if not p.exists():
+        return {}
+    import json as _json
+    try:
+        data = _json.loads(p.read_text())
+    except _json.JSONDecodeError as e:
+        err(f"remotes config invalid JSON at {p}: {e}", EXIT_CONFIG_ERROR)
+    if not isinstance(data, dict):
+        err(f"remotes config must be an object at {p}", EXIT_CONFIG_ERROR)
+    out: dict[str, dict[str, str]] = {}
+    for host, cfg in data.items():
+        if not isinstance(cfg, dict):
+            err(f"remotes[{host!r}] must be an object", EXIT_CONFIG_ERROR)
+        base_url = str(cfg.get("base_url", "")).rstrip("/")
+        if not base_url:
+            err(f"remotes[{host!r}] missing base_url", EXIT_CONFIG_ERROR)
+        out[host] = {
+            "base_url": base_url,
+            "auth_token_env": str(cfg.get("auth_token_env", "")),
+            "auth_token": str(cfg.get("auth_token", "")),
+        }
+    return out
+
+
+def resolve_remote_auth_token(remote_cfg: dict[str, str]) -> str:
+    """Pick the bearer token for a remote. Env var wins over inline."""
+    env_name = remote_cfg.get("auth_token_env", "")
+    if env_name:
+        tok = os.environ.get(env_name, "")
+        if tok:
+            return tok
+    return remote_cfg.get("auth_token", "")
+
+
 def generate_pair_key() -> str:
     """Return a fresh memorable pair key (adjective-noun-XXXX)."""
     import secrets
@@ -782,6 +838,114 @@ def _next_server_seq(conn: sqlite3.Connection, room_key: str) -> int:
         (room_key,),
     ).fetchone()
     return int(row["nxt"])
+
+
+def _peer_send_remote(
+    args: argparse.Namespace,
+    pair_key: str,
+    home_host: str,
+    message_id: str,
+    body: str,
+    self_label: str,
+) -> int:
+    """Route a peer-send to a remote host's peer-web /api/send.
+
+    Read `remotes[home_host]` from ~/.agent-collab/remotes.json for the
+    base_url + bearer token. POST {from, to, body, message_id} and surface
+    the remote's response. Network failures bubble up as EXIT_CONFIG_ERROR
+    today; Item 5 (outbound queue) will later absorb transient failures
+    by queuing the payload for retry.
+    """
+    remotes = load_remotes()
+    cfg = remotes.get(home_host)
+    if cfg is None:
+        err(
+            f"room {pair_key} is home={home_host!r} but no remote config "
+            f"found. Add an entry to {_remotes_path()}:\n"
+            f'  {{"{home_host}": {{"base_url": "https://...", '
+            f'"auth_token_env": "AGENT_COLLAB_TOKEN_{home_host.upper()}"}}}}',
+            EXIT_CONFIG_ERROR,
+        )
+
+    url = f"{cfg['base_url']}/api/send?pair_key={pair_key}"
+    payload = {
+        "from": self_label,
+        "to": args.to,
+        "body": body,
+        "message_id": message_id,
+    }
+    token = resolve_remote_auth_token(cfg)
+
+    import json as _json
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        url,
+        data=_json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp_body = resp.read().decode("utf-8")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+        resp_body = e.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        err(
+            f"remote send failed: {e} (target={url}). Item 5 outbound "
+            f"queue not yet wired; retry manually or check tailnet.",
+            EXIT_PEER_OFFLINE,
+        )
+
+    try:
+        parsed = _json.loads(resp_body) if resp_body else {}
+    except _json.JSONDecodeError:
+        parsed = {"raw": resp_body}
+
+    ok = status == 200 and bool(parsed.get("ok", True))
+
+    if getattr(args, "json_output", False):
+        print(_json.dumps({
+            "ok": ok,
+            "to": args.to,
+            "message_id": parsed.get("message_id", message_id),
+            "server_seq": parsed.get("server_seq", 0),
+            "push_status": parsed.get("push_status", "remote"),
+            "dedup_hit": parsed.get("dedup_hit", False),
+            "terminates": False,
+            "mentions": [],
+            "routed_via": home_host,
+        }))
+    else:
+        seq = parsed.get("server_seq", "?")
+        dedup = " [deduped]" if parsed.get("dedup_hit") else ""
+        print(f"sent to {args.to} via {home_host} (seq={seq}){dedup}")
+    return EXIT_OK if ok else EXIT_PEER_OFFLINE
+
+
+def _get_room_home_host(room_key: str) -> Optional[str]:
+    """Return peer_rooms.home_host for a room, or None if the row is absent.
+
+    Used by peer-send to decide local vs. HTTP routing. A missing row
+    means the room hasn't been created locally yet; the caller treats
+    that as "local" (matches pre-v3.3 behavior — cwd-only degenerate
+    rooms never had peer_rooms entries).
+    """
+    conn = open_db()
+    try:
+        row = conn.execute(
+            "SELECT home_host FROM peer_rooms WHERE room_key = ?",
+            (room_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return row["home_host"] or None
 
 
 def _bump_room(
@@ -1388,6 +1552,42 @@ def cmd_session_register(args: argparse.Namespace) -> int:
             """,
             (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now, receive_mode_value),
         )
+
+        # v3.3 federation: if joining a pair_key-scoped room, ensure a
+        # peer_rooms row exists locally with the right home_host. --home-host
+        # HOST seeds a remote-home row; omitted = local self_host(). The row
+        # is the routing decision: peer-send reads home_host to pick local
+        # SQLite vs HTTP POST to a remote peer-web.
+        if pair_key is not None:
+            room_key = f"pk:{pair_key}"
+            declared_home = getattr(args, "home_host", None)
+            if declared_home:
+                validate_host_label(declared_home)
+                home_host = declared_home
+            else:
+                home_host = self_host()
+            existing_room = conn.execute(
+                "SELECT home_host FROM peer_rooms WHERE room_key = ?",
+                (room_key,),
+            ).fetchone()
+            if existing_room is None:
+                conn.execute(
+                    "INSERT INTO peer_rooms (room_key, pair_key, turn_count, home_host) "
+                    "VALUES (?, ?, 0, ?)",
+                    (room_key, pair_key, home_host),
+                )
+            elif declared_home and (existing_room["home_host"] or "") != declared_home:
+                # User explicitly passed --home-host that disagrees with a
+                # pre-existing row. home_host is immutable per plan §2; fail
+                # rather than silently flip.
+                conn.execute("ROLLBACK")
+                err(
+                    f"room {pair_key} already bound to host "
+                    f"{existing_room['home_host']!r}; home_host is immutable "
+                    f"(plan v3.3 §2). Use a different pair_key to switch hosts.",
+                    EXIT_VALIDATION,
+                )
+
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -1592,18 +1792,6 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         args.to = _infer_peer_label(str(self_cwd), self_label, self_pair_key)
     validate_label(args.to)
 
-    # Resolve target cwd. Order of precedence:
-    #   1. explicit --to-cwd wins (legacy cross-cwd sends).
-    #   2. self has a pair_key → look up (pair_key, to_label) across cwds.
-    #   3. fall back to same-cwd resolution (v1.6 behaviour).
-    if args.to_cwd:
-        to_cwd = resolve_cwd(args.to_cwd)
-    elif self_pair_key is not None:
-        resolved_cwd = _lookup_pair_peer_cwd(self_pair_key, args.to)
-        to_cwd = Path(resolved_cwd) if resolved_cwd else self_cwd
-    else:
-        to_cwd = self_cwd
-
     if args.message_stdin:
         body = sys.stdin.read()
     elif args.message_file:
@@ -1622,6 +1810,31 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     if len(body_bytes) == 0:
         err("empty message rejected", EXIT_VALIDATION)
 
+    message_id = getattr(args, "message_id", None) or generate_ulid()
+
+    # v3.3 federation: if the room's home_host is a remote, short-circuit
+    # the local SQLite path and POST to the remote peer-web instead. The
+    # remote resolves the target label + writes its own inbox + assigns
+    # its own server_seq. Local DB carries no trace of the write (Item 5
+    # — outbound queue — will later buffer these for retry).
+    if self_pair_key is not None:
+        remote_home = _get_room_home_host(f"pk:{self_pair_key}")
+        if remote_home and remote_home != self_host():
+            return _peer_send_remote(args, self_pair_key, remote_home,
+                                     message_id, body, self_label)
+
+    # Resolve target cwd. Order of precedence:
+    #   1. explicit --to-cwd wins (legacy cross-cwd sends).
+    #   2. self has a pair_key → look up (pair_key, to_label) across cwds.
+    #   3. fall back to same-cwd resolution (v1.6 behaviour).
+    if args.to_cwd:
+        to_cwd = resolve_cwd(args.to_cwd)
+    elif self_pair_key is not None:
+        resolved_cwd = _lookup_pair_peer_cwd(self_pair_key, args.to)
+        to_cwd = Path(resolved_cwd) if resolved_cwd else self_cwd
+    else:
+        to_cwd = self_cwd
+
     # Room identity for accounting. pair_key-scoped rooms share a counter
     # across every member; cwd-only two-person pairs get a synthesized
     # per-edge key (degenerate N=2 room).
@@ -1630,8 +1843,6 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         f"peer reset --pair-key {self_pair_key}"
         if self_pair_key else f"peer reset --to {args.to}"
     )
-
-    message_id = getattr(args, "message_id", None) or generate_ulid()
 
     conn = open_db()
     dedup_hit = False
@@ -4491,6 +4702,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "'interactive' labels reject --daemon-mode. "
                          "Omitted = preserve existing (or 'interactive' for new sessions).")
     sr.add_argument("--force", action="store_true")
+    sr.add_argument(
+        "--home-host", dest="home_host",
+        help="v3.3 federation: declare a remote host as this room's owner. "
+             "Seeds a local peer_rooms row with home_host=<label> so peer-send "
+             "routes writes to that host's /api/send. Omit to default to the "
+             "local self_host().",
+    )
     sr.set_defaults(func=cmd_session_register)
 
     hl = sub.add_parser("hook-log-session")
