@@ -153,6 +153,30 @@ func runSessionRegister(args []string) int {
 	writeMarker(resolvedCWD, finalLabel, sk)
 	sweepStaleMarkersForLabel(resolvedCWD, finalLabel, sk)
 
+	// Announce a genuine join (first-time label, seat change, or
+	// session_key swap) to every other live peer in the room. Silent on
+	// idempotent refreshes into the same pair. Best-effort: errors emit
+	// a warning but don't undo the register.
+	if res.IsNewJoin && res.PairKey != "" {
+		roleTag := ""
+		if res.Role != "" {
+			roleTag = ", role=" + res.Role
+		}
+		body := fmt.Sprintf("[system] %s joined the room (agent=%s%s)",
+			res.Label, res.Agent, roleTag)
+		if serr := st.EmitSystemEvent(ctx, sqlitestore.SystemEventParams{
+			SelfCWD:   res.CWD,
+			SelfLabel: res.Label,
+			PairKey:   res.PairKey,
+			Kind:      "join",
+			Body:      body,
+			ExtraMeta: map[string]string{"agent": res.Agent, "role": res.Role},
+			Now:       time.Now().UTC(),
+		}); serr != nil {
+			fmt.Fprintf(os.Stderr, "session-register: warning: emit join event: %v\n", serr)
+		}
+	}
+
 	role4Print := res.Role
 	if role4Print == "" {
 		role4Print = "peer"

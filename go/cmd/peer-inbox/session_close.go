@@ -16,9 +16,6 @@ import (
 // the session was pair-key-scoped, DELETEs the sessions row, and
 // removes the marker file.
 //
-// Phase 5.1 deferral (documented in-file):
-//   - emit_system_event (channel-push) — Phase 5.1 TODO; leave message
-//     is skipped silently, matching the "no channel live" case.
 func runSessionClose(args []string) int {
 	fs := flag.NewFlagSet("session-close", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -102,6 +99,24 @@ func runSessionClose(args []string) int {
 		return exitInternal
 	}
 	defer st.Close()
+
+	// Capture pair_key BEFORE the delete so we can announce the leave
+	// to peers. Emit FIRST (while self still in sessions so meta.members
+	// lists the leaver on this last push). Best-effort — warnings don't
+	// block the delete. Matches Python cmd_session_close:1929-1941.
+	leavingPairKey, _ := st.GetSessionPairKey(ctx, targetCWD, labelArg)
+	if leavingPairKey != "" {
+		if serr := st.EmitSystemEvent(ctx, sqlitestore.SystemEventParams{
+			SelfCWD:   targetCWD,
+			SelfLabel: labelArg,
+			PairKey:   leavingPairKey,
+			Kind:      "leave",
+			Body:      fmt.Sprintf("[system] %s left the room", labelArg),
+			Now:       time.Now().UTC(),
+		}); serr != nil {
+			fmt.Fprintf(os.Stderr, "session-close: warning: emit leave event: %v\n", serr)
+		}
+	}
 
 	deleted, err := st.DeleteSession(ctx, targetCWD, labelArg, sk)
 	if err != nil {
