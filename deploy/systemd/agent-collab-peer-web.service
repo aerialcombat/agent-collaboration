@@ -1,0 +1,51 @@
+[Unit]
+Description=agent-collab peer-web dashboard (Go)
+Documentation=file:///opt/agent-collab/docs/PEER-WEB-GUIDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-collab
+Group=agent-collab
+# EnvironmentFile prefix `-` = ignore if missing. Owner fills
+# /etc/agent-collab/env from /etc/agent-collab/env.example on first
+# deploy; until then the service runs with whatever env systemd
+# provides (ANTHROPIC_API_KEY etc. will be missing — peer-web will
+# still render local sessions.db, just can't serve live agent work).
+EnvironmentFile=-/etc/agent-collab/env
+# The web dashboard reads ~/.agent-collab/sessions.db; working dir
+# just needs to be writeable for the user.
+WorkingDirectory=~
+ExecStart=/usr/local/bin/peer-web --port 8787
+Restart=on-failure
+RestartSec=5
+# Kill cleanly so the listening socket is released for restarts.
+KillMode=mixed
+TimeoutStopSec=10
+
+# Hardening — peer-web only needs read/write on its own home (for the
+# sessions.db) plus network for localhost bind. Everything else is
+# tightened.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# ReadWritePaths opens the agent-collab user's home + the shared DB
+# location for writes. Keep this list short; expanding it weakens the
+# sandbox.
+ReadWritePaths=/var/lib/agent-collab
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-collab-peer-web
+
+[Install]
+WantedBy=multi-user.target

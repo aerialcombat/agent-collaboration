@@ -1,0 +1,46 @@
+[Unit]
+Description=agent-collab peer-inbox daemon (config: %i)
+Documentation=file:///opt/agent-collab/docs/DAEMON-OPERATOR-GUIDE.md
+After=network-online.target
+Wants=network-online.target
+
+# Templated instance unit. Enable per-agent with:
+#   sudo systemctl enable --now agent-collab-daemon@<name>
+# where <name> matches ~agent-collab/.agent-collab/daemons/<name>.json.
+# %i is the instance name (e.g. "alpha"); --config <name> resolves to
+# ~/.agent-collab/daemons/<name>.json per the daemon's bare-name rule.
+
+[Service]
+Type=simple
+User=agent-collab
+Group=agent-collab
+EnvironmentFile=-/etc/agent-collab/env
+WorkingDirectory=~
+ExecStart=/usr/local/bin/agent-collab-daemon --config %i
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+# Hardening — same profile as peer-web. The daemon spawns child CLIs
+# (claude/codex/gemini/pi) so PrivateTmp isolates any scratch files
+# those processes create.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/agent-collab
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-collab-daemon@%i
+
+[Install]
+WantedBy=multi-user.target
