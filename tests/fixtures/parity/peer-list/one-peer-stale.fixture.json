@@ -1,0 +1,10 @@
+{
+  "description": "peer-list --include-stale surfaces a sibling session in the same cwd (pair_key NULL fallback). 6-year-old last_seen bins deterministically as 'stale' regardless of wall clock.",
+  "verb": "peer-list",
+  "args": ["--cwd", "__CWD__", "--as", "alpha", "--include-stale"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'); INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'beta', 'codex', 'challenger', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');"
+}

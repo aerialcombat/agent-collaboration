@@ -1,0 +1,15 @@
+{
+  "stdout": "beta                 codex    challenger   stale   last-seen 2020-01-01T00:00:00Z\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM sessions",
+      "expected": "2"
+    },
+    {
+      "query": "SELECT label FROM sessions WHERE label='beta'",
+      "expected": "beta"
+    }
+  ]
+}

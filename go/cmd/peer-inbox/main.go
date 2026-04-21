@@ -43,6 +43,7 @@ import (
 	"strings"
 	"time"
 
+	"agent-collaboration/go/pkg/envelope"
 	"agent-collaboration/go/pkg/store"
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
 )
@@ -82,6 +83,10 @@ func run(args []string) int {
 		return runResetSession(rest)
 	case "session-list":
 		return runSessionList(rest)
+	case "peer-list":
+		return runPeerList(rest)
+	case "peer-receive":
+		return runPeerReceive(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
@@ -100,6 +105,8 @@ func usage() {
   daemon-sweep         [--cwd DIR] [--sweep-ttl SECS] [--format json|plain]
   daemon-reset-session --cwd DIR --as LABEL [--format json|plain]
   session-list         [--cwd DIR] [--all-cwds] [--include-stale] [--json]
+  peer-list            [--cwd DIR] [--as LABEL] [--include-stale] [--json]
+  peer-receive         [--cwd DIR] [--as LABEL] [--since ISO] [--format plain|json|hook|hook-json]
 
 Go parity for the Python daemon-mode verbs in scripts/peer-inbox-db.py.
 Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation,
@@ -814,4 +821,417 @@ func padRight(s string, width int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", width-len(s))
+}
+
+// pyJSONFormat rewrites a compact JSON byte slice into Python's default
+// json.dump spacing: ", " between elements and ": " between key and
+// value. Required for byte-parity with scripts/peer-inbox-db.py whose
+// JSON paths all call json.dump with default separators. Walks the
+// bytes tracking in-string state so separators inside string literals
+// are left alone.
+func pyJSONFormat(compact []byte) []byte {
+	out := make([]byte, 0, len(compact)+len(compact)/10)
+	inString := false
+	escape := false
+	for _, b := range compact {
+		out = append(out, b)
+		if escape {
+			escape = false
+			continue
+		}
+		if inString {
+			if b == '\\' {
+				escape = true
+			} else if b == '"' {
+				inString = false
+			}
+			continue
+		}
+		if b == '"' {
+			inString = true
+			continue
+		}
+		if b == ',' || b == ':' {
+			out = append(out, ' ')
+		}
+	}
+	return out
+}
+
+// writePyCompatJSON marshals v with Go's encoder (HTML escapes disabled
+// to match Python's default), then rewrites the spacing to Python's
+// json.dump default so downstream byte diffs don't trigger on
+// formatting. Trailing newline to mirror Python's explicit
+// `sys.stdout.write("\n")`.
+func writePyCompatJSON(v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	// json.Marshal escapes HTML by default; Python's dump(ensure_ascii=
+	// False) does not. Reverse the escapes inline rather than plumb
+	// SetEscapeHTML(false) through every call site.
+	raw = unescapeHTMLJSON(raw)
+	spaced := pyJSONFormat(raw)
+	if _, err := os.Stdout.Write(spaced); err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write([]byte("\n"))
+	return err
+}
+
+// unescapeHTMLJSON reverses json.Marshal's HTML escaping (\u003c \u003e
+// \u0026) so the output matches Python's ensure_ascii=False default.
+// Conservative: only touches these three escape sequences; other
+// \uXXXX escapes inside strings are left alone.
+func unescapeHTMLJSON(b []byte) []byte {
+	replacements := []struct {
+		from, to string
+	}{
+		{`\u003c`, "<"},
+		{`\u003e`, ">"},
+		{`\u0026`, "&"},
+	}
+	s := string(b)
+	for _, r := range replacements {
+		s = strings.ReplaceAll(s, r.from, r.to)
+	}
+	return []byte(s)
+}
+
+// ---------------------------------------------------------------------------
+// peer-list (v3.4 Phase 2 — read-only verb port)
+// ---------------------------------------------------------------------------
+
+// peerListRowJSON mirrors Python's dict shape in cmd_peer_list. Role
+// renders as null when NULL/empty (Python's sqlite3 Row -> None -> JSON
+// null); include-stale gating still runs in the aggregation loop.
+type peerListRowJSON struct {
+	Label      string `json:"label"`
+	Agent      string `json:"agent"`
+	Role       any    `json:"role"`
+	Activity   string `json:"activity"`
+	LastSeenAt string `json:"last_seen_at"`
+}
+
+// discoverSessionKey mirrors Python's discover_session_key env-var
+// probe order. Used only when --as is omitted.
+func discoverSessionKey() string {
+	for _, name := range []string{
+		"CLAUDE_SESSION_ID", "CODEX_SESSION_ID", "GEMINI_SESSION_ID",
+		"AGENT_COLLAB_SESSION_KEY",
+	} {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func runPeerList(args []string) int {
+	fs := flag.NewFlagSet("peer-list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var (
+		cwd          = fs.String("cwd", "", "session cwd (default: process cwd)")
+		asLbl        = fs.String("as", "", "session label (default: resolve via marker / env)")
+		includeStale = fs.Bool("include-stale", false, "include peers with stale last-seen")
+		jsonOut      = fs.Bool("json", false, "emit JSON array instead of the human table")
+	)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	resolvedCWD, err := resolveCWD(*cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-list: resolve cwd: %v\n", err)
+		return exitInternal
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-list: open store: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	selfCWD := resolvedCWD
+	selfLabel := *asLbl
+	if selfLabel == "" {
+		self, err := st.ResolveSelf(ctx, resolvedCWD, discoverSessionKey())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "peer-list: resolve self: %v (pass --as <label> or set a session key env)\n", err)
+			return exitInternal
+		}
+		selfCWD = self.CWD
+		selfLabel = self.Label
+	}
+
+	pairKey, err := st.GetSessionPairKey(ctx, selfCWD, selfLabel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-list: %v\n", err)
+		return exitInternal
+	}
+
+	rows, err := st.ListPeers(ctx, selfCWD, selfLabel, pairKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-list: %v\n", err)
+		return exitInternal
+	}
+
+	results := make([]peerListRowJSON, 0, len(rows))
+	for _, r := range rows {
+		state := activityState(r.LastSeenAt)
+		if state == "stale" && !*includeStale {
+			continue
+		}
+		var roleVal any
+		if r.Role != "" {
+			roleVal = r.Role
+		}
+		results = append(results, peerListRowJSON{
+			Label: r.Label, Agent: r.Agent, Role: roleVal,
+			Activity: state, LastSeenAt: r.LastSeenAt,
+		})
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(results); err != nil {
+			fmt.Fprintf(os.Stderr, "peer-list: encode json: %v\n", err)
+			return exitInternal
+		}
+		return exitOK
+	}
+
+	if len(results) == 0 {
+		fmt.Println("no peers")
+		return exitOK
+	}
+
+	for _, r := range results {
+		role := "peer"
+		if s, ok := r.Role.(string); ok && s != "" {
+			role = s
+		}
+		fmt.Printf("%s %s %s %s last-seen %s\n",
+			padRight(r.Label, 20),
+			padRight(r.Agent, 8),
+			padRight(role, 12),
+			padRight(r.Activity, 7),
+			r.LastSeenAt,
+		)
+	}
+	return exitOK
+}
+
+// ---------------------------------------------------------------------------
+// peer-receive (v3.4 Phase 2 — read-only inspect path)
+// ---------------------------------------------------------------------------
+//
+// Ports the non-mutating path of cmd_peer_receive in
+// scripts/peer-inbox-db.py: no --mark-read, no --daemon-mode/--complete/
+// --sweep/--reset-session (those route to the dedicated daemon verbs).
+// Mutually-exclusive checks still run so invoking the wrong flag
+// produces the same exit64 Python does; the actual mutation-mode
+// handlers are reserved for Phase 3 (write-verb port).
+
+// peerReceiveRowJSON mirrors Python's per-row JSON shape in the --format
+// json branch of cmd_peer_receive. read_at is omitted (Python's shape).
+type peerReceiveRowJSON struct {
+	ID        int64  `json:"id"`
+	FromCWD   string `json:"from_cwd"`
+	FromLabel string `json:"from_label"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"created_at"`
+}
+
+// hookBudgetFromEnv mirrors Python's HOOK_BLOCK_BUDGET env override with
+// a 4 KiB default. Matches hookBlockBudgetBytes in go/cmd/hook/main.go.
+func hookBudgetFromEnv() int {
+	if v := os.Getenv("AGENT_COLLAB_HOOK_BLOCK_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 4 * 1024
+}
+
+func runPeerReceive(args []string) int {
+	fs := flag.NewFlagSet("peer-receive", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var (
+		cwd      = fs.String("cwd", "", "session cwd (default: process cwd)")
+		asLbl    = fs.String("as", "", "session label (default: resolve via marker / env)")
+		format   = fs.String("format", "plain", "output format: plain | json | hook | hook-json")
+		since    = fs.String("since", "", "ISO-8601 UTC; skip messages older than this")
+		markRead = fs.Bool("mark-read", false, "(Phase 3) interactive claim-and-mark; not yet ported in Go")
+		daemon   = fs.Bool("daemon-mode", false, "(use `peer-inbox daemon-claim` instead)")
+		complete = fs.Bool("complete", false, "(use `peer-inbox daemon-complete` instead)")
+		sweep    = fs.Bool("sweep", false, "(use `peer-inbox daemon-sweep` instead)")
+		reset    = fs.Bool("reset-session", false, "(use `peer-inbox daemon-reset-session` instead)")
+	)
+	// Consumed only for mutex validation + error text.
+	_ = fs.Int("sweep-ttl", -1, "ignored by peer-receive (use daemon-sweep --sweep-ttl)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	// Mutex check mirrors Python's len(sub_modes) > 1 validation.
+	modeCount := 0
+	for _, m := range []bool{*markRead, *daemon, *complete, *sweep, *reset} {
+		if m {
+			modeCount++
+		}
+	}
+	if modeCount > 1 {
+		fmt.Fprintln(os.Stderr,
+			"peer receive: --mark-read, --daemon-mode, --complete, --sweep, --reset-session are mutually exclusive")
+		return exitUsage
+	}
+
+	// Phase-2 scope: the mutating / daemon-delegated modes are not
+	// reimplemented here. They are already exposed as top-level
+	// subcommands on this binary (daemon-claim / daemon-complete /
+	// daemon-sweep / daemon-reset-session) or deferred to Phase 3
+	// (--mark-read). Route the operator to the correct verb rather
+	// than silently diverging from Python.
+	if *markRead {
+		fmt.Fprintln(os.Stderr,
+			"peer-receive --mark-read: not yet ported to Go (Phase 3 write-verb port); "+
+				"fall back to the Python CLI for this mode.")
+		return exitInternal
+	}
+	if *daemon {
+		fmt.Fprintln(os.Stderr,
+			"peer-receive --daemon-mode: use `peer-inbox daemon-claim` (already ported).")
+		return exitUsage
+	}
+	if *complete {
+		fmt.Fprintln(os.Stderr,
+			"peer-receive --complete: use `peer-inbox daemon-complete` (already ported).")
+		return exitUsage
+	}
+	if *sweep {
+		fmt.Fprintln(os.Stderr,
+			"peer-receive --sweep: use `peer-inbox daemon-sweep` (already ported).")
+		return exitUsage
+	}
+	if *reset {
+		fmt.Fprintln(os.Stderr,
+			"peer-receive --reset-session: use `peer-inbox daemon-reset-session` (already ported).")
+		return exitUsage
+	}
+
+	switch *format {
+	case "plain", "json", "hook", "hook-json":
+	default:
+		fmt.Fprintf(os.Stderr, "peer-receive: --format must be one of: plain, json, hook, hook-json (got %q)\n", *format)
+		return exitUsage
+	}
+
+	resolvedCWD, err := resolveCWD(*cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-receive: resolve cwd: %v\n", err)
+		return exitInternal
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-receive: open store: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	self := store.Session{CWD: resolvedCWD, Label: *asLbl}
+	if self.Label == "" {
+		resolved, err := st.ResolveSelf(ctx, resolvedCWD, discoverSessionKey())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "peer-receive: resolve self: %v (pass --as <label> or set a session key env)\n", err)
+			return exitInternal
+		}
+		self = resolved
+	}
+
+	rows, err := st.ListUnreadForSelf(ctx, self, *since)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "peer-receive: %v\n", err)
+		return exitInternal
+	}
+
+	switch *format {
+	case "json":
+		payload := make([]peerReceiveRowJSON, 0, len(rows))
+		for _, r := range rows {
+			payload = append(payload, peerReceiveRowJSON{
+				ID: r.ID, FromCWD: r.FromCWD, FromLabel: r.FromLabel,
+				Body: r.Body, CreatedAt: r.CreatedAt,
+			})
+		}
+		if err := writePyCompatJSON(payload); err != nil {
+			fmt.Fprintf(os.Stderr, "peer-receive: encode json: %v\n", err)
+			return exitInternal
+		}
+	case "hook":
+		block := renderHookBlock(rows)
+		if block != "" {
+			// Python: stdout.write(block) then stdout.write("\n")
+			fmt.Print(block)
+			fmt.Println()
+		}
+	case "hook-json":
+		block := renderHookBlock(rows)
+		if block == "" {
+			return exitOK
+		}
+		eventName := os.Getenv("AGENT_COLLAB_HOOK_EVENT_NAME")
+		if eventName == "" {
+			eventName = "UserPromptSubmit"
+		}
+		// Struct (not map) so field order matches Python's insertion-
+		// ordered dict. Go's encoding/json sorts map keys alphabetically,
+		// which breaks byte-parity against hookEventName-first Python.
+		type hookEnv struct {
+			HookEventName     string `json:"hookEventName"`
+			AdditionalContext string `json:"additionalContext"`
+		}
+		envlp := struct {
+			HookSpecificOutput hookEnv `json:"hookSpecificOutput"`
+		}{HookSpecificOutput: hookEnv{HookEventName: eventName, AdditionalContext: block}}
+		if err := writePyCompatJSON(envlp); err != nil {
+			fmt.Fprintf(os.Stderr, "peer-receive: encode hook-json: %v\n", err)
+			return exitInternal
+		}
+	default: // plain
+		for _, r := range rows {
+			fmt.Printf("[%s @ %s]\n", r.FromLabel, r.CreatedAt)
+			fmt.Println(r.Body)
+			fmt.Println()
+		}
+	}
+	return exitOK
+}
+
+// renderHookBlock reuses the shared envelope renderer so peer-receive's
+// --format hook / hook-json paths emit byte-identical blocks to both
+// the Python cmd_peer_receive path and the Go hook binary.
+func renderHookBlock(rows []store.InboxMessage) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	msgs := make([]envelope.Message, 0, len(rows))
+	for _, r := range rows {
+		msgs = append(msgs, envelope.Message{
+			ID: r.ID, FromCWD: r.FromCWD, FromLabel: r.FromLabel,
+			Body: r.Body, CreatedAt: r.CreatedAt, RoomKey: r.RoomKey,
+		})
+	}
+	env := envelope.BuildFromHookRows(msgs, nil)
+	return envelope.RenderText(env, hookBudgetFromEnv())
 }

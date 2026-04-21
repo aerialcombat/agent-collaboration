@@ -1,0 +1,8 @@
+{
+  "description": "peer-receive with no unread rows in plain format exits 0 with empty stdout. Non-mutating read path.",
+  "verb": "peer-receive",
+  "args": ["--cwd", "__CWD__", "--as", "alpha", "--format", "plain"],
+  "stdin": "",
+  "env": {},
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');"
+}

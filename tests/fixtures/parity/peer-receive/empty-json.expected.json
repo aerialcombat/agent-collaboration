@@ -1,0 +1,11 @@
+{
+  "stdout": "[]\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox",
+      "expected": "0"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "stdout": "[beta @ 2020-01-02T00:00:00Z]\nhello world\n\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox WHERE read_at IS NULL",
+      "expected": "1"
+    }
+  ]
+}

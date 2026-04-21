@@ -1,0 +1,8 @@
+{
+  "description": "peer-receive --format hook-json wraps the <peer-inbox> block in a Claude hookSpecificOutput envelope. Byte parity requires Python's default json.dump spacing (', ' + ': ').",
+  "verb": "peer-receive",
+  "args": ["--cwd", "__CWD__", "--as", "alpha", "--format", "hook-json"],
+  "stdin": "",
+  "env": {},
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z'); INSERT INTO inbox (to_cwd, to_label, from_cwd, from_label, body, created_at) VALUES ('__CWD__', 'alpha', '__CWD__', 'beta', 'hello world', '2020-01-02T00:00:00Z');"
+}

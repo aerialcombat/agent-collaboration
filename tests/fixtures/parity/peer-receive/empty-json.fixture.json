@@ -1,0 +1,8 @@
+{
+  "description": "peer-receive --format json with no unread rows prints an empty JSON array and a trailing newline.",
+  "verb": "peer-receive",
+  "args": ["--cwd", "__CWD__", "--as", "alpha", "--format", "json"],
+  "stdin": "",
+  "env": {},
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');"
+}

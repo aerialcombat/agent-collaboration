@@ -1,0 +1,10 @@
+{
+  "description": "peer-list with self registered but no peers prints 'no peers' and exits 0. Uses --as to bypass marker-file resolution.",
+  "verb": "peer-list",
+  "args": ["--cwd", "__CWD__", "--as", "alpha"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');"
+}

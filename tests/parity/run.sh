@@ -71,6 +71,14 @@ cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
 DB="$TMP/sessions.db"
+
+# FIXTURE_CWD is a scratch directory that actually exists on disk so
+# Python's strict `resolve_cwd` accepts it. Fixtures reference it via the
+# literal token `__CWD__` in args/stdin/env/pre_sql; the harness
+# substitutes it with the symlink-resolved absolute path (macOS /tmp ->
+# /private/tmp happens automatically via `pwd -P`).
+mkdir -p "$TMP/cwd"
+FIXTURE_CWD="$(cd "$TMP/cwd" && pwd -P)"
 actual_stdout="$TMP/stdout.txt"
 actual_stderr="$TMP/stderr.txt"
 actual_exit=""
@@ -124,8 +132,16 @@ SQL
   up >/dev/null 2>&1 \
   || { echo "migrations failed against $DB" >&2; exit 2; }
 
+substitute_cwd() {
+  # Replace the literal token __CWD__ with $FIXTURE_CWD. sed-friendly
+  # because we built FIXTURE_CWD via `pwd -P` — no embedded newlines, no
+  # sed metacharacters expected inside a mktemp path.
+  printf '%s' "$1" | sed "s|__CWD__|$FIXTURE_CWD|g"
+}
+
 # 2. Apply fixture pre_sql (seed state).
 pre_sql="$(jq -r '.pre_sql // ""' "$fixture_json")"
+pre_sql="$(substitute_cwd "$pre_sql")"
 if [ -n "$pre_sql" ]; then
   printf '%s\n' "$pre_sql" | sqlite3 "$DB" \
     || { echo "pre_sql failed" >&2; exit 2; }
@@ -135,17 +151,20 @@ fi
 env_args=("AGENT_COLLAB_INBOX_DB=$DB")
 while IFS=$'\t' read -r k v; do
   [ -z "$k" ] && continue
+  v="$(substitute_cwd "$v")"
   env_args+=("$k=$v")
 done < <(jq -r '.env // {} | to_entries[] | "\(.key)\t\(.value)"' "$fixture_json")
 
 # 4. Build args array. macOS bash 3.2 has no readarray; use a loop.
 verb_args=()
 while IFS= read -r line; do
+  line="$(substitute_cwd "$line")"
   verb_args+=("$line")
 done < <(jq -r '.args[]?' "$fixture_json")
 
 # 5. Build stdin.
 stdin_content="$(jq -r '.stdin // ""' "$fixture_json")"
+stdin_content="$(substitute_cwd "$stdin_content")"
 
 # 6. Select impl invocation.
 case "$impl" in
@@ -193,8 +212,8 @@ fi
 actual_exit=$?
 
 # 8. Compare.
-expected_stdout="$(jq -r '.stdout // ""' "$expected_json")"
-expected_stderr="$(jq -r '.stderr // ""' "$expected_json")"
+expected_stdout="$(substitute_cwd "$(jq -r '.stdout // ""' "$expected_json")")"
+expected_stderr="$(substitute_cwd "$(jq -r '.stderr // ""' "$expected_json")")"
 expected_exit="$(jq -r '.exit // 0' "$expected_json")"
 
 # Accumulate failures so we report all mismatches at once, not just the first.
@@ -221,8 +240,8 @@ fi
 n="$(jq -r '.verify_sql // [] | length' "$expected_json")"
 i=0
 while [ "$i" -lt "$n" ]; do
-  query="$(jq -r ".verify_sql[$i].query" "$expected_json")"
-  expected_rows="$(jq -r ".verify_sql[$i].expected" "$expected_json")"
+  query="$(substitute_cwd "$(jq -r ".verify_sql[$i].query" "$expected_json")")"
+  expected_rows="$(substitute_cwd "$(jq -r ".verify_sql[$i].expected" "$expected_json")")"
   actual_rows="$(sqlite3 "$DB" "$query")"
   if [ "$expected_rows" != "$actual_rows" ]; then
     echo "[FAIL] $verb/$scenario ($impl): verify_sql[$i] mismatch" >&2

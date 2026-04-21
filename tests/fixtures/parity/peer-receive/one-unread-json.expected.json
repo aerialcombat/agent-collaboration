@@ -1,0 +1,11 @@
+{
+  "stdout": "[{\"id\": 1, \"from_cwd\": \"__CWD__\", \"from_label\": \"beta\", \"body\": \"hello world\", \"created_at\": \"2020-01-02T00:00:00Z\"}]\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox WHERE read_at IS NULL",
+      "expected": "1"
+    }
+  ]
+}
