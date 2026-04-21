@@ -101,10 +101,18 @@ func runSessionRegister(args []string) int {
 		sk = autoAgentSessionKey(resolvedCWD, finalLabel, *agent)
 	}
 	if sk == "" {
+		// Last resort: the UserPromptSubmit hook logs every Claude
+		// session_id it sees in this cwd. Pick the newest — matches the
+		// Python fallback at cmd_session_register's key-resolution tail.
+		if seen := recentSeenSessions(resolvedCWD, 1); len(seen) > 0 {
+			sk = seen[0]
+		}
+	}
+	if sk == "" {
 		fmt.Fprintln(os.Stderr,
 			"session-register: no session key available. Pass --session-key, set "+
 				"AGENT_COLLAB_SESSION_KEY, or (for claude) let UserPromptSubmit log "+
-				"a session id first. The recent-seen-sessions fallback is a Phase 4 item.")
+				"a session id first.")
 		return exitInternal
 	}
 
@@ -143,6 +151,7 @@ func runSessionRegister(args []string) int {
 	}
 
 	writeMarker(resolvedCWD, finalLabel, sk)
+	sweepStaleMarkersForLabel(resolvedCWD, finalLabel, sk)
 
 	role4Print := res.Role
 	if role4Print == "" {

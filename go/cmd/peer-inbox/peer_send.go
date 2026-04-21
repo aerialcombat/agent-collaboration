@@ -167,6 +167,19 @@ func runPeerSend(args []string) int {
 	// assignment, bump_room / bump_last_seen, and the best-effort channel
 	// push after commit.
 	nowUTC := time.Now().UTC()
+	// --to-cwd override: honor caller's explicit target regardless of
+	// pair-key membership. Matches Python cmd_peer_send's resolve_cwd
+	// normalization.
+	var resolvedToCWD string
+	if *toCWD != "" {
+		rc, cerr := resolveCWD(*toCWD)
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "error: cannot resolve --to-cwd: %v\n", cerr)
+			return exitConfigError
+		}
+		resolvedToCWD = rc
+	}
+
 	params := sqlitestore.SendParams{
 		SenderCWD:   self.CWD,
 		SenderLabel: self.Label,
@@ -174,21 +187,9 @@ func runPeerSend(args []string) int {
 		Body:        body,
 		MessageID:   *messageID,
 		PairKey:     selfPairKey,
+		TargetCWD:   resolvedToCWD,
 		Mentions:    []string(mentions),
 		Now:         nowUTC,
-	}
-	if *toCWD != "" {
-		// Python's cmd_peer_send lets --to-cwd override the pair-key /
-		// same-cwd resolution. Send (in send.go) derives to_cwd from the
-		// sender's row, so wiring this through cleanly would need a new
-		// TargetCWD field on SendParams — a change in send.go, which
-		// Phase 3's file-level ownership forbids. Cross-cwd sends are
-		// rare in practice (pair-key mode is the supported path in v3.3+);
-		// keep the flag accepted for CLI symmetry but route to Python.
-		fmt.Fprintln(os.Stderr,
-			"error: --to-cwd is not yet supported by the Go peer-send port; "+
-				"fall back to the Python CLI (AGENT_COLLAB_IMPL=python)")
-		return exitInternal
 	}
 
 	result, err := st.Send(ctx, params)

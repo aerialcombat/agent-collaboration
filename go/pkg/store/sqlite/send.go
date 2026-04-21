@@ -60,6 +60,7 @@ type SendParams struct {
 	Body        string
 	MessageID   string   // ULID for idempotency; auto-generated if empty
 	PairKey     string   // empty = cwd-only (legacy degenerate pair)
+	TargetCWD   string   // peer-send --to-cwd override; bypasses pair-key resolution
 	Mentions    []string // explicit --mention args; body @tokens merged in
 	Now         time.Time
 }
@@ -93,9 +94,17 @@ func (s *SQLiteLocal) Send(ctx context.Context, p SendParams) (SendResult, error
 	}
 
 	roomKey := roomKeyFor(p.SenderCWD, p.SenderLabel, p.ToLabel, p.PairKey)
-	toCWD, err := s.resolveTargetCWD(ctx, p.PairKey, p.ToLabel, p.SenderCWD)
-	if err != nil {
-		return SendResult{}, err
+	var toCWD string
+	if p.TargetCWD != "" {
+		// --to-cwd override: honor caller's explicit target regardless of
+		// pair-key membership. Matches Python cmd_peer_send:2083-2084.
+		toCWD = p.TargetCWD
+	} else {
+		var err error
+		toCWD, err = s.resolveTargetCWD(ctx, p.PairKey, p.ToLabel, p.SenderCWD)
+		if err != nil {
+			return SendResult{}, err
+		}
 	}
 
 	var (

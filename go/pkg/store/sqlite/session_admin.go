@@ -6,6 +6,32 @@ import (
 	"fmt"
 )
 
+// ActiveSessionKeysInCWD returns the set of non-NULL session_keys
+// currently registered in the given cwd. Used by session-close's
+// recent-seen fallback to pick the most recent hook-logged key that
+// still points at a live row. Mirrors the intersection Python builds
+// at cmd_session_close:1879-1895.
+func (s *SQLiteLocal) ActiveSessionKeysInCWD(ctx context.Context, cwd string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT session_key FROM sessions WHERE cwd = ? AND session_key IS NOT NULL`,
+		cwd)
+	if err != nil {
+		return nil, fmt.Errorf("active session keys: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var sk string
+		if err := rows.Scan(&sk); err != nil {
+			return nil, fmt.Errorf("scan session key: %w", err)
+		}
+		if sk != "" {
+			out[sk] = true
+		}
+	}
+	return out, rows.Err()
+}
+
 // AdoptSessionKey re-keys an existing (cwd, label) row to newKey.
 // Returns (oldKey, rowExists, err). When rowExists is false no UPDATE
 // runs. Wrapped in BEGIN IMMEDIATE so the read-then-update is atomic

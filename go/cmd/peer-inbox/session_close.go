@@ -16,11 +16,8 @@ import (
 // the session was pair-key-scoped, DELETEs the sessions row, and
 // removes the marker file.
 //
-// Phase 4 deferrals (documented in-file):
-//   - recent_seen_sessions fallback (hook-log-session bridge) — used
-//     only when no env session-key + no --label is given; covered by
-//     the --label path for every operator-facing flow.
-//   - emit_system_event (channel-push) — Phase 4 TODO; leave message
+// Phase 5.1 deferral (documented in-file):
+//   - emit_system_event (channel-push) — Phase 5.1 TODO; leave message
 //     is skipped silently, matching the "no channel live" case.
 func runSessionClose(args []string) int {
 	fs := flag.NewFlagSet("session-close", flag.ContinueOnError)
@@ -43,6 +40,25 @@ func runSessionClose(args []string) int {
 	sk := *sessionKey
 	if sk == "" {
 		sk = discoverSessionKey()
+	}
+	if sk == "" {
+		// Fallback: pick the most recent hook-logged session_id in this
+		// cwd that's still registered. Same shape as Python
+		// cmd_session_close:1879-1895.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		st, oerr := sqlitestore.Open(ctx)
+		if oerr == nil {
+			if active, aerr := st.ActiveSessionKeysInCWD(ctx, resolvedCWD); aerr == nil {
+				for _, sid := range recentSeenSessions(resolvedCWD, 20) {
+					if active[sid] {
+						sk = sid
+						break
+					}
+				}
+			}
+			st.Close()
+		}
+		cancel()
 	}
 
 	var (
