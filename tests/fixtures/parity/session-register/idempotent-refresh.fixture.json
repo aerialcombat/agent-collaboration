@@ -1,0 +1,11 @@
+{
+  "description": "session-register with a pre-existing row + same session_key preserves the auth_token and emits one 'registered:' line. No channel pairing (PEER_INBOX_PENDING_DIR is empty), no auth_token print (preserved). Deterministic because no fresh token is minted.",
+  "verb": "session-register",
+  "args": ["--cwd", "__CWD__", "--label", "alpha", "--agent", "claude", "--session-key", "existing-key"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost",
+    "PEER_INBOX_PENDING_DIR": "__CWD__/no-channels"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at, receive_mode, auth_token, auth_token_rotated_at) VALUES ('__CWD__', 'alpha', 'claude', 'peer', 'existing-key', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 'interactive', 'preserved-token-XXXXX', '2020-01-01T00:00:00Z');"
+}

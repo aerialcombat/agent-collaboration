@@ -1,0 +1,15 @@
+{
+  "stdout": "registered: alpha (claude, peer) at __CWD__ [session_key=711b566d4a1c301f] [channel: none]\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT auth_token FROM sessions WHERE cwd='__CWD__' AND label='alpha'",
+      "expected": "preserved-token-XXXXX"
+    },
+    {
+      "query": "SELECT agent FROM sessions WHERE cwd='__CWD__' AND label='alpha'",
+      "expected": "claude"
+    }
+  ]
+}
