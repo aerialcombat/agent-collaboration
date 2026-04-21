@@ -764,10 +764,10 @@ resolve_peer_inbox_script() {
 
 # resolve_peer_inbox_binary — returns the path to the Go peer-inbox
 # binary if present, empty string otherwise. Same search shape as
-# resolve_peer_web_binary. Used by Phase 5 opt-in (v3.4 Python-removal):
-# set AGENT_COLLAB_IMPL=go to route verbs through the Go binary; default
-# stays Python until the remaining peripheral paths (channel pairing,
-# marker sweep, system events, federation client) are ported.
+# resolve_peer_web_binary. The Go binary is the default impl as of
+# v3.4 Phase 5.1; set AGENT_COLLAB_IMPL=python to force the legacy
+# Python script (bug-report reproducibility only — Python removal is
+# tracked in Phase 6).
 resolve_peer_inbox_binary() {
   if [[ -n "${AGENT_COLLAB_PEER_INBOX_BIN:-}" ]]; then
     if [[ -x "$AGENT_COLLAB_PEER_INBOX_BIN" ]]; then
@@ -855,14 +855,13 @@ dispatch_peer_inbox() {
     fi
   fi
 
-  # v3.4 Phase 5 opt-in: AGENT_COLLAB_IMPL=go routes non-`peer web` verbs
-  # through the Go peer-inbox binary. Parity-fixture coverage (52 green
-  # as of this commit) proves byte-equivalence on the core flows. The
-  # deferred peripherals (channel pairing, marker sweep, system events,
-  # federation client, --to-cwd) still route to Python — so we keep
-  # Python as the default until those land, and flip to Go only when
-  # operators explicitly opt in via the env var.
-  if [[ "${AGENT_COLLAB_IMPL:-}" == "go" && "$top_mode" != "peer" || "${AGENT_COLLAB_IMPL:-}" == "go" && "$sub" != "web" ]]; then
+  # v3.4 Phase 5.1: Go is the default impl for all non-`peer web` verbs.
+  # Every verb has byte-equivalent parity coverage (52 fixtures +
+  # federation-smoke + peer-web-go-parity). Set AGENT_COLLAB_IMPL=python
+  # to route back to the legacy script for bug-report reproducibility.
+  # Fresh checkouts that haven't run `go build` fall through to Python
+  # rather than hard-fail.
+  if [[ "${AGENT_COLLAB_IMPL:-}" != "python" ]]; then
     local peer_inbox_bin
     peer_inbox_bin="$(resolve_peer_inbox_binary)"
     if [[ -n "$peer_inbox_bin" ]]; then
@@ -874,7 +873,7 @@ dispatch_peer_inbox() {
       exec "$peer_inbox_bin" "${top_mode}-${sub}" "$@"
     fi
     # Binary missing — fall through to Python rather than hard-fail so
-    # the opt-in doesn't break fresh checkouts.
+    # fresh checkouts still work before `go build`.
   fi
 
   local python_cmd
