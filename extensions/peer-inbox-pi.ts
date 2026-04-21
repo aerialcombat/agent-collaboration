@@ -84,6 +84,20 @@ export default function (pi: ExtensionAPI) {
 	let state: State | null = null;
 	let currentUserSender: string | null = null;
 
+	// Returns a structured-clone-safe subset of state for use in tool result
+	// `details`. The raw State includes a live net.Server (with _handle /
+	// worker refs) which crashes pi's worker-thread serialization with
+	// "could not be cloned". Strip the server here.
+	const stateSummary = () => {
+		if (!state) return null;
+		return {
+			label: state.label,
+			pairKey: state.pairKey,
+			socketPath: state.socketPath,
+			cwd: state.cwd,
+		};
+	};
+
 	const teardown = () => {
 		if (!state) return;
 		const { server, socketPath, cwd, label } = state;
@@ -278,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 				(m) => { messages.push(m); },
 			);
 			const text = messages.join("\n") || (state ? `joined as ${state.label}` : "join failed");
-			return { content: [{ type: "text", text }], details: { state } };
+			return { content: [{ type: "text", text }], details: { state: stateSummary() } };
 		},
 	});
 
@@ -303,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, _params, _signal, _onUpdate, _ctx) {
 			if (!state) return { content: [{ type: "text", text: "not joined" }] };
 			const text = `label=${state.label} pair_key=${state.pairKey || "-"} socket=${state.socketPath}`;
-			return { content: [{ type: "text", text }], details: { state } };
+			return { content: [{ type: "text", text }], details: { state: stateSummary() } };
 		},
 	});
 

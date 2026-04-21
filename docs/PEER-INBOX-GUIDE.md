@@ -1,9 +1,20 @@
 # Peer Inbox — User Guide
 
-Cross-session messaging for Claude Code, Codex CLI, and Gemini CLI.
-Two (or more) agent sessions on the same machine exchange labeled
-messages; each answers from its own live context so fidelity stays
-high and there's no manual copy-paste.
+Cross-session messaging for Claude Code, Codex CLI, Gemini CLI, and
+pi (pi-coding-agent). Two (or more) agent sessions on the same
+machine exchange labeled messages; each answers from its own live
+context so fidelity stays high and there's no manual copy-paste.
+
+> **Continuing-session model.** As of v2.0+, **pi is the preferred
+> continuing-session peer** alongside channels-enabled Claude. codex-cli
+> and gemini-cli are not used for continuing sessions — they lack a
+> mid-turn push surface (codex #18056, gemini #3052), so the daemon
+> path spawns a fresh `codex exec` / `gemini -p` per batch with no
+> live context continuity. pi, by contrast, stays running as a single
+> process and receives peer messages as follow-up user turns via the
+> native extension (`extensions/peer-inbox-pi.ts`). For anything
+> resembling a long-lived conversation with a non-Claude agent, join a
+> pi session into the room.
 
 **Current version:** v1.5
 **Architecture details:** [ARCHITECTURE.md](./PEER-INBOX-ARCHITECTURE.md)
@@ -87,8 +98,11 @@ Uninstall reverses all of it cleanly:
 
 ## Core concepts
 
-**Session.** One running `claude` / `codex` / `gemini` process. Each
-registers with a short human label.
+**Session.** One running `claude` / `codex` / `gemini` / `pi` process.
+Each registers with a short human label. `pi` sessions join via the
+bundled extension (`/peer-join`) or env-driven auto-join
+(`PEER_INBOX_LABEL`, `PEER_INBOX_PAIR_KEY`) — no separate
+`agent-collab session register` step needed.
 
 **Label.** How a session is addressed by peers. Pattern
 `[a-z0-9][a-z0-9_-]{0,63}`. You pick it; it's scoped to your canonical
@@ -417,16 +431,166 @@ complement the shape-2 CI gates at `tests/daemon-*.sh`.
 
 ## Per-runtime cheatsheet
 
-| Need to… | Claude Code | Codex CLI | Gemini CLI |
-|---|---|---|---|
-| Register | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) |
-| Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Yes, via `UserPromptSubmit` hook | Yes, via `BeforeAgent` hook |
-| Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Not yet (see [Codex issue #18056](https://github.com/openai/codex/issues/18056) for upstream MCP notifications tracking) | Not supported (architectural; see Gemini issue #3052) |
-| Auto-reply via daemon | Yes (`agent-collab-daemon --cli claude`; usually unnecessary given hook + Channels coverage) | Yes (`agent-collab-daemon --cli codex`) | Yes (`agent-collab-daemon --cli gemini`) |
-| Cross-spawn context (Arch D opt-in, v0.1) | No — `claude -p` has no stable cross-process session-resume; daemon emits warn + falls back to Arch B | Yes — `codex exec resume <UUID>` | Yes — `gemini --resume <index>` (UUID stored, translated to current index at resume time) |
-| Peer send | identical | identical | identical |
+| Need to… | Claude Code | pi (pi-coding-agent) | Codex CLI | Gemini CLI |
+|---|---|---|---|---|
+| Register | bare `session register` (hook provides session key) | `/peer-join <label>` in TUI, or `PEER_INBOX_LABEL` env for headless — extension does the DB register itself | bare `session register` (hook provides session key) | bare `session register` (hook provides session key) |
+| Auto-inject on turn start | Yes, via `UserPromptSubmit` hook | Yes — extension wraps inbound pushes as `<peer-inbox>` follow-up user turns | Yes, via `UserPromptSubmit` hook | Yes, via `BeforeAgent` hook |
+| Real-time push (self-sustain) | `--dangerously-load-development-channels server:peer-inbox` | Yes — native extension opens a per-session Unix socket, `sessions.channel_socket` is bound automatically | Not yet (see [Codex issue #18056](https://github.com/openai/codex/issues/18056) for upstream MCP notifications tracking) | Not supported (architectural; see Gemini issue #3052) |
+| **Continuing-session peer** (long-lived conversation, preserved context) | **Yes** (channels mode) | **Yes — preferred for non-Claude** (single long-running process) | **No** (daemon spawns fresh `codex exec` per batch) | **No** (daemon spawns fresh `gemini -p` per batch) |
+| Auto-reply via daemon | Yes (`agent-collab-daemon --cli claude`; usually unnecessary given hook + Channels coverage) | Yes (`agent-collab-daemon --cli pi`) — current canonical daemon CLI | Yes (`agent-collab-daemon --cli codex`) — fresh-LLM-per-batch | Yes (`agent-collab-daemon --cli gemini`) — fresh-LLM-per-batch |
+| Cross-spawn context (Arch D opt-in) | No — `claude -p` has no stable cross-process session-resume | Yes — daemon mints `$pi.session_dir/$label.jsonl`, passed via `--session`; `pi reset` clears the file | Yes — `codex exec resume <UUID>` | Yes — `gemini --resume <index>` (UUID stored, translated to current index at resume time) |
+| Peer send | identical | identical (LLM calls `peer_send` tool; operator can also `/peer-send`) | identical | identical |
 
-Installing the hook on all three CLIs is a single `scripts/install-global-protocol` run — it detects which CLI homes exist (`~/.claude`, `~/.codex`, `~/.gemini`) and registers the unified `hooks/peer-inbox-inject.sh` into each. Codex additionally gets `[features] codex_hooks = true` appended to `~/.codex/config.toml` (required by Codex for hooks to fire).
+Installing the hook on all three CLIs is a single `scripts/install-global-protocol` run — it detects which CLI homes exist (`~/.claude`, `~/.codex`, `~/.gemini`) and registers the unified `hooks/peer-inbox-inject.sh` into each. Codex additionally gets `[features] codex_hooks = true` appended to `~/.codex/config.toml` (required by Codex for hooks to fire). The same installer copies `extensions/peer-inbox-pi.ts` into `~/.pi/agent/extensions/` so pi picks it up on next launch.
+
+---
+
+## pi as continuing-session peer
+
+When you want a non-Claude agent to hold a conversation across many
+rounds without losing context, use **pi**. The bundled extension
+(`extensions/peer-inbox-pi.ts`, installed to `~/.pi/agent/extensions/`)
+makes pi a first-class peer-inbox member.
+
+### Operator commands (interactive TUI)
+
+| Slash command | Effect |
+|---|---|
+| `/peer-join <label> [pair-key]` | Register this pi session under `<label>`, join a `pair_key` room if given, open a Unix socket listener, bind `sessions.channel_socket` |
+| `/peer-leave` | Close listener, clear channel_socket, remove registration |
+| `/peer-status` | Show current label / pair_key / socket path |
+| `/peer-send <label> <msg>` | DM another peer |
+| `/peer-broadcast <msg>` | Fan-out to the whole room |
+
+### LLM tools (pi's model can call these directly)
+
+The extension also registers `peer_join`, `peer_leave`, `peer_status`,
+`peer_send`, and `peer_broadcast` as pi tools, so the model itself
+can address peers without operator intervention. Tool guidelines tell
+it to prefer `peer_send(to, message)` over shelling out to bash.
+
+### Delivery
+
+Inbound messages POST over HTTP/1.1 to pi's Unix socket (`/tmp/peer-inbox-pi-<pid>-<label>.sock`). The extension wraps them in
+`<peer-inbox from="..." meta-key="..." ...>body</peer-inbox>` and calls
+`pi.sendUserMessage(envelope, { deliverAs: "followUp" })` — pi sees the
+message as a follow-up user turn and replies in-context. On
+`turn_end`, the extension auto-relays pi's first text block back to
+the original sender via `peer-send`, so round-trips happen without
+operator action.
+
+### Headless auto-join
+
+Set env vars before launching pi (headless modes like `--mode rpc` /
+`--mode json`, or any launch):
+
+```bash
+PEER_INBOX_LABEL=pi-peer PEER_INBOX_PAIR_KEY=<room-key> pi ...
+```
+
+The extension's `session_start` handler auto-runs `join(...)` with
+these values — no `/peer-join` command required.
+
+### Relationship to the daemon
+
+`agent-collab-daemon --cli pi` is a separate reactive path that spawns
+batched pi invocations with a persistent `--session` file (Arch D). Use
+the **extension** when you want a live TUI pi session holding context;
+use the **daemon** when you want autonomous fresh-spawn batching without
+an attached terminal. They don't conflict — a single machine can run
+both for different labels.
+
+### Recipe: "consult with <model>, keep session running for context"
+
+Stand up a background pi session backed by a non-Claude model (codex,
+gemini, zai-glm, …) and talk to it from the current Claude session.
+This is the canonical flow when the user asks to "consult with codex
+and keep the session running so it keeps context" — or any analogous
+model. Verified working 2026-04-19 with `openai-codex / gpt-5.4`.
+
+**Prereqs**
+- Pi extension installed at `~/.pi/agent/extensions/peer-inbox-pi.ts`
+  (installer places it).
+- Provider auth already set up in pi (`pi config` once per provider;
+  operator-owned, not in shell env). If pi can't auth, it exits
+  silently after join — check `stderr.log`.
+
+**Steps** (run from Claude Code; treat as a template):
+
+```bash
+# 1. Mint a fresh pair-key (private 1:1 room).
+agent-collab room create
+# → created: <pair-key> (empty room)
+
+# 2. Register this Claude session into the room.
+agent-collab session register \
+  --label claude-lead --agent claude \
+  --pair-key <pair-key> --force
+# → registered: claude-lead ... [channel: paired]
+
+# 3. Launch pi headless in background, auto-joining via env.
+#    IMPORTANT: pipe `tail -f /dev/null` into pi. In --mode rpc pi
+#    reads JSON-RPC on stdin; without a held-open stdin it EOF-exits
+#    seconds after booting, taking the socket with it.
+mkdir -p /tmp/pi-<label>-test
+tail -f /dev/null | \
+  PEER_INBOX_LABEL=<label> PEER_INBOX_PAIR_KEY=<pair-key> \
+  pi --provider openai-codex --model gpt-5.4 \
+     --mode rpc --no-session \
+     > /tmp/pi-<label>-test/stdout.log \
+     2> /tmp/pi-<label>-test/stderr.log &
+# Launch with run_in_background:true when using the Bash tool.
+
+# 4. Wait ~5s, then verify pi joined and socket is live.
+ls -la /tmp/peer-inbox-pi-*.sock
+agent-collab peer list --as claude-lead
+# Expect: <label>  pi  peer  active
+
+# 5. Send first message.
+agent-collab peer send --as claude-lead --to <label> \
+  --message "<prompt>"
+# → sent to <label> (pushed)
+
+# 6. Reply arrives via the UserPromptSubmit hook on Claude's next
+#    turn (wrapped in <peer-inbox from="<label>">...</peer-inbox>).
+#    Typical latency 15-30s depending on model.
+```
+
+**Provider / model table** (pairs verified to exist; run
+`pi --list-models <provider>` to confirm current availability):
+
+| User says | `--provider` | `--model` suggestion |
+|---|---|---|
+| "consult codex" / gpt-5.x | `openai-codex` | `gpt-5.4` (current default), `gpt-5.3-codex`, `gpt-5.4-mini` |
+| "consult gemini" | `google` | `gemini-3-pro` / whatever's current |
+| "consult claude via pi" | `anthropic` | `claude-opus-4-7` etc. |
+| "consult glm" | `zai-glm` (plugin) | `glm-4.6` |
+
+**Follow-up turns.** Just keep sending `peer send --as claude-lead
+--to <label> --message ...`. Pi holds the conversation state across
+turns — that's the whole point of this vs. the daemon fresh-spawn
+path.
+
+**Teardown**:
+
+```bash
+# Kill pi. If launched via run_in_background, use the background task
+# ID; otherwise `kill %1` / pkill the pi PID seen in the socket name.
+agent-collab session close --label claude-lead
+# Pi's registration row auto-cleans on `session_shutdown` in the
+# extension; if pi was kill -9'd, manually clear:
+#   sqlite3 ~/.agent-collab/sessions.db \
+#     "DELETE FROM sessions WHERE label='<label>'"
+```
+
+**Troubleshooting**
+- **Pi exits immediately after logging "joined as …"** → missing the
+  `tail -f /dev/null |` stdin held-open pipe. Rerun step 3.
+- **`(no-channel)` on send** → socket went away. Check pi process +
+  socket path; relaunch from step 3.
+- **No reply lands on Claude** → check `agent-collab peer receive
+  --as claude-lead --format plain` (bypasses hook), then check
+  `/tmp/pi-<label>-test/stderr.log` for provider auth errors.
 
 ---
 

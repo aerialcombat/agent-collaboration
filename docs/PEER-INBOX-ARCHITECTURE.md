@@ -272,6 +272,70 @@ turn-start hook, so they use manual `peer receive`.
 - Delivery is **additive**: SQLite write is authoritative; channel
   push is a signal. If the push fails, the hook path still delivers.
 
+### pi extension path (real-time push, pi only)
+
+pi (pi-coding-agent) has no MCP-channel story; instead the bundled
+extension `extensions/peer-inbox-pi.ts` (installed at
+`~/.pi/agent/extensions/peer-inbox-pi.ts`) makes pi a first-class
+continuing-session peer.
+
+```
+┌──────────────────┐    POST JSON        ┌──────────────────────┐
+│ Sender (any      │ ───────────────────▶│ pi session           │
+│ peer-inbox role) │  via Unix socket    │                      │
+│                  │                     │ extension HTTP/1.1   │
+│ peer send        │                     │ listener on          │
+│  1. SQLite write │                     │ /tmp/peer-inbox-pi-  │
+│  2. POST to      │                     │   <pid>-<label>.sock │
+│     channel_sock │                     │   │                  │
+│     on recipient │                     │   ▼                  │
+│     row          │                     │ wrap as              │
+└──────────────────┘                     │ <peer-inbox from=…   │
+                                         │  meta…>body</…>      │
+                                         │   │                  │
+                                         │   ▼                  │
+                                         │ pi.sendUserMessage(  │
+                                         │   envelope,          │
+                                         │   {deliverAs:        │
+                                         │    "followUp"})      │
+                                         │   │                  │
+                                         │   ▼                  │
+                                         │ pi LLM sees it as a  │
+                                         │ user follow-up turn  │
+                                         │ and replies in-      │
+                                         │ context              │
+                                         │   │                  │
+                                         │   ▼ turn_end         │
+                                         │ extension auto-      │
+                                         │ relays first text    │
+                                         │ block back via       │
+                                         │ peer-send to the     │
+                                         │ original sender      │
+                                         └──────────────────────┘
+```
+
+- The extension itself calls `peer-inbox-db.py session-register` to
+  register under `--agent pi`, then opens the socket and
+  `UPDATE sessions SET channel_socket=...` for its own row. No
+  separate `agent-collab session register` step needed from the user.
+- Operator entry points: slash commands `/peer-join`, `/peer-leave`,
+  `/peer-status`, `/peer-send`, `/peer-broadcast`.
+- LLM entry points: the same verbs as registered tools (`peer_join`,
+  `peer_send`, etc.) — pi's model can decide to DM / broadcast
+  autonomously.
+- Headless mode: env vars `PEER_INBOX_LABEL` and `PEER_INBOX_PAIR_KEY`
+  trigger auto-join on `session_start`, for pi running in `--mode rpc`
+  / `--mode json` without a TUI.
+- Teardown: `session_shutdown` closes the server, unlinks the socket,
+  and clears `channel_socket` in the DB.
+
+This is why **pi is the preferred continuing-session peer** for
+non-Claude work: unlike codex-cli (no mid-turn push) and gemini-cli
+(refused upstream), pi holds a single long-running process whose
+context accumulates naturally across peer round-trips. The RPC-bridge
++ operator-attach path that previously tried to deliver this was
+retired (commit `f6d4ff0`) in favor of this native extension.
+
 ---
 
 ## Concurrency

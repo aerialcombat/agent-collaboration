@@ -30,7 +30,7 @@ DEFAULT_MAX_PAIR_TURNS = 100
 TERMINATION_TOKEN = "[[end]]"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PAIR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
-VALID_AGENTS = {"claude", "codex", "gemini", "pi"}
+VALID_AGENTS = {"claude", "codex", "gemini", "pi", "human"}
 
 # Wordlists for pair-key slugs (adjective-noun-XXXX) and auto-generated
 # labels (adjective-noun). 128 × 128 × 65536 ≈ 1 billion pair-key combos
@@ -1165,7 +1165,7 @@ def cmd_session_register(args: argparse.Namespace) -> int:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT agent, role, last_seen_at, session_key, pair_key FROM sessions "
+            "SELECT agent, role, last_seen_at, session_key, pair_key, receive_mode FROM sessions "
             "WHERE cwd = ? AND label = ?",
             (str(cwd), args.label),
         ).fetchone()
@@ -2663,11 +2663,16 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
     # In pair-key mode, resolve the set of (cwd, label) the pair spans.
     # Messages in this view = inbox rows where BOTH endpoints are registered
     # under this pair_key. Sessions may live in different cwds.
-    pair_members: list[tuple[str, str]] = []
-    if pair_key:
+    #
+    # NOTE: refreshed per-request below via _pair_members(). At startup we
+    # only verify the pair_key exists; subsequent joins (new peers) get
+    # picked up automatically by /pairs.json and /rooms.json polls.
+    def _pair_members() -> list[tuple[str, str]]:
+        if not pair_key:
+            return []
         c = open_db()
         try:
-            pair_members = [
+            return [
                 (r["cwd"], r["label"])
                 for r in c.execute(
                     "SELECT cwd, label FROM sessions WHERE pair_key = ? ORDER BY label",
@@ -2676,8 +2681,9 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             ]
         finally:
             c.close()
-        if not pair_members:
-            err(f"no sessions registered with pair_key {pair_key!r}", EXIT_NOT_FOUND)
+
+    if pair_key and not _pair_members():
+        err(f"no sessions registered with pair_key {pair_key!r}", EXIT_NOT_FOUND)
 
     def _canonical_pair(a: str, b: str) -> tuple[str, str]:
         return (a, b) if a <= b else (b, a)
@@ -2691,7 +2697,7 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             # label pairs whose endpoints both belong to the pair, across
             # any cwd.
             if pair_key:
-                member_labels = tuple({lbl for (_, lbl) in pair_members})
+                member_labels = tuple({lbl for (_, lbl) in _pair_members()})
                 if not member_labels:
                     rows = []
                 else:
@@ -2820,7 +2826,7 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             return []
         c = open_db()
         try:
-            member_labels = sorted({lbl for (_, lbl) in pair_members})
+            member_labels = sorted({lbl for (_, lbl) in _pair_members()})
             if not member_labels:
                 return []
             room_key_value = f"pk:{pair_key}"
@@ -2958,7 +2964,7 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             c.close()
 
     if pair_key:
-        member_labels = sorted({lbl for (_, lbl) in pair_members})
+        member_labels = sorted({lbl for (_, lbl) in _pair_members()})
         scope_desc = f"pair {pair_key} ({', '.join(member_labels)})"
     elif as_label:
         scope_desc = f"conversations involving {as_label} in {cwd}"
@@ -2977,9 +2983,134 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
         handler.end_headers()
         handler.wfile.write(body)
 
+    # Shell-out to this same script's `peer-send` / `peer-broadcast` verbs.
+    # Reusing the CLI path gives us identical validation, room-cap,
+    # termination, push, and error semantics for free — the composer is a
+    # thin UI over the same code path as `agent-collab peer send`.
+    import subprocess as _subp
+
+    def _script_self_invoke(verb: str, extra_args: list[str], body: str, send_cwd: Path) -> dict:
+        cmd = [sys.executable, os.path.abspath(__file__), verb,
+               "--cwd", str(send_cwd), "--message-stdin", *extra_args]
+        try:
+            proc = _subp.run(cmd, input=body, text=True,
+                             capture_output=True, timeout=15)
+        except _subp.TimeoutExpired:
+            return {"ok": False, "error": "send timed out", "exit": -1}
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "exit": proc.returncode,
+            "stdout": (proc.stdout or "").strip(),
+            "stderr": (proc.stderr or "").strip(),
+        }
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/send":
+                self.send_response(404); self.end_headers(); return
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+                raw = self.rfile.read(length) if length > 0 else b""
+                data = json.loads(raw.decode("utf-8") or "{}")
+            except Exception as e:
+                _send_json(self, 400, {"ok": False, "error": f"bad json: {e}"})
+                return
+            from_label = (data.get("from") or "").strip()
+            to_label = (data.get("to") or "").strip()  # "" or "@room" = broadcast
+            body = data.get("body")
+            if not from_label or not body:
+                _send_json(self, 400, {"ok": False, "error": "from + body required"})
+                return
+            try:
+                validate_label(from_label)
+                if to_label and to_label != "@room":
+                    validate_label(to_label)
+            except SystemExit:
+                _send_json(self, 400, {"ok": False, "error": "invalid label"})
+                return
+
+            # Resolve the sender's cwd from the sessions table. Visitors and
+            # pair-key members can live in any cwd; we look them up by
+            # (pair_key, label) in pair-key mode and by (cwd, label) otherwise.
+            send_cwd: Optional[Path] = None
+            c = open_db()
+            try:
+                if pair_key:
+                    row = c.execute(
+                        "SELECT cwd FROM sessions WHERE pair_key = ? AND label = ?",
+                        (pair_key, from_label),
+                    ).fetchone()
+                else:
+                    row = c.execute(
+                        "SELECT cwd FROM sessions WHERE cwd = ? AND label = ?",
+                        (str(cwd), from_label),
+                    ).fetchone()
+            finally:
+                c.close()
+            if row is None:
+                # Auto-register `owner` (the human) on first send. Other
+                # labels must already exist — the composer only offers
+                # impersonation of real members.
+                if from_label == "owner" and pair_key:
+                    reg_cmd = [
+                        sys.executable, os.path.abspath(__file__),
+                        "session-register",
+                        "--cwd", str(cwd),
+                        "--label", "owner",
+                        "--agent", "human",
+                        "--role", "owner",
+                        "--pair-key", pair_key,
+                        "--session-key", f"owner-web-{pair_key}",
+                        "--force",
+                    ]
+                    try:
+                        _subp.run(reg_cmd, capture_output=True, timeout=10, check=True)
+                    except Exception as e:
+                        _send_json(self, 500, {
+                            "ok": False,
+                            "error": f"auto-register owner failed: {e}",
+                        })
+                        return
+                    # Owner is human — it has no channel listener.
+                    # session-register walks the process tree and may bind a
+                    # bogus socket from an ancestor Claude session; scrub it
+                    # so push attempts to owner correctly return no-channel.
+                    c2 = open_db()
+                    try:
+                        c2.execute(
+                            "UPDATE sessions SET channel_socket=NULL "
+                            "WHERE cwd=? AND label=?",
+                            (str(cwd), "owner"),
+                        )
+                        c2.commit()
+                    finally:
+                        c2.close()
+                    send_cwd = cwd
+                else:
+                    _send_json(self, 404, {
+                        "ok": False,
+                        "error": f"sender {from_label!r} not registered in this scope",
+                    })
+                    return
+            else:
+                send_cwd = Path(row["cwd"])
+
+            if not to_label or to_label == "@room":
+                result = _script_self_invoke(
+                    "peer-broadcast", ["--as", from_label], body, send_cwd,
+                )
+            else:
+                result = _script_self_invoke(
+                    "peer-send", ["--as", from_label, "--to", to_label],
+                    body, send_cwd,
+                )
+            code = 200 if result["ok"] else 400
+            _send_json(self, code, result)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -3089,9 +3220,10 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
 <title>__TITLE__</title>
 <style>
   :root {
-    --bg:#0e1015; --fg:#e6e6e6; --muted:#8a8f98; --accent:#6cd9ff;
-    --panel:#181b23; --border:#262a33; --sidebar-bg:#12141b;
-    --hover:#1f242e; --selected:#223041; --unread:#6cd9ff;
+    /* Kraken palette: jet black + deep purple, crypto-fintech precision */
+    --bg:#111111; --fg:#FFFFFF; --muted:#8A8A8A; --accent:#5841D8;
+    --panel:#1A1A1A; --border:rgba(128,128,128,0.22); --sidebar-bg:#0B0B0B;
+    --hover:rgba(128,128,128,0.08); --selected:rgba(88,65,216,0.15); --unread:#5841D8;
     --terminated:#f59e0b;
   }
   * { box-sizing:border-box }
@@ -3151,8 +3283,8 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     display:flex; align-items:center; gap:8px; }
   .pair-header .sub { color:var(--muted); font-size:12px; margin-top:4px;
     display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-  .pill { color:#1a1d24; padding:2px 8px; border-radius:10px;
-    font-weight:500; font-size:11px; }
+  .pill { color:#FFFFFF; padding:2px 8px; border-radius:4px;
+    font-weight:600; font-size:11px; }
   .arrow { color:var(--muted) }
 
   .stream { flex:1; overflow-y:auto; padding:16px 24px 40px; }
@@ -3161,9 +3293,9 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
   .day { color:var(--muted); text-align:center; margin:20px 0 8px;
     font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
   .msg { margin:10px 0; padding:10px 14px; background:var(--panel);
-    border:1px solid var(--border); border-radius:8px; max-width:760px; }
+    border:1px solid var(--border); border-radius:4px; max-width:760px; }
   .msg.new { animation:flash 1.2s ease-out; }
-  @keyframes flash { 0% { background:#2a3340 } 100% { background:var(--panel) } }
+  @keyframes flash { 0% { background:var(--selected) } 100% { background:var(--panel) } }
   .msg.end-marker { border-color:var(--terminated);
     background:rgba(245,158,11,.08); }
   .meta { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
@@ -3174,13 +3306,44 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }
   .term-banner { margin:16px 0; padding:10px 14px;
     background:rgba(245,158,11,.08); border:1px dashed var(--terminated);
-    border-radius:8px; color:var(--terminated); font-size:12px;
+    border-radius:4px; color:var(--terminated); font-size:12px;
     text-align:center; }
 
-  .scroll-btn { position:absolute; bottom:20px; right:32px; padding:6px 12px;
+  .scroll-btn { position:absolute; bottom:96px; right:32px; padding:6px 12px;
     background:var(--panel); color:var(--fg); border:1px solid var(--border);
-    border-radius:6px; cursor:pointer; font-size:12px; display:none; }
+    border-radius:4px; cursor:pointer; font-size:12px; display:none; }
   .scroll-btn.show { display:block }
+
+  /* Composer */
+  .composer { border-top:1px solid var(--border); background:var(--sidebar-bg);
+    padding:10px 16px 12px; display:none; flex-direction:column; gap:6px; }
+  .composer.active { display:flex; }
+  .composer .row { display:flex; gap:8px; align-items:center;
+    font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .composer select { background:var(--panel); color:var(--fg);
+    border:1px solid var(--border); border-radius:4px; padding:3px 6px;
+    font:inherit; font-size:12px; }
+  .composer select:focus { outline:1px solid var(--accent);
+    outline-offset:-1px; }
+  .composer textarea { width:100%; min-height:52px; max-height:220px;
+    resize:vertical; padding:8px 10px; background:var(--panel);
+    color:var(--fg); border:1px solid var(--border); border-radius:4px;
+    font:13px/1.5 SF Mono,Menlo,Consolas,monospace; }
+  .composer textarea:focus { outline:1px solid var(--accent);
+    outline-offset:-1px; }
+  .composer .actions { display:flex; gap:8px; align-items:center;
+    justify-content:space-between; }
+  .composer .hint { color:var(--muted); font-size:11px; }
+  .composer button { background:var(--accent); color:#FFFFFF;
+    border:none; border-radius:4px; padding:6px 14px; font-weight:600;
+    font-size:12px; cursor:pointer; }
+  .composer button:disabled { opacity:.4; cursor:not-allowed; }
+  .composer .status { font-size:11px; padding:4px 8px; border-radius:4px;
+    display:none; white-space:pre-wrap; }
+  .composer .status.show { display:inline-block; }
+  .composer .status.ok { color:#22c55e; }
+  .composer .status.err { color:#ef4444;
+    background:rgba(239,68,68,.08); }
 </style>
 <body>
 <div class=app>
@@ -3201,6 +3364,21 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
       <div class=empty id=emptyMain>pick a conversation on the left to view its messages</div>
     </div>
     <button class=scroll-btn id=scrollBtn>↓ new messages</button>
+    <div class=composer id=composer>
+      <div class=row>
+        <label>from</label>
+        <select id=fromPicker></select>
+        <label>to</label>
+        <select id=toPicker></select>
+        <span class="status" id=sendStatus></span>
+      </div>
+      <textarea id=composerBody
+        placeholder="type a message (Enter to send · Shift+Enter for newline)"></textarea>
+      <div class=actions>
+        <span class=hint id=composerHint></span>
+        <button id=sendBtn>Send</button>
+      </div>
+    </div>
   </main>
 </div>
 <script>
@@ -3232,7 +3410,8 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
   function pill(label) {
     const el = document.createElement('span');
     el.className = 'pill';
-    el.style.background = `hsl(${hue(label)}, 55%, 86%)`;
+    el.style.background = `hsl(${hue(label)}, 65%, 25%)`;
+    el.style.border = `1px solid hsl(${hue(label)}, 65%, 45%)`;
     el.textContent = label;
     return el;
   }
@@ -3422,7 +3601,8 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
         meta.appendChild(pill(g.recipients[0] || '?'));
       } else if (roomSize && g.recipients.length >= roomSize - 1) {
         const room = el('span', 'pill');
-        room.style.background = '#6cd9ff';
+        room.style.background = 'var(--accent)';
+        room.style.border = '1px solid rgba(255,255,255,0.18)';
         room.textContent = '@room (' + g.recipients.length + ')';
         meta.appendChild(room);
       } else {
@@ -3454,9 +3634,117 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
     if (key && !state.messagesByPair[key]) {
       fetchPairMessages(key);
     }
+    renderComposer();
     state.autoScroll = true;
     requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; });
   }
+
+  // Composer: `owner` is a reserved first-class identity (the human in
+  // the loop). `@room` broadcasts. Any other existing member can be
+  // impersonated or DM'd.
+  const composer = document.getElementById('composer');
+  const fromPicker = document.getElementById('fromPicker');
+  const toPicker = document.getElementById('toPicker');
+  const composerBody = document.getElementById('composerBody');
+  const sendBtn = document.getElementById('sendBtn');
+  const sendStatus = document.getElementById('sendStatus');
+  const composerHint = document.getElementById('composerHint');
+
+  function memberLabels(p) {
+    if (!p) return [];
+    if (state.mode === 'pair_key') return (p.members || []).map(m => m.label);
+    return [p.a, p.b];
+  }
+  let lastComposerKey = null;    // signature of last rendered composer
+  function renderComposer() {
+    const p = state.selectedKey ? state.pairs[state.selectedKey] : null;
+    if (!p) { composer.classList.remove('active'); lastComposerKey = null; return; }
+    composer.classList.add('active');
+    const members = memberLabels(p).filter(Boolean);
+    // Skip rebuild when the membership set hasn't changed — otherwise the
+    // 1s poll would collapse an open dropdown mid-selection. Key includes
+    // the selected pair so switching rooms still re-renders.
+    const sig = state.selectedKey + '|' + members.slice().sort().join(',');
+    if (sig === lastComposerKey) return;
+    lastComposerKey = sig;
+    const prevFrom = fromPicker.value;
+    const prevTo = toPicker.value;
+    // From: owner first, then any existing members. Auto-register fires
+    // server-side on first send if owner isn't in the DB yet.
+    fromPicker.innerHTML = '';
+    const fromOpts = ['owner', ...members.filter(m => m !== 'owner')];
+    for (const m of fromOpts) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m === 'owner' ? 'owner (you)' : m;
+      fromPicker.appendChild(opt);
+    }
+    fromPicker.value = fromOpts.includes(prevFrom) ? prevFrom : 'owner';
+    // To: @room, then each member except the current `from`.
+    function refreshToOptions() {
+      const from = fromPicker.value;
+      const prev = toPicker.value;
+      toPicker.innerHTML = '';
+      const roomOpt = document.createElement('option');
+      roomOpt.value = '@room';
+      roomOpt.textContent = '@room (broadcast)';
+      toPicker.appendChild(roomOpt);
+      for (const m of members) {
+        if (m === from) continue;
+        const opt = document.createElement('option');
+        opt.value = m; opt.textContent = m;
+        toPicker.appendChild(opt);
+      }
+      const candidates = Array.from(toPicker.options).map(o => o.value);
+      toPicker.value = candidates.includes(prev) ? prev : '@room';
+    }
+    refreshToOptions();
+    fromPicker.onchange = refreshToOptions;
+    composerHint.textContent = state.mode === 'pair_key'
+      ? `room: ${state.pairKey}` : 'cwd-scoped conversation';
+  }
+  async function doSend() {
+    const from = fromPicker.value;
+    const to = toPicker.value;
+    const body = composerBody.value;
+    if (!body.trim()) return;
+    sendBtn.disabled = true;
+    sendStatus.className = 'status show';
+    sendStatus.textContent = 'sending…';
+    try {
+      const r = await fetch('/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from, to, body }),
+      });
+      const data = await r.json();
+      if (r.ok && data.ok) {
+        composerBody.value = '';
+        sendStatus.className = 'status show ok';
+        sendStatus.textContent = (data.stdout || 'sent').split('\\n')[0];
+        setTimeout(() => { sendStatus.className = 'status'; }, 2500);
+        // Poll immediately so the new message shows up.
+        tick();
+      } else {
+        sendStatus.className = 'status show err';
+        sendStatus.textContent = data.error
+          || data.stderr || data.stdout || 'send failed';
+      }
+    } catch (e) {
+      sendStatus.className = 'status show err';
+      sendStatus.textContent = 'network error: ' + e.message;
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+  sendBtn.addEventListener('click', doSend);
+  composerBody.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    if (ev.shiftKey) return;             // Shift+Enter → newline (default)
+    if (ev.isComposing) return;          // IME composition → don't send
+    ev.preventDefault();
+    doSend();
+  });
 
   async function fetchScope() {
     try {
@@ -3486,6 +3774,10 @@ _PEER_WEB_HTML_TEMPLATE = """<!doctype html>
       renderSidebar();
       if (state.selectedKey && pairs[state.selectedKey]) {
         renderPairHeader(pairs[state.selectedKey]);
+        // Re-render composer so from/to pickers reflect new members.
+        // renderComposer preserves prev selection so dropdowns stay stable
+        // while adding any new peers.
+        renderComposer();
       }
       // Pair-key mode auto-selects the single room so the user lands on
       // the stream without a click.
