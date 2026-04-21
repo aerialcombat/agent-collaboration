@@ -44,8 +44,10 @@ const (
 	// migration that adds peer_rooms.home_host; peer-web's /rooms.json and
 	// routing helpers consult the column, so pre-0004 DBs must fail the
 	// schema check first. Bumped 4 → 5 for v3.3 Item 4's 0005 migration
-	// that adds inbox.server_seq for per-room monotonic ack ids.
-	GooseVersionRequired = 5
+	// that adds inbox.server_seq for per-room monotonic ack ids. Bumped
+	// 5 → 6 for v3.3 Item 5's 0006 migration that adds pending_outbound
+	// for the laptop-side federation queue.
+	GooseVersionRequired = 6
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

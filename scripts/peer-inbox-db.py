@@ -95,8 +95,10 @@ PYTHON_MIN = (3, 9)
 # migration that adds peer_rooms.home_host so rooms declare which host owns
 # writes; display + CLI routing consult the column. Bumped 4 → 5 for v3.3
 # Item 4's 0005 migration that adds inbox.server_seq for per-room monotonic
-# ack ids (read-your-writes + idempotent retries).
-GOOSE_VERSION_REQUIRED = 5
+# ack ids (read-your-writes + idempotent retries). Bumped 5 → 6 for v3.3
+# Item 5's 0006 migration that adds the pending_outbound table for the
+# laptop-side federation queue.
+GOOSE_VERSION_REQUIRED = 6
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",
@@ -840,37 +842,27 @@ def _next_server_seq(conn: sqlite3.Connection, room_key: str) -> int:
     return int(row["nxt"])
 
 
-def _peer_send_remote(
-    args: argparse.Namespace,
+OUTBOUND_QUEUE_TTL_SECS = 24 * 60 * 60  # 24 hours
+
+
+def _remote_send_http(
+    cfg: dict[str, str],
     pair_key: str,
-    home_host: str,
-    message_id: str,
+    from_label: str,
+    to_label: str,
     body: str,
-    self_label: str,
-) -> int:
-    """Route a peer-send to a remote host's peer-web /api/send.
+    message_id: str,
+) -> tuple[bool, Optional[dict], Optional[str]]:
+    """Perform the raw HTTP POST. Returns (reachable, parsed_response, error).
 
-    Read `remotes[home_host]` from ~/.agent-collab/remotes.json for the
-    base_url + bearer token. POST {from, to, body, message_id} and surface
-    the remote's response. Network failures bubble up as EXIT_CONFIG_ERROR
-    today; Item 5 (outbound queue) will later absorb transient failures
-    by queuing the payload for retry.
+    reachable=True means we got *any* HTTP status back (even 4xx/5xx);
+    reachable=False means network-level failure (tailnet flake, DNS,
+    connection refused) — the signal the queue cares about.
     """
-    remotes = load_remotes()
-    cfg = remotes.get(home_host)
-    if cfg is None:
-        err(
-            f"room {pair_key} is home={home_host!r} but no remote config "
-            f"found. Add an entry to {_remotes_path()}:\n"
-            f'  {{"{home_host}": {{"base_url": "https://...", '
-            f'"auth_token_env": "AGENT_COLLAB_TOKEN_{home_host.upper()}"}}}}',
-            EXIT_CONFIG_ERROR,
-        )
-
     url = f"{cfg['base_url']}/api/send?pair_key={pair_key}"
     payload = {
-        "from": self_label,
-        "to": args.to,
+        "from": from_label,
+        "to": to_label,
         "body": body,
         "message_id": message_id,
     }
@@ -889,42 +881,265 @@ def _peer_send_remote(
         req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            resp_body = resp.read().decode("utf-8")
+            raw = resp.read().decode("utf-8")
             status = resp.status
     except urllib.error.HTTPError as e:
         status = e.code
-        resp_body = e.read().decode("utf-8", errors="replace")
+        raw = e.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError) as e:
-        err(
-            f"remote send failed: {e} (target={url}). Item 5 outbound "
-            f"queue not yet wired; retry manually or check tailnet.",
-            EXIT_PEER_OFFLINE,
-        )
+        return False, None, str(e)
 
     try:
-        parsed = _json.loads(resp_body) if resp_body else {}
+        parsed = _json.loads(raw) if raw else {}
     except _json.JSONDecodeError:
-        parsed = {"raw": resp_body}
+        parsed = {"raw": raw}
+    parsed["_http_status"] = status
+    return True, parsed, None
 
-    ok = status == 200 and bool(parsed.get("ok", True))
+
+def _enqueue_outbound(
+    home_host: str,
+    pair_key: str,
+    from_label: str,
+    to_label: str,
+    body: str,
+    message_id: str,
+    last_error: str,
+) -> None:
+    """Persist a failed remote-send to pending_outbound for later retry.
+
+    Idempotent on message_id (unique index) — a retry that also fails
+    updates the attempts counter rather than creating a duplicate row.
+    """
+    conn = open_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = now_iso()
+        existing = conn.execute(
+            "SELECT id FROM pending_outbound WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO pending_outbound
+                  (message_id, home_host, pair_key, from_label, to_label, body,
+                   created_at, attempts, last_attempt_at, last_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (message_id, home_host, pair_key, from_label, to_label, body,
+                 now, now, last_error),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE pending_outbound
+                   SET attempts = attempts + 1,
+                       last_attempt_at = ?,
+                       last_error = ?
+                 WHERE id = ?
+                """,
+                (now, last_error, existing["id"]),
+            )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+
+def _flush_outbound_queue(home_host: Optional[str] = None) -> dict[str, int]:
+    """Replay queued outbound sends for home_host (or all hosts if None).
+
+    FIFO per (home_host, pair_key). TTL: rows older than
+    OUTBOUND_QUEUE_TTL_SECS are dropped with a stderr warning instead of
+    replayed — stale messages in archived rooms are worse than the drop.
+    Returns counters for the caller's status output:
+      {'flushed': N, 'dropped_ttl': N, 'still_failing': N}.
+
+    Remote config lookup uses load_remotes(); hosts missing from the
+    config are skipped (can't reach without a base_url) — those rows stay
+    queued for the operator to configure.
+    """
+    counters = {"flushed": 0, "dropped_ttl": 0, "still_failing": 0}
+    remotes = load_remotes()
+
+    conn = open_db()
+    try:
+        if home_host:
+            rows = conn.execute(
+                "SELECT id, message_id, home_host, pair_key, from_label, "
+                "to_label, body, created_at FROM pending_outbound "
+                "WHERE home_host = ? ORDER BY id",
+                (home_host,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, message_id, home_host, pair_key, from_label, "
+                "to_label, body, created_at FROM pending_outbound "
+                "ORDER BY home_host, pair_key, id"
+            ).fetchall()
+    finally:
+        conn.close()
+
+    for r in rows:
+        age = seconds_since(r["created_at"])
+        if age > OUTBOUND_QUEUE_TTL_SECS:
+            _drop_outbound(r["id"])
+            counters["dropped_ttl"] += 1
+            print(
+                f"dropped queued send {r['message_id']} "
+                f"(age={int(age)}s > {OUTBOUND_QUEUE_TTL_SECS}s TTL, "
+                f"host={r['home_host']}, room={r['pair_key']})",
+                file=sys.stderr,
+            )
+            continue
+
+        cfg = remotes.get(r["home_host"])
+        if cfg is None:
+            counters["still_failing"] += 1
+            continue
+
+        reachable, parsed, err_str = _remote_send_http(
+            cfg, r["pair_key"], r["from_label"], r["to_label"],
+            r["body"], r["message_id"],
+        )
+        if reachable and parsed is not None and parsed.get("_http_status") == 200 and parsed.get("ok", True):
+            _drop_outbound(r["id"])
+            counters["flushed"] += 1
+        else:
+            counters["still_failing"] += 1
+            _bump_outbound_attempt(r["id"], err_str or f"http {parsed.get('_http_status') if parsed else '?'}")
+            # Don't keep trying more rows for this host; if one fails the
+            # rest likely will too, and we want FIFO ordering preserved.
+            break
+    return counters
+
+
+def _drop_outbound(row_id: int) -> None:
+    conn = open_db()
+    try:
+        conn.execute("DELETE FROM pending_outbound WHERE id = ?", (row_id,))
+    finally:
+        conn.close()
+
+
+def _bump_outbound_attempt(row_id: int, last_error: str) -> None:
+    conn = open_db()
+    try:
+        conn.execute(
+            "UPDATE pending_outbound SET attempts = attempts + 1, "
+            "last_attempt_at = ?, last_error = ? WHERE id = ?",
+            (now_iso(), last_error, row_id),
+        )
+    finally:
+        conn.close()
+
+
+def _peer_send_remote(
+    args: argparse.Namespace,
+    pair_key: str,
+    home_host: str,
+    message_id: str,
+    body: str,
+    self_label: str,
+) -> int:
+    """Route a peer-send to a remote host's peer-web /api/send.
+
+    Flushes any previously-queued sends for this host first (FIFO), then
+    attempts the current message. On network failure the current message
+    is enqueued and the call exits 0 with a visible warning — matches the
+    plan §5 Item 5 contract so callers never hang or silently drop.
+    """
+    remotes = load_remotes()
+    cfg = remotes.get(home_host)
+    if cfg is None:
+        err(
+            f"room {pair_key} is home={home_host!r} but no remote config "
+            f"found. Add an entry to {_remotes_path()}:\n"
+            f'  {{"{home_host}": {{"base_url": "https://...", '
+            f'"auth_token_env": "AGENT_COLLAB_TOKEN_{home_host.upper()}"}}}}',
+            EXIT_CONFIG_ERROR,
+        )
+
+    flush_stats = _flush_outbound_queue(home_host)
+
+    reachable, parsed, err_str = _remote_send_http(
+        cfg, pair_key, self_label, args.to, body, message_id,
+    )
+
+    import json as _json
+
+    if not reachable:
+        _enqueue_outbound(
+            home_host, pair_key, self_label, args.to, body, message_id,
+            err_str or "unknown network error",
+        )
+        depth = _outbound_queue_depth(home_host)
+        if getattr(args, "json_output", False):
+            print(_json.dumps({
+                "ok": True,
+                "to": args.to,
+                "message_id": message_id,
+                "server_seq": 0,
+                "push_status": "queued",
+                "dedup_hit": False,
+                "queued": True,
+                "queue_depth": depth,
+                "routed_via": home_host,
+                "error": err_str,
+            }))
+        else:
+            print(
+                f"queued for {home_host} (depth={depth}): {err_str}. "
+                f"Retries on next send; manual flush: "
+                f"agent-collab peer queue --flush",
+                file=sys.stderr,
+            )
+        return EXIT_OK
+
+    status = parsed.get("_http_status") if parsed else None
+    ok = status == 200 and bool(parsed.get("ok", True) if parsed else False)
 
     if getattr(args, "json_output", False):
-        print(_json.dumps({
+        payload = {
             "ok": ok,
             "to": args.to,
-            "message_id": parsed.get("message_id", message_id),
-            "server_seq": parsed.get("server_seq", 0),
-            "push_status": parsed.get("push_status", "remote"),
-            "dedup_hit": parsed.get("dedup_hit", False),
+            "message_id": (parsed or {}).get("message_id", message_id),
+            "server_seq": (parsed or {}).get("server_seq", 0),
+            "push_status": (parsed or {}).get("push_status", "remote"),
+            "dedup_hit": (parsed or {}).get("dedup_hit", False),
             "terminates": False,
             "mentions": [],
             "routed_via": home_host,
-        }))
+        }
+        if flush_stats["flushed"] or flush_stats["dropped_ttl"]:
+            payload["queue_flushed"] = flush_stats["flushed"]
+            payload["queue_dropped_ttl"] = flush_stats["dropped_ttl"]
+        print(_json.dumps(payload))
     else:
-        seq = parsed.get("server_seq", "?")
-        dedup = " [deduped]" if parsed.get("dedup_hit") else ""
-        print(f"sent to {args.to} via {home_host} (seq={seq}){dedup}")
+        seq = (parsed or {}).get("server_seq", "?")
+        dedup = " [deduped]" if (parsed or {}).get("dedup_hit") else ""
+        flush_note = ""
+        if flush_stats["flushed"]:
+            flush_note = f" [queue flushed {flush_stats['flushed']}]"
+        print(f"sent to {args.to} via {home_host} (seq={seq}){dedup}{flush_note}")
     return EXIT_OK if ok else EXIT_PEER_OFFLINE
+
+
+def _outbound_queue_depth(home_host: Optional[str] = None) -> int:
+    conn = open_db()
+    try:
+        if home_host:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM pending_outbound WHERE home_host = ?",
+                (home_host,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM pending_outbound"
+            ).fetchone()
+    finally:
+        conn.close()
+    return int(row["n"])
 
 
 def _get_room_home_host(room_key: str) -> Optional[str]:
@@ -4299,6 +4514,63 @@ def cmd_room_create(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_peer_queue(args: argparse.Namespace) -> int:
+    """v3.3 federation queue inspector + manual flush.
+
+    --show: list rows with (age, host, room, attempts, last_error).
+    --flush: attempt to replay every row for the given host (or all).
+    Default (neither flag): same as --show.
+    """
+    if not args.show and not args.flush:
+        args.show = True
+
+    if args.home_host:
+        validate_host_label(args.home_host)
+
+    if args.flush:
+        stats = _flush_outbound_queue(args.home_host)
+        print(
+            f"flush: flushed={stats['flushed']} "
+            f"dropped_ttl={stats['dropped_ttl']} "
+            f"still_failing={stats['still_failing']}"
+        )
+
+    if args.show:
+        conn = open_db()
+        try:
+            if args.home_host:
+                rows = conn.execute(
+                    "SELECT id, message_id, home_host, pair_key, from_label, "
+                    "to_label, created_at, attempts, last_error "
+                    "FROM pending_outbound WHERE home_host = ? ORDER BY id",
+                    (args.home_host,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, message_id, home_host, pair_key, from_label, "
+                    "to_label, created_at, attempts, last_error "
+                    "FROM pending_outbound ORDER BY home_host, pair_key, id"
+                ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            print("(no queued sends)")
+            return EXIT_OK
+        print(
+            f"{'ID':>4} {'AGE':>6} {'HOST':<12} {'ROOM':<24} "
+            f"{'FROM→TO':<24} {'TRIES':>5}  LAST_ERROR"
+        )
+        for r in rows:
+            age = int(seconds_since(r["created_at"]))
+            ft = f"{r['from_label']}→{r['to_label']}"
+            last_err = (r["last_error"] or "")[:40]
+            print(
+                f"{r['id']:>4} {age:>5}s {r['home_host']:<12} "
+                f"{r['pair_key']:<24} {ft:<24} {r['attempts']:>5}  {last_err}"
+            )
+    return EXIT_OK
+
+
 def cmd_peer_reset(args: argparse.Namespace) -> int:
     """Clear the termination flag + turn counter for a room.
 
@@ -4880,6 +5152,24 @@ def build_parser() -> argparse.ArgumentParser:
     prst.add_argument("--room-key", dest="room_key",
                       help="reset an arbitrary room by its exact key")
     prst.set_defaults(func=cmd_peer_reset)
+
+    pq = sub.add_parser(
+        "peer-queue",
+        help="inspect / flush the v3.3 federation outbound queue",
+    )
+    pq.add_argument(
+        "--show", action="store_true",
+        help="list queued outbound sends with age, host, room, attempts",
+    )
+    pq.add_argument(
+        "--flush", action="store_true",
+        help="attempt to replay every queued send; drop TTL-expired rows",
+    )
+    pq.add_argument(
+        "--home-host", dest="home_host",
+        help="scope --show or --flush to a single remote host label",
+    )
+    pq.set_defaults(func=cmd_peer_queue)
 
     pwb = sub.add_parser("peer-web")
     pwb.add_argument("--cwd")
