@@ -80,6 +80,8 @@ func run(args []string) int {
 		return runSweep(rest)
 	case "daemon-reset-session":
 		return runResetSession(rest)
+	case "session-list":
+		return runSessionList(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
@@ -91,12 +93,13 @@ func run(args []string) int {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage: peer-inbox <daemon-claim|daemon-complete|daemon-sweep|daemon-reset-session> [flags]
+	fmt.Fprintf(os.Stderr, `usage: peer-inbox <daemon-claim|daemon-complete|daemon-sweep|daemon-reset-session|session-list> [flags]
 
   daemon-claim         --cwd DIR --as LABEL [--format json|plain]
   daemon-complete      --cwd DIR --as LABEL [--format json|plain]
   daemon-sweep         [--cwd DIR] [--sweep-ttl SECS] [--format json|plain]
   daemon-reset-session --cwd DIR --as LABEL [--format json|plain]
+  session-list         [--cwd DIR] [--all-cwds] [--include-stale] [--json]
 
 Go parity for the Python daemon-mode verbs in scripts/peer-inbox-db.py.
 Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation,
@@ -621,4 +624,194 @@ func stringContains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// session-list (v3.4 Phase 2 — read-only verb port)
+// ---------------------------------------------------------------------------
+//
+// Mirrors scripts/peer-inbox-db.py::cmd_session_list byte-for-byte. Parity
+// gate is tests/parity/run.sh session-list <scenario> go; diverging from
+// the Python output shape (column widths, role-default "peer", trailing
+// "  cwd=..." on --all-cwds, JSON array shape) breaks the harness.
+
+// idleThresholdSecs + staleThresholdSecs mirror the Python constants.
+// Any bump needs to land on both sides in lockstep; the parity harness
+// will surface drift on the next CI run.
+const (
+	idleThresholdSecs  = 5 * 60
+	staleThresholdSecs = 30 * 60
+)
+
+// sessionListRowJSON is the per-row JSON shape Python emits. Keys and
+// order match the dict built in cmd_session_list.
+type sessionListRowJSON struct {
+	CWD        string `json:"cwd"`
+	Label      string `json:"label"`
+	Agent      string `json:"agent"`
+	Role       any    `json:"role"` // null when empty, else string — Python stores NULL as None
+	StartedAt  string `json:"started_at"`
+	LastSeenAt string `json:"last_seen_at"`
+	Activity   string `json:"activity"`
+}
+
+// activityState mirrors Python's activity_state(last_seen). Uses strptime-
+// compatible parsing (`2006-01-02T15:04:05Z`); malformed timestamps fall
+// back to "stale" so a bad row can't crash the list verb.
+func activityState(lastSeen string) string {
+	t, err := time.Parse("2006-01-02T15:04:05Z", lastSeen)
+	if err != nil {
+		return "stale"
+	}
+	age := time.Since(t).Seconds()
+	if age < idleThresholdSecs {
+		return "active"
+	}
+	if age < staleThresholdSecs {
+		return "idle"
+	}
+	return "stale"
+}
+
+// resolveScopeCWD mirrors the "not --all-cwds" branch of Python's
+// cmd_session_list: walk up from cwd looking for .agent-collab/sessions,
+// and if found, scope the list to that owner's resolved cwd. Otherwise
+// fall back to the passed-in cwd.
+func resolveScopeCWD(cwd string) string {
+	sessDir := findSessionsDirForList(cwd)
+	if sessDir == "" {
+		return cwd
+	}
+	// sessDir = <owner>/.agent-collab/sessions; owner is 2 parents up.
+	owner := filepath.Dir(filepath.Dir(sessDir))
+	if resolved, err := filepath.EvalSymlinks(owner); err == nil {
+		return resolved
+	}
+	return owner
+}
+
+// findSessionsDirForList walks up from cwd looking for any
+// .agent-collab/sessions directory. Mirrors Python's
+// find_any_sessions_dir; inline-defined here because the existing Go
+// helper with the same semantics lives in the sqlite package and isn't
+// exported (and keeping the CLI deps minimal).
+func findSessionsDirForList(cwd string) string {
+	cur := cwd
+	for {
+		candidate := filepath.Join(cur, ".agent-collab", "sessions")
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		cur = parent
+	}
+}
+
+func runSessionList(args []string) int {
+	fs := flag.NewFlagSet("session-list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var (
+		cwd          = fs.String("cwd", "", "session cwd (default: process cwd)")
+		allCWDs      = fs.Bool("all-cwds", false, "list sessions across all cwds")
+		includeStale = fs.Bool("include-stale", false, "include sessions with stale last-seen timestamps")
+		jsonOut      = fs.Bool("json", false, "emit JSON array instead of the human-readable table")
+	)
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+
+	resolvedCWD, err := resolveCWD(*cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "session-list: resolve cwd: %v\n", err)
+		return exitInternal
+	}
+
+	scopeCWD := resolvedCWD
+	if !*allCWDs {
+		scopeCWD = resolveScopeCWD(resolvedCWD)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "session-list: open store: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	filterCWD := ""
+	if !*allCWDs {
+		filterCWD = scopeCWD
+	}
+	rows, err := st.ListSessions(ctx, filterCWD)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "session-list: %v\n", err)
+		return exitInternal
+	}
+
+	results := make([]sessionListRowJSON, 0, len(rows))
+	for _, r := range rows {
+		state := activityState(r.LastSeenAt)
+		if state == "stale" && !*includeStale {
+			continue
+		}
+		var roleVal any
+		if r.Role != "" {
+			roleVal = r.Role
+		}
+		results = append(results, sessionListRowJSON{
+			CWD: r.CWD, Label: r.Label, Agent: r.Agent,
+			Role: roleVal, StartedAt: r.StartedAt,
+			LastSeenAt: r.LastSeenAt, Activity: state,
+		})
+	}
+
+	if *jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(results); err != nil {
+			fmt.Fprintf(os.Stderr, "session-list: encode json: %v\n", err)
+			return exitInternal
+		}
+		return exitOK
+	}
+
+	if len(results) == 0 {
+		fmt.Println("no sessions")
+		return exitOK
+	}
+
+	for _, r := range results {
+		role := "peer"
+		if s, ok := r.Role.(string); ok && s != "" {
+			role = s
+		}
+		// Python: f"{label:<20} {agent:<8} {role:<12} {activity:<7} last-seen {last_seen}"
+		line := fmt.Sprintf("%s %s %s %s last-seen %s",
+			padRight(r.Label, 20),
+			padRight(r.Agent, 8),
+			padRight(role, 12),
+			padRight(r.Activity, 7),
+			r.LastSeenAt,
+		)
+		if *allCWDs {
+			line += "  cwd=" + r.CWD
+		}
+		fmt.Println(line)
+	}
+	return exitOK
+}
+
+// padRight emulates Python's `f"{s:<N}"` — left-justify in a field of
+// width N, padding with spaces. If len(s) >= N, returns s unchanged.
+func padRight(s string, width int) string {
+	if len(s) >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-len(s))
 }
