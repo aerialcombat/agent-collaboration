@@ -87,6 +87,20 @@ func run(args []string) int {
 		return runPeerList(rest)
 	case "peer-receive":
 		return runPeerReceive(rest)
+	case "session-register":
+		return runSessionRegister(rest)
+	case "peer-send":
+		return runPeerSend(rest)
+	case "peer-broadcast":
+		return runPeerBroadcast(rest)
+	case "peer-round":
+		return runPeerRound(rest)
+	case "room-create":
+		return runRoomCreate(rest)
+	case "peer-reset":
+		return runPeerReset(rest)
+	case "peer-queue":
+		return runPeerQueue(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
@@ -107,6 +121,10 @@ func usage() {
   session-list         [--cwd DIR] [--all-cwds] [--include-stale] [--json]
   peer-list            [--cwd DIR] [--as LABEL] [--include-stale] [--json]
   peer-receive         [--cwd DIR] [--as LABEL] [--since ISO] [--format plain|json|hook|hook-json]
+
+v3.4 Phase 3 (in progress — currently stubbed; route to Python CLI):
+  session-register, peer-send, peer-broadcast, peer-round,
+  room-create, peer-reset, peer-queue.
 
 Go parity for the Python daemon-mode verbs in scripts/peer-inbox-db.py.
 Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation,
