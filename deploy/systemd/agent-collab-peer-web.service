@@ -17,7 +17,9 @@ EnvironmentFile=-/etc/agent-collab/env
 # The web dashboard reads ~/.agent-collab/sessions.db; working dir
 # just needs to be writeable for the user.
 WorkingDirectory=~
-ExecStart=/usr/local/bin/peer-web --port 8787
+# PEER_WEB_PORT is set in /etc/agent-collab/env; defaults to 8787 if unset.
+Environment=PEER_WEB_PORT=8787
+ExecStart=/bin/sh -c '/usr/local/bin/peer-web --port "$PEER_WEB_PORT"'
 Restart=on-failure
 RestartSec=5
 # Kill cleanly so the listening socket is released for restarts.

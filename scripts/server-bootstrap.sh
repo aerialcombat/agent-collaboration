@@ -33,6 +33,14 @@ set -euo pipefail
 AC_USER="${AGENT_COLLAB_USER:-agent-collab}"
 AC_HOME="${AGENT_COLLAB_HOME:-/var/lib/agent-collab}"
 GO_VERSION="${GO_VERSION:-1.25.5}"
+# GO_SCOPE: "system" installs Go at /usr/local/go (default; simplest).
+# "user" installs under $AC_HOME/go and never touches a system-wide Go
+# — use this on shared servers where another stack already expects a
+# different system Go. Setting this to "skip" assumes Go is already
+# present at the required version and refuses to touch it.
+GO_SCOPE="${GO_SCOPE:-system}"
+# PORT: peer-web bind port. Preflight checks it's free before we build.
+PORT="${AGENT_COLLAB_PORT:-8787}"
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SYSTEMD_SRC_DIR="$PROJECT_ROOT/deploy/systemd"
@@ -58,6 +66,18 @@ fi
 [[ -d "$PROJECT_ROOT/go" && -d "$PROJECT_ROOT/scripts" ]] || \
   err "PROJECT_ROOT=$PROJECT_ROOT doesn't look like the agent-collab repo"
 
+# ---- Port preflight -------------------------------------------------------
+
+if command -v ss >/dev/null 2>&1; then
+  if ss -tln "( sport = :$PORT )" 2>/dev/null | grep -q ":$PORT"; then
+    err "port $PORT is already in use on this host. Set AGENT_COLLAB_PORT to a free port or free :$PORT first. (ss -tlnp | grep :$PORT shows the owner.)"
+  fi
+elif command -v lsof >/dev/null 2>&1; then
+  if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    err "port $PORT is already in use on this host. Set AGENT_COLLAB_PORT to a free port or free :$PORT first."
+  fi
+fi
+
 # ---- 1. apt deps ----------------------------------------------------------
 
 log "updating apt + installing runtime deps"
@@ -69,20 +89,58 @@ apt-get install -y --no-install-recommends \
 
 # ---- 2. Go toolchain ------------------------------------------------------
 
-# Detect usable Go. apt's golang is often too old; we target 1.25+. If the
-# installed version is old or missing, download the upstream tarball.
+# Resolve installation strategy based on GO_SCOPE. "system" writes to
+# /usr/local/go — clean on a dedicated host, but risky on a shared box
+# where another stack already depends on a specific system Go. "user"
+# writes to $AC_HOME/go and is invisible to other users. "skip" assumes
+# the already-installed Go is good enough and refuses to touch anything.
+
+GO_BIN=""
 need_go_install=0
-if command -v go >/dev/null 2>&1; then
-  have_go="$(go version | awk '{print $3}' | sed 's/^go//')"
-  if [[ "$(printf '%s\n%s\n' "$GO_VERSION" "$have_go" | sort -V | head -n1)" != "$GO_VERSION" ]]; then
-    log "go is $have_go, need >= $GO_VERSION — will install"
-    need_go_install=1
-  else
-    log "go $have_go OK (>= $GO_VERSION)"
-  fi
-else
-  need_go_install=1
-fi
+
+case "$GO_SCOPE" in
+  system)
+    if command -v go >/dev/null 2>&1; then
+      have_go="$(go version | awk '{print $3}' | sed 's/^go//')"
+      if [[ "$(printf '%s\n%s\n' "$GO_VERSION" "$have_go" | sort -V | head -n1)" != "$GO_VERSION" ]]; then
+        log "go is $have_go, need >= $GO_VERSION — will install system-wide"
+        need_go_install=1
+      else
+        log "go $have_go OK (>= $GO_VERSION), system scope"
+        GO_BIN="$(command -v go)"
+      fi
+    else
+      need_go_install=1
+    fi
+    ;;
+  user)
+    user_go="$AC_HOME/go/bin/go"
+    if [[ -x "$user_go" ]]; then
+      have_go="$("$user_go" version | awk '{print $3}' | sed 's/^go//')"
+      if [[ "$(printf '%s\n%s\n' "$GO_VERSION" "$have_go" | sort -V | head -n1)" != "$GO_VERSION" ]]; then
+        log "user-scoped go at $user_go is $have_go, need >= $GO_VERSION — will reinstall"
+        need_go_install=1
+      else
+        log "user-scoped go $have_go OK (>= $GO_VERSION)"
+        GO_BIN="$user_go"
+      fi
+    else
+      log "no user-scoped go at $user_go — will install"
+      need_go_install=1
+    fi
+    ;;
+  skip)
+    command -v go >/dev/null 2>&1 || err "GO_SCOPE=skip but no \`go\` found on PATH"
+    have_go="$(go version | awk '{print $3}' | sed 's/^go//')"
+    [[ "$(printf '%s\n%s\n' "$GO_VERSION" "$have_go" | sort -V | head -n1)" == "$GO_VERSION" ]] || \
+      err "GO_SCOPE=skip but existing go is $have_go, need >= $GO_VERSION"
+    log "GO_SCOPE=skip — using existing go $have_go at $(command -v go)"
+    GO_BIN="$(command -v go)"
+    ;;
+  *)
+    err "unknown GO_SCOPE=$GO_SCOPE (use: system | user | skip)"
+    ;;
+esac
 
 if [[ "$need_go_install" -eq 1 ]]; then
   arch="$(dpkg --print-architecture)"
@@ -94,15 +152,29 @@ if [[ "$need_go_install" -eq 1 ]]; then
   tarball="go${GO_VERSION}.linux-${go_arch}.tar.gz"
   log "downloading ${tarball}"
   curl -fsSL -o "/tmp/$tarball" "https://go.dev/dl/$tarball"
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf "/tmp/$tarball"
-  rm -f "/tmp/$tarball"
-  # Ensure /usr/local/go/bin is on PATH for subsequent steps + future logins.
-  if ! grep -q '/usr/local/go/bin' /etc/profile.d/go.sh 2>/dev/null; then
-    echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
-    chmod 644 /etc/profile.d/go.sh
+
+  if [[ "$GO_SCOPE" == "user" ]]; then
+    # Install under $AC_HOME/go. We need the user's home to exist first
+    # — step 3 creates it, but to avoid a step ordering issue we create
+    # the minimum dir here and chown later.
+    install -d -m 755 -o root -g root "$AC_HOME"
+    rm -rf "$AC_HOME/go"
+    tar -C "$AC_HOME" -xzf "/tmp/$tarball"
+    rm -f "/tmp/$tarball"
+    GO_BIN="$AC_HOME/go/bin/go"
+    # Chown happens after step 3 (user creation) — marker it.
+    USER_GO_INSTALLED=1
+  else
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf "/tmp/$tarball"
+    rm -f "/tmp/$tarball"
+    if ! grep -q '/usr/local/go/bin' /etc/profile.d/go.sh 2>/dev/null; then
+      echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
+      chmod 644 /etc/profile.d/go.sh
+    fi
+    export PATH="$PATH:/usr/local/go/bin"
+    GO_BIN="/usr/local/go/bin/go"
   fi
-  export PATH="$PATH:/usr/local/go/bin"
 fi
 
 # ---- 3. agent-collab system user -----------------------------------------
@@ -116,15 +188,20 @@ fi
 # Ensure home perms are sane even if user existed.
 chown "$AC_USER:$AC_USER" "$AC_HOME"
 chmod 750 "$AC_HOME"
+# If user-scoped Go was unpacked earlier (before user existed), hand
+# ownership of the unpacked tree to the agent-collab user now.
+if [[ "${USER_GO_INSTALLED:-0}" -eq 1 ]]; then
+  chown -R "$AC_USER:$AC_USER" "$AC_HOME/go"
+fi
 
 # ---- 4. Build Go binaries ------------------------------------------------
 
-log "building Go binaries from $PROJECT_ROOT/go"
+log "building Go binaries from $PROJECT_ROOT/go (using $GO_BIN)"
 (
   cd "$PROJECT_ROOT/go"
   mkdir -p bin
-  # Build each cmd/ subpackage. Module cache lives under HOME; use a
-  # stable cache so sequential bootstrap runs are fast.
+  # Module cache lives under a stable path so sequential bootstrap
+  # runs are fast. Keep it out of the source tree.
   export GOCACHE="${GOCACHE:-/var/cache/agent-collab/gocache}"
   export GOMODCACHE="${GOMODCACHE:-/var/cache/agent-collab/gomodcache}"
   mkdir -p "$GOCACHE" "$GOMODCACHE"
@@ -137,7 +214,7 @@ log "building Go binaries from $PROJECT_ROOT/go"
       migrate) out_name="peer-inbox-migrate" ;;
     esac
     log "  go build ./cmd/$sub -> bin/$out_name"
-    go build -o "bin/$out_name" "./cmd/$sub"
+    "$GO_BIN" build -o "bin/$out_name" "./cmd/$sub"
   done
 )
 
