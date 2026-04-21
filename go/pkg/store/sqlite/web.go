@@ -101,6 +101,39 @@ type FetchMessagesOpts struct {
 	AsLabel string // cwd-mode + no pair narrowing: filter to conversations involving this label
 }
 
+// SessionAuth represents the identity derived from a bearer token on the
+// /api/send path (v3.3 Item 7). Label + CWD tell the request handler who
+// this caller is; PairKey (if set) scopes the token to a specific room.
+type SessionAuth struct {
+	Label   string
+	CWD     string
+	PairKey string
+}
+
+// SessionByToken looks up a session row by its auth_token. Returns
+// (nil, nil) when the token is unknown so callers distinguish "not found"
+// from "SQL error." Backed by idx_sessions_auth_token partial unique
+// index.
+func (s *SQLiteLocal) SessionByToken(ctx context.Context, token string) (*SessionAuth, error) {
+	if token == "" {
+		return nil, nil
+	}
+	var a SessionAuth
+	var pk sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT label, cwd, pair_key
+		FROM sessions
+		WHERE auth_token = ?`, token).Scan(&a.Label, &a.CWD, &pk)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("SessionByToken: %w", err)
+	}
+	a.PairKey = nullString(pk)
+	return &a, nil
+}
+
 // TerminateRoom marks a pair-key room as ended by writing terminated_at
 // + terminated_by into peer_rooms. Reversible via
 // `agent-collab peer reset --pair-key K`, so this is a soft-archive

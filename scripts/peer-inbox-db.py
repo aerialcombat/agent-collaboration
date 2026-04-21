@@ -97,8 +97,10 @@ PYTHON_MIN = (3, 9)
 # Item 4's 0005 migration that adds inbox.server_seq for per-room monotonic
 # ack ids (read-your-writes + idempotent retries). Bumped 5 → 6 for v3.3
 # Item 5's 0006 migration that adds the pending_outbound table for the
-# laptop-side federation queue.
-GOOSE_VERSION_REQUIRED = 6
+# laptop-side federation queue. Bumped 6 → 7 for v3.3 Item 7's 0007
+# migration that adds sessions.auth_token for per-session bearer auth on
+# /api/send.
+GOOSE_VERSION_REQUIRED = 7
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",
@@ -1671,7 +1673,8 @@ def cmd_session_register(args: argparse.Namespace) -> int:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT agent, role, last_seen_at, session_key, pair_key, receive_mode FROM sessions "
+            "SELECT agent, role, last_seen_at, session_key, pair_key, "
+            "receive_mode, auth_token FROM sessions "
             "WHERE cwd = ? AND label = ?",
             (str(cwd), args.label),
         ).fetchone()
@@ -1751,10 +1754,31 @@ def cmd_session_register(args: argparse.Namespace) -> int:
         else:
             receive_mode_value = "interactive"
 
+        # v3.3 Item 7: mint a bearer token the first time this session is
+        # registered. Idempotent refresh keeps the existing token (rotating
+        # would break remote callers that cached it); --force-rotate-token
+        # is a future flag if operators need manual rotation.
+        existing_token: Optional[str] = None
+        if row is not None:
+            try:
+                existing_token = row["auth_token"]
+            except (KeyError, IndexError):
+                existing_token = None
+        if existing_token:
+            auth_token = existing_token
+            token_rotated_at = None  # preserved from prior INSERT
+            token_is_new = False
+        else:
+            import secrets
+            import base64
+            auth_token = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+            token_rotated_at = now
+            token_is_new = True
+
         conn.execute(
             """
-            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at, receive_mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (cwd, label, agent, role, session_key, channel_socket, pair_key, started_at, last_seen_at, receive_mode, auth_token, auth_token_rotated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(cwd, label) DO UPDATE SET
               agent = excluded.agent,
               role = excluded.role,
@@ -1763,9 +1787,11 @@ def cmd_session_register(args: argparse.Namespace) -> int:
               pair_key = excluded.pair_key,
               started_at = excluded.started_at,
               last_seen_at = excluded.last_seen_at,
-              receive_mode = excluded.receive_mode
+              receive_mode = excluded.receive_mode,
+              auth_token = COALESCE(sessions.auth_token, excluded.auth_token),
+              auth_token_rotated_at = COALESCE(sessions.auth_token_rotated_at, excluded.auth_token_rotated_at)
             """,
-            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now, receive_mode_value),
+            (str(cwd), args.label, args.agent, args.role, session_key, channel_socket, pair_key, now, now, receive_mode_value, auth_token, token_rotated_at),
         )
 
         # v3.3 federation: if joining a pair_key-scoped room, ensure a
@@ -1827,6 +1853,18 @@ def cmd_session_register(args: argparse.Namespace) -> int:
         f"registered: {args.label} ({args.agent}, {args.role or 'peer'}) at {cwd} "
         f"[session_key={session_key_hash(session_key)}]{channel_note}{pair_note}"
     )
+    # v3.3 Item 7: surface the bearer token exactly once. Subsequent
+    # re-registers don't reprint — the operator is expected to have already
+    # copied it to the client host's environment. Use --force-rotate-token
+    # (future) if the token is lost.
+    if token_is_new:
+        print(f"auth_token: {auth_token}")
+        print(
+            f"  For cross-host sends from another peer: set an env var "
+            f"(e.g. AGENT_COLLAB_TOKEN_{self_host().upper()}) to this value "
+            f"and reference it from remotes.json as auth_token_env.",
+            file=sys.stderr,
+        )
     return EXIT_OK
 
 

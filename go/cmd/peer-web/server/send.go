@@ -66,14 +66,43 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.Close()
 
-	sendCWD, err := s.resolveSenderCWD(ctx, st, scope, body.From)
-	if err != nil {
-		code := http.StatusNotFound
-		if errors.Is(err, errSenderAutoRegisterFailed) {
-			code = http.StatusInternalServerError
+	// v3.3 Item 7: bearer-token auth for non-owner labels. "owner" remains
+	// the auto-register web-UI human (no token) per existing contract;
+	// every other caller must present a valid session token.
+	bearer := extractBearer(r.Header.Get("Authorization"))
+	var sendCWD string
+	if bearer != "" {
+		auth, lookupErr := st.SessionByToken(ctx, bearer)
+		if lookupErr != nil {
+			writeJSONError(w, http.StatusInternalServerError, "auth lookup: "+lookupErr.Error())
+			return
 		}
-		writeJSONError(w, code, err.Error())
+		if auth == nil {
+			writeJSONError(w, http.StatusUnauthorized, "invalid bearer token")
+			return
+		}
+		if body.From != "" && body.From != auth.Label {
+			writeJSONError(w, http.StatusForbidden,
+				fmt.Sprintf("token is bound to %q, not %q", auth.Label, body.From))
+			return
+		}
+		body.From = auth.Label
+		sendCWD = auth.CWD
+	} else if body.From != "owner" {
+		writeJSONError(w, http.StatusUnauthorized,
+			"bearer token required for non-owner senders "+
+				"(register the session on this host and set Authorization: Bearer <token>)")
 		return
+	} else {
+		sendCWD, err = s.resolveSenderCWD(ctx, st, scope, body.From)
+		if err != nil {
+			code := http.StatusNotFound
+			if errors.Is(err, errSenderAutoRegisterFailed) {
+				code = http.StatusInternalServerError
+			}
+			writeJSONError(w, code, err.Error())
+			return
+		}
 	}
 
 	script := s.resolvePeerInboxScript()
@@ -214,6 +243,23 @@ func (s *Server) resolvePeerInboxScript() string {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
+	}
+	return ""
+}
+
+// extractBearer parses `Authorization: Bearer <token>`. Case-insensitive
+// on the scheme. Returns "" if absent or malformed.
+func extractBearer(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return ""
+	}
+	const prefix = "bearer "
+	if len(h) < len(prefix) {
+		return ""
+	}
+	if strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
 	}
 	return ""
 }

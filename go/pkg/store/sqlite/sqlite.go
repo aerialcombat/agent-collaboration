@@ -46,8 +46,11 @@ const (
 	// schema check first. Bumped 4 → 5 for v3.3 Item 4's 0005 migration
 	// that adds inbox.server_seq for per-room monotonic ack ids. Bumped
 	// 5 → 6 for v3.3 Item 5's 0006 migration that adds pending_outbound
-	// for the laptop-side federation queue.
-	GooseVersionRequired = 6
+	// for the laptop-side federation queue. Bumped 6 → 7 for v3.3 Item 7's
+	// 0007 migration that adds sessions.auth_token — peer-web /api/send's
+	// bearer-token validation reads this column, so pre-0007 DBs must
+	// fail the schema check first.
+	GooseVersionRequired = 7
 
 	sessionsDirRel = ".agent-collab/sessions"
 )
