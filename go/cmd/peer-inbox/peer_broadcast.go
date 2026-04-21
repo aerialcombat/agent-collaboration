@@ -244,7 +244,7 @@ func runPeerBroadcast(args []string) int {
 		cohortArg = strings.Join(names, ",")
 	}
 
-	results, err := st.BroadcastCLI(ctx, sqlitestore.SendParams{
+	results, err := st.BroadcastLocal(ctx, sqlitestore.SendParams{
 		SenderCWD:   self.CWD,
 		SenderLabel: self.Label,
 		ToLabel:     cohortArg,

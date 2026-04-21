@@ -256,12 +256,18 @@ func (s *SQLiteLocal) Send(ctx context.Context, p SendParams) (SendResult, error
 // distinct room (pair_key mode coalesces to 1), per-row server_seq,
 // best-effort channel push per recipient. Returns one SendResult per
 // recipient (ordered by label).
+//
+// inbox.idempotency_key is intentionally NOT set on fan-out rows. Python
+// cmd_peer_broadcast (peer-inbox-db.py:2353-2362) omits it because the
+// inbox has a UNIQUE(workspace_id, idempotency_key) partial index
+// (migrations/sqlite/0001:48) — a single message_id reused across
+// recipients trips the constraint on the 2nd INSERT of any N>=2
+// broadcast. Callers needing retry safety should dedupe at the HTTP
+// layer (idempotency is a per-recipient concept that the broadcast
+// shape doesn't cleanly express).
 func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendResult, error) {
 	if p.Now.IsZero() {
 		p.Now = time.Now().UTC()
-	}
-	if p.MessageID == "" {
-		p.MessageID = NewULID(p.Now)
 	}
 	if err := validateBody(p.Body); err != nil {
 		return nil, err
@@ -323,33 +329,7 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 		}
 	}
 
-	// Idempotency: if this message_id was already broadcast, return the
-	// stored rows as dedup results (rare in broadcast, but keeps retry
-	// semantics uniform with unicast).
-	dedupRows, err := conn.QueryContext(ctx,
-		"SELECT to_label, server_seq FROM inbox WHERE idempotency_key = ? AND workspace_id = 'default'",
-		p.MessageID)
-	if err != nil {
-		return nil, fmt.Errorf("dedup probe: %w", err)
-	}
-	dedupMap := map[string]int64{}
-	for dedupRows.Next() {
-		var toLabel string
-		var seq int64
-		if err := dedupRows.Scan(&toLabel, &seq); err == nil {
-			dedupMap[toLabel] = seq
-		}
-	}
-	dedupRows.Close()
-
 	for _, r := range recipients {
-		if seq, ok := dedupMap[r.toLabel]; ok {
-			results = append(results, SendResult{
-				To: r.toLabel, MessageID: p.MessageID, ServerSeq: seq,
-				DedupHit: true, PushStatus: "deduped", Terminates: terminates,
-			})
-			continue
-		}
 		nextSeq, err := nextServerSeq(ctx, conn, r.roomKey)
 		if err != nil {
 			return nil, err
@@ -357,14 +337,14 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 		if _, err := conn.ExecContext(ctx, `
 			INSERT INTO inbox
 			  (to_cwd, to_label, from_cwd, from_label, body, created_at,
-			   room_key, idempotency_key, server_seq)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			   room_key, server_seq)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.toCWD, r.toLabel, p.SenderCWD, p.SenderLabel, p.Body, nowISO,
-			r.roomKey, p.MessageID, nextSeq); err != nil {
+			r.roomKey, nextSeq); err != nil {
 			return nil, fmt.Errorf("insert inbox: %w", err)
 		}
 		results = append(results, SendResult{
-			To: r.toLabel, MessageID: p.MessageID, ServerSeq: nextSeq,
+			To: r.toLabel, ServerSeq: nextSeq,
 			PushStatus: "pending", Terminates: terminates,
 		})
 	}
@@ -402,15 +382,21 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 	members, _ := s.roomMembers(ctx, p.SenderCWD, p.SenderLabel, p.PairKey)
 	mentions := resolveMentions(p.Body, p.Mentions, members, p.SenderLabel)
 	for i := range results {
-		if results[i].DedupHit {
-			continue
-		}
 		results[i].Mentions = mentions
 	}
-	for i, r := range recipients {
-		if results[i].DedupHit {
-			continue
+	// Push meta includes broadcast="1" on every fan-out push, plus a
+	// sorted cohort-labels list when the send is a multicast (ToLabel !=
+	// ""). Mirrors Python cmd_peer_broadcast:2395-2402.
+	var cohortLabels string
+	if p.ToLabel != "" && p.ToLabel != "@room" {
+		labels := make([]string, 0, len(recipients))
+		for _, rr := range recipients {
+			labels = append(labels, rr.toLabel)
 		}
+		sort.Strings(labels)
+		cohortLabels = strings.Join(labels, ",")
+	}
+	for i, r := range recipients {
 		if r.channelSocket == "" {
 			results[i].PushStatus = "no-channel"
 			continue
@@ -419,7 +405,10 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 			results[i].PushStatus = "no-channel"
 			continue
 		}
-		meta := map[string]string{"to": r.toLabel}
+		meta := map[string]string{"to": r.toLabel, "broadcast": "1"}
+		if cohortLabels != "" {
+			meta["cohort"] = cohortLabels
+		}
 		if len(mentions) > 0 {
 			meta["mentions"] = strings.Join(mentions, ",")
 		}
