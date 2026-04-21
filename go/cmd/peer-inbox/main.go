@@ -101,6 +101,12 @@ func run(args []string) int {
 		return runPeerReset(rest)
 	case "peer-queue":
 		return runPeerQueue(rest)
+	case "hook-log-session":
+		return runHookLogSession(rest)
+	case "session-adopt":
+		return runSessionAdopt(rest)
+	case "session-close":
+		return runSessionClose(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
@@ -122,9 +128,12 @@ func usage() {
   peer-list            [--cwd DIR] [--as LABEL] [--include-stale] [--json]
   peer-receive         [--cwd DIR] [--as LABEL] [--since ISO] [--format plain|json|hook|hook-json]
 
-v3.4 Phase 3 (in progress — currently stubbed; route to Python CLI):
+v3.4 Phase 3 landed (native Go):
   session-register, peer-send, peer-broadcast, peer-round,
   room-create, peer-reset, peer-queue.
+
+v3.4 Phase 4 edge verbs:
+  hook-log-session, session-adopt, session-close.
 
 Go parity for the Python daemon-mode verbs in scripts/peer-inbox-db.py.
 Exit 64 = usage error, 65 = Topic 3 fail-loud contract violation,

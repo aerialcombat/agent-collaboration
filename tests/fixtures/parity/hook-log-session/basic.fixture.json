@@ -1,0 +1,10 @@
+{
+  "description": "hook-log-session writes a timestamped line to the per-cwd log file and exits silently with 0. HOME is overridden to __CWD__ so both impls write into the scratch dir.",
+  "verb": "hook-log-session",
+  "args": ["--cwd", "__CWD__", "--session-id", "claude-session-abc123"],
+  "stdin": "",
+  "env": {
+    "HOME": "__CWD__"
+  },
+  "pre_sql": ""
+}

@@ -1,0 +1,11 @@
+{
+  "stdout": "adopted: alpha at __CWD__ [session_key=21d93e14b1d8c30d]\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT session_key FROM sessions WHERE cwd='__CWD__' AND label='alpha'",
+      "expected": "new-session-key-xyz"
+    }
+  ]
+}

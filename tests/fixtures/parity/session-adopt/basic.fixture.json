@@ -1,0 +1,10 @@
+{
+  "description": "session-adopt re-keys an existing row: session_key flips from old to new, stdout prints 'adopted: <label> at <cwd> [session_key=<sha16(new)>]'. Deterministic since the new key is supplied.",
+  "verb": "session-adopt",
+  "args": ["--cwd", "__CWD__", "--label", "alpha", "--session-id", "new-session-key-xyz"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at, receive_mode) VALUES ('__CWD__', 'alpha', 'claude', 'peer', 'old-session-key', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 'interactive');"
+}

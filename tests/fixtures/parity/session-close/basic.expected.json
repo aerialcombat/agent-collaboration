@@ -1,0 +1,11 @@
+{
+  "stdout": "closed: alpha at __CWD__\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM sessions WHERE label='alpha'",
+      "expected": "0"
+    }
+  ]
+}
