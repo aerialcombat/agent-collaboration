@@ -1,0 +1,14 @@
+{
+  "description": "peer-send unicast happy path: alice@__CWD__ sends --message 'hello' --to bob --message-id <fixed ULID> in a cwd-only degenerate room. Bob's last_seen_at is pinned far in the future so the staleness check + inference logic pass deterministically regardless of wall clock. No pair_key / peer_rooms rows means cwd-degenerate room accounting.",
+  "verb": "peer-send",
+  "args": [
+    "--cwd", "__CWD__",
+    "--as", "alice",
+    "--to", "bob",
+    "--message", "hello",
+    "--message-id", "01HXYZZZZZZZZZZZZZZZZZZZZZ"
+  ],
+  "stdin": "",
+  "env": {},
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alice', 'claude', 'peer', 'alice-key', NULL, '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z'); INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'bob', 'claude', 'peer', 'bob-key', NULL, '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z');"
+}

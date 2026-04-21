@@ -1,0 +1,19 @@
+{
+  "stdout": "sent to bob (no-channel) [deduped]\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox",
+      "expected": "1"
+    },
+    {
+      "query": "SELECT server_seq FROM inbox WHERE idempotency_key = '01HXDEDUPDEDUPDEDUPDEDUPDEDU'",
+      "expected": "7"
+    },
+    {
+      "query": "SELECT turn_count FROM peer_rooms WHERE room_key = 'cwd:__CWD__#alice+bob'",
+      "expected": "7"
+    }
+  ]
+}

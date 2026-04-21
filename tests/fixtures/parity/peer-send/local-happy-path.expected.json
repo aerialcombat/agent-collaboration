@@ -1,0 +1,19 @@
+{
+  "stdout": "sent to bob (no-channel)\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox",
+      "expected": "1"
+    },
+    {
+      "query": "SELECT to_cwd, to_label, from_cwd, from_label, body, room_key, idempotency_key, server_seq FROM inbox WHERE idempotency_key = '01HXYZZZZZZZZZZZZZZZZZZZZZ'",
+      "expected": "__CWD__|bob|__CWD__|alice|hello|cwd:__CWD__#alice+bob|01HXYZZZZZZZZZZZZZZZZZZZZZ|1"
+    },
+    {
+      "query": "SELECT room_key, turn_count, terminated_at FROM peer_rooms WHERE room_key = 'cwd:__CWD__#alice+bob'",
+      "expected": "cwd:__CWD__#alice+bob|1|"
+    }
+  ]
+}

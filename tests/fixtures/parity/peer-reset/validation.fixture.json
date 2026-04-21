@@ -1,0 +1,10 @@
+{
+  "description": "peer-reset with no scope flag is a usage error (EXIT_VALIDATION=3). Makes sure the mutex check precedes any DB I/O on both impls.",
+  "verb": "peer-reset",
+  "args": [],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": ""
+}

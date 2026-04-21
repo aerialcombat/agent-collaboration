@@ -1,0 +1,15 @@
+{
+  "stdout": "",
+  "stderr": "error: room 'test-foo' already exists\n",
+  "exit": 1,
+  "verify_sql": [
+    {
+      "query": "SELECT turn_count FROM peer_rooms WHERE pair_key='test-foo'",
+      "expected": "7"
+    },
+    {
+      "query": "SELECT home_host FROM peer_rooms WHERE pair_key='test-foo'",
+      "expected": "otherhost"
+    }
+  ]
+}

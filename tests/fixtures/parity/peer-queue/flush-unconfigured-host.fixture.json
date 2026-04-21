@@ -1,0 +1,11 @@
+{
+  "description": "peer-queue --flush with a queued row whose home_host has no remotes.json entry: Python skips it (no attempts bump) and counts it as still_failing. AGENT_COLLAB_REMOTES points at a non-existent path so load_remotes() returns the empty map on both impls.",
+  "verb": "peer-queue",
+  "args": ["--flush"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost",
+    "AGENT_COLLAB_REMOTES": "__CWD__/nope.json"
+  },
+  "pre_sql": "INSERT INTO pending_outbound (message_id, home_host, pair_key, from_label, to_label, body, created_at, attempts, last_attempt_at, last_error) VALUES ('01HZABC123', 'no-such-host', 'dusty-island-8114', 'backend', 'frontend', 'hello', '2030-01-01T00:00:00Z', 3, '2030-01-01T00:00:05Z', 'connection refused');"
+}

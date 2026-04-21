@@ -1,0 +1,10 @@
+{
+  "description": "room-create --pair-key against a pre-existing peer_rooms row fails loud with EXIT_LABEL_COLLISION (11) and leaves the row untouched.",
+  "verb": "room-create",
+  "args": ["--pair-key", "test-foo"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO peer_rooms (room_key, pair_key, turn_count, home_host) VALUES ('pk:test-foo', 'test-foo', 7, 'otherhost');"
+}

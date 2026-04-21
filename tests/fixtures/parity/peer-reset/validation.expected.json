@@ -1,0 +1,6 @@
+{
+  "stdout": "",
+  "stderr": "error: exactly one of --to, --pair-key, --room-key is required\n",
+  "exit": 3,
+  "verify_sql": []
+}

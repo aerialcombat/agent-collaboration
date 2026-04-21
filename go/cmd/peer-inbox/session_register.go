@@ -128,7 +128,7 @@ func runSessionRegister(args []string) int {
 	if err != nil {
 		if errors.Is(err, sqlitestore.ErrLabelCollision) {
 			fmt.Fprintf(os.Stderr, "session-register: %v\n", err)
-			return 11 // Python EXIT_LABEL_COLLISION
+			return 1 // Python EXIT_LABEL_COLLISION
 		}
 		if errors.Is(err, sqlitestore.ErrHomeHostImmutable) {
 			fmt.Fprintf(os.Stderr, "session-register: %v\n", err)

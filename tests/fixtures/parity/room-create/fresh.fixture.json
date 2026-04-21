@@ -1,0 +1,10 @@
+{
+  "description": "room-create --pair-key on a fresh slug mints a peer_rooms row home-stamped with AGENT_COLLAB_SELF_HOST, prints the 'created:' banner + join hint, and exits 0.",
+  "verb": "room-create",
+  "args": ["--pair-key", "fresh-demo"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": ""
+}

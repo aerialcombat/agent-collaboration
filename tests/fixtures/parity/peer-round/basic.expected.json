@@ -1,0 +1,19 @@
+{
+  "stdout": "broadcast to 2 peer(s): beta (no-channel), gamma (no-channel)\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM inbox",
+      "expected": "2"
+    },
+    {
+      "query": "SELECT to_label, body FROM inbox ORDER BY to_label",
+      "expected": "beta|[Round 1] please open\ngamma|[Round 1] please open"
+    },
+    {
+      "query": "SELECT turn_count FROM peer_rooms WHERE room_key='pk:test-room'",
+      "expected": "1"
+    }
+  ]
+}

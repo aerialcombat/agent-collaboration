@@ -1,0 +1,11 @@
+{
+  "description": "peer-broadcast --to beta limits delivery to a single peer despite a three-member room. Output kind becomes 'multicast' (vs 'broadcast'). Only one inbox row is inserted; the room still bumps exactly once.",
+  "verb": "peer-broadcast",
+  "args": ["--cwd", "__CWD__", "--as", "alpha", "--to", "beta", "--message", "targeted"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost",
+    "PEER_INBOX_PENDING_DIR": "__CWD__/no-channels"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at, receive_mode) VALUES ('__CWD__', 'alpha', 'claude', 'peer', 'sk-alpha', 'test-room', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z', 'interactive'); INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at, receive_mode) VALUES ('__CWD__', 'beta',  'claude', 'peer', 'sk-beta',  'test-room', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z', 'interactive'); INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at, receive_mode) VALUES ('__CWD__', 'gamma', 'claude', 'peer', 'sk-gamma', 'test-room', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z', 'interactive');"
+}

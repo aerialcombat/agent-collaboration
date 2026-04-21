@@ -1,0 +1,19 @@
+{
+  "stdout": "created: testhost:fresh-demo (empty room)\n  join: agent-collab session register --pair-key fresh-demo --agent <claude|codex|gemini|pi>\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT room_key FROM peer_rooms WHERE pair_key='fresh-demo'",
+      "expected": "pk:fresh-demo"
+    },
+    {
+      "query": "SELECT home_host FROM peer_rooms WHERE pair_key='fresh-demo'",
+      "expected": "testhost"
+    },
+    {
+      "query": "SELECT turn_count FROM peer_rooms WHERE pair_key='fresh-demo'",
+      "expected": "0"
+    }
+  ]
+}

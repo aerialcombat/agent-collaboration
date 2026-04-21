@@ -1,0 +1,14 @@
+{
+  "description": "peer-send retry with a message-id that already has an inbox row must short-circuit via the dedup probe: no new insert, same server_seq returned, plain output carries the ' [deduped]' suffix. Pre-seed includes one inbox row with server_seq=7 and idempotency_key='01HXDEDUPDEDUPDEDUPDEDUPDEDU' plus a matching peer_rooms turn_count=7 so the state post-retry is identical to pre-state.",
+  "verb": "peer-send",
+  "args": [
+    "--cwd", "__CWD__",
+    "--as", "alice",
+    "--to", "bob",
+    "--message", "same message",
+    "--message-id", "01HXDEDUPDEDUPDEDUPDEDUPDEDU"
+  ],
+  "stdin": "",
+  "env": {},
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'alice', 'claude', 'peer', 'alice-key', NULL, '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z'); INSERT INTO sessions (cwd, label, agent, role, session_key, pair_key, started_at, last_seen_at) VALUES ('__CWD__', 'bob', 'claude', 'peer', 'bob-key', NULL, '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z'); INSERT INTO inbox (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key, workspace_id, idempotency_key, server_seq) VALUES ('__CWD__', 'bob', '__CWD__', 'alice', 'same message', '2099-01-01T00:00:00Z', 'cwd:__CWD__#alice+bob', 'default', '01HXDEDUPDEDUPDEDUPDEDUPDEDU', 7); INSERT INTO peer_rooms (room_key, pair_key, turn_count, terminated_at, terminated_by) VALUES ('cwd:__CWD__#alice+bob', NULL, 7, NULL, NULL);"
+}

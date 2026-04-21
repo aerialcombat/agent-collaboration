@@ -1,0 +1,15 @@
+{
+  "stdout": "flush: flushed=0 dropped_ttl=0 still_failing=1\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT attempts FROM pending_outbound WHERE id=1",
+      "expected": "3"
+    },
+    {
+      "query": "SELECT COUNT(*) FROM pending_outbound",
+      "expected": "1"
+    }
+  ]
+}

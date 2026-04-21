@@ -1,0 +1,11 @@
+{
+  "stdout": "reset: pair demo-room\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM peer_rooms WHERE room_key='pk:demo-room'",
+      "expected": "0"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "description": "peer-queue with no --show / --flush defaults to --show; with an empty pending_outbound table the verb prints the '(no queued sends)' sentinel and exits 0.",
+  "verb": "peer-queue",
+  "args": [],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": ""
+}

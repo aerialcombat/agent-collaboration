@@ -1,0 +1,10 @@
+{
+  "description": "peer-reset --pair-key on a room with no peer_rooms row prints the 'note: ... had no room state' hint and exits 0 (idempotent escape hatch).",
+  "verb": "peer-reset",
+  "args": ["--pair-key", "no-room"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": ""
+}

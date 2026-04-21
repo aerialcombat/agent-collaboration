@@ -1,0 +1,10 @@
+{
+  "description": "peer-reset --pair-key against an existing peer_rooms row deletes the row and prints 'reset: pair <key>'.",
+  "verb": "peer-reset",
+  "args": ["--pair-key", "demo-room"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO peer_rooms (room_key, pair_key, turn_count, home_host) VALUES ('pk:demo-room', 'demo-room', 5, 'testhost');"
+}
