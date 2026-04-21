@@ -20,6 +20,7 @@ import (
 // "no hint" — server is multi-room.
 type Config struct {
 	Port        int
+	Bind        string // bind address; "" → "127.0.0.1"
 	PairKey     string
 	OnlyPairKey string
 	CWD         string
@@ -58,8 +59,12 @@ func New(cfg Config) (*Server, error) {
 		static: sub,
 	}
 	s.registerRoutes()
+	bind := cfg.Bind
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
 	s.http = &http.Server{
-		Addr:              net.JoinHostPort("127.0.0.1", itoa(cfg.Port)),
+		Addr:              net.JoinHostPort(bind, itoa(cfg.Port)),
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}

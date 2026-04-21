@@ -43,6 +43,7 @@ func run(args []string) int {
 
 	var (
 		port        = fs.Int("port", 8787, "HTTP port to bind (default 8787)")
+		bind        = fs.String("bind", "127.0.0.1", "bind address; use 0.0.0.0 or a specific iface IP for cross-machine federation")
 		pairKey     = fs.String("pair-key", "", "deep-link to a specific room on first visit; server stays multi-room")
 		onlyPairKey = fs.String("only-pair-key", "", "lock server to a single pair_key; reject requests for other scopes")
 		cwdFlag     = fs.String("cwd", "", "cwd-mode deep-link (optional)")
@@ -60,6 +61,7 @@ func run(args []string) int {
 
 	cfg := server.Config{
 		Port:        *port,
+		Bind:        *bind,
 		PairKey:     *pairKey,
 		OnlyPairKey: *onlyPairKey,
 		CWD:         *cwdFlag,
@@ -77,7 +79,13 @@ func run(args []string) int {
 	defer stop()
 
 	fmt.Fprintf(os.Stderr,
-		"peer-web (go): http://127.0.0.1:%d  (Ctrl-C to stop)\n", *port)
+		"peer-web (go): http://%s:%d  (Ctrl-C to stop)\n", *bind, *port)
+	if *bind == "0.0.0.0" || (*bind != "" && *bind != "127.0.0.1" && *bind != "localhost") {
+		fmt.Fprintln(os.Stderr,
+			"peer-web: WARNING — bound to a non-loopback address. "+
+				"Traffic is plain HTTP; only expose over a trusted network "+
+				"(LAN, SSH tunnel, VPN, or Tailscale) until TLS lands.")
+	}
 
 	if err := srv.Serve(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "peer-web: serve: %v\n", err)
@@ -96,12 +104,16 @@ func run(args []string) int {
 const usageText = `usage: peer-web [flags]
 
   --port N              bind port (default 8787)
+  --bind ADDR           bind address (default 127.0.0.1; use 0.0.0.0 or an
+                        interface IP to accept federation traffic from peers
+                        on other machines — requires a trusted network
+                        since the server speaks plain HTTP only)
   --pair-key KEY        deep-link to a pair-key room on first visit
   --only-pair-key KEY   lock server to one pair-key room (rejects other scopes)
   --cwd PATH            cwd-mode deep-link
   --as LABEL            viewer label hint
 
-Serves http://127.0.0.1:PORT with a multi-room index + per-room detail.
+Serves http://<bind>:PORT with a multi-room index + per-room detail.
 Go port of the Python cmd_peer_web; reads the shared ~/.agent-collab/
 sessions.db. Python version stays as fallback; dispatch via
 AGENT_COLLAB_WEB_IMPL=python forces the Python path.

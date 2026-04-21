@@ -23,6 +23,7 @@ PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
 PEER_INBOX_DAEMONS_DIR="$PEER_INBOX_HOME/daemons"
 PEER_INBOX_DAEMON_BIN="$BIN_DIR/agent-collab-daemon"
 PEER_INBOX_GO_CLI="$BIN_DIR/peer-inbox"
+PEER_WEB_GO_BIN="$BIN_DIR/peer-web"
 PEER_INBOX_DAEMON_EXAMPLE_CFG="$PEER_INBOX_DAEMONS_DIR/example.json.disabled"
 PEER_INBOX_DAEMON_PI_EXAMPLE_CFG="$PEER_INBOX_DAEMONS_DIR/example-pi.json.disabled"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
@@ -1047,6 +1048,7 @@ case "$MODE" in
     # features degrade).
     install_go_binary "$PEER_INBOX_DAEMON_BIN" "daemon" "agent-collab-daemon"
     install_go_binary "$PEER_INBOX_GO_CLI" "peer-inbox" "peer-inbox Go CLI"
+    install_go_binary "$PEER_WEB_GO_BIN" "peer-web" "peer-web Go server"
     install_daemon_config_dir
 
     # Slash commands: /agent-collab and /peer in Claude Code.
@@ -1122,6 +1124,7 @@ case "$MODE" in
     # — uninstall mirrors the sessions.db treatment (user data stays).
     remove_go_binary "$PEER_INBOX_DAEMON_BIN"
     remove_go_binary "$PEER_INBOX_GO_CLI"
+    remove_go_binary "$PEER_WEB_GO_BIN"
     remove_daemon_config_dir
     for cmd in "${SLASH_COMMANDS[@]}"; do
       remove_slash_command "$CLAUDE_COMMANDS_DIR/$cmd"
