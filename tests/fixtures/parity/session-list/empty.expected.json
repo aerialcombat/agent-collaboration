@@ -1,0 +1,11 @@
+{
+  "stdout": "no sessions\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM sessions",
+      "expected": "0"
+    }
+  ]
+}

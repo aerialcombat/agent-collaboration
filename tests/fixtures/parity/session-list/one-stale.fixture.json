@@ -1,0 +1,10 @@
+{
+  "description": "session-list --all-cwds --include-stale surfaces a 6-year-old row with deterministic output (timestamps in the far past always bin as 'stale' regardless of wall clock)",
+  "verb": "session-list",
+  "args": ["--all-cwds", "--include-stale"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": "INSERT INTO sessions (cwd, label, agent, role, session_key, started_at, last_seen_at) VALUES ('/tmp/fixture-cwd', 'ghost', 'claude', 'peer', 'ghost-sess-001', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');"
+}

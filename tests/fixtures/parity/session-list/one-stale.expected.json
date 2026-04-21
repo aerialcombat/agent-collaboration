@@ -1,0 +1,15 @@
+{
+  "stdout": "ghost                claude   peer         stale   last-seen 2020-01-01T00:00:00Z  cwd=/tmp/fixture-cwd\n",
+  "stderr": "",
+  "exit": 0,
+  "verify_sql": [
+    {
+      "query": "SELECT COUNT(*) FROM sessions",
+      "expected": "1"
+    },
+    {
+      "query": "SELECT label FROM sessions",
+      "expected": "ghost"
+    }
+  ]
+}

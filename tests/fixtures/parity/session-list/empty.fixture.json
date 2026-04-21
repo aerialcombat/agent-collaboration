@@ -1,0 +1,10 @@
+{
+  "description": "session-list on empty DB prints 'no sessions' and exits 0",
+  "verb": "session-list",
+  "args": ["--all-cwds"],
+  "stdin": "",
+  "env": {
+    "AGENT_COLLAB_SELF_HOST": "testhost"
+  },
+  "pre_sql": ""
+}
