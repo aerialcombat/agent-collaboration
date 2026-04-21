@@ -29,6 +29,9 @@ type webStore interface {
 	ClearChannelSocket(ctx context.Context, cwd, label string) error
 	TerminateRoom(ctx context.Context, pairKey, by string) error
 	SessionByToken(ctx context.Context, token string) (*sqlitestore.SessionAuth, error)
+	Send(ctx context.Context, params sqlitestore.SendParams) (sqlitestore.SendResult, error)
+	BroadcastLocal(ctx context.Context, params sqlitestore.SendParams) ([]sqlitestore.SendResult, error)
+	RegisterOwner(ctx context.Context, params sqlitestore.RegisterOwnerParams) error
 	Close() error
 }
 

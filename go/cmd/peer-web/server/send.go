@@ -8,26 +8,26 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
 )
 
-// handleSend wires the composer send path. Matches the Python
-// cmd_peer_web /send handler at scripts/peer-inbox-db.py byte-for-
-// byte on happy paths:
-//   1. Parse POST body {from, to, body}.
-//   2. Resolve sender's cwd from the sessions table (by pair_key+label
-//      in pair-key mode, cwd+label in cwd mode).
-//   3. Auto-register "owner" on first send in pair-key mode (the human
-//      in the loop). Other unregistered senders are rejected.
-//   4. Shell out to `peer-inbox-db.py peer-send` / `peer-broadcast`.
-//      Reusing the Python CLI gives us identical validation, room-cap,
-//      termination, and push semantics for free — documented rationale
-//      lives at plans/v3.2-frontend-go-rewrite-scoping.md §4 Item 6.
+// handleSend is the composer send path. v3.4 Phase 1 ported this to a
+// native Go call into the sqlite store — no more python3 shell-out.
+// Contract mirrors the prior Python-backed version byte-for-byte on
+// happy paths + error codes:
+//
+//  1. Parse POST body {from, to, body, message_id}.
+//  2. Bearer-token auth (v3.3 Item 7): non-owner senders must present
+//     a valid Authorization: Bearer <token>; wrong label = 403.
+//  3. "owner" is the one tokenless path — auto-register on first send
+//     in pair-key mode, same as before.
+//  4. Dispatch to store.Send (unicast) or store.BroadcastLocal
+//     (to=="" or "@room").
+//  5. Map typed errors to HTTP codes (peer-not-found 404,
+//     peer-offline/turn-cap/terminated 400).
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -43,7 +43,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		From      string `json:"from"`
 		To        string `json:"to"`
 		Body      string `json:"body"`
-		MessageID string `json:"message_id"` // v3.3 client-generated ULID for idempotent retry
+		MessageID string `json:"message_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad json: "+err.Error())
@@ -66,12 +66,10 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.Close()
 
-	// v3.3 Item 7: bearer-token auth for non-owner labels. "owner" remains
-	// the auto-register web-UI human (no token) per existing contract;
-	// every other caller must present a valid session token.
 	bearer := extractBearer(r.Header.Get("Authorization"))
 	var sendCWD string
-	if bearer != "" {
+	switch {
+	case bearer != "":
 		auth, lookupErr := st.SessionByToken(ctx, bearer)
 		if lookupErr != nil {
 			writeJSONError(w, http.StatusInternalServerError, "auth lookup: "+lookupErr.Error())
@@ -88,12 +86,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		body.From = auth.Label
 		sendCWD = auth.CWD
-	} else if body.From != "owner" {
+	case body.From != "owner":
 		writeJSONError(w, http.StatusUnauthorized,
 			"bearer token required for non-owner senders "+
 				"(register the session on this host and set Authorization: Bearer <token>)")
 		return
-	} else {
+	default:
 		sendCWD, err = s.resolveSenderCWD(ctx, st, scope, body.From)
 		if err != nil {
 			code := http.StatusNotFound
@@ -105,71 +103,83 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	script := s.resolvePeerInboxScript()
-	if script == "" {
-		writeJSONError(w, http.StatusServiceUnavailable,
-			"peer-inbox-db.py not found (checked $AGENT_COLLAB_PEER_INBOX_DB_SCRIPT, script-sibling, ~/.agent-collab/scripts/)")
+	params := sqlitestore.SendParams{
+		SenderCWD:   sendCWD,
+		SenderLabel: body.From,
+		ToLabel:     body.To,
+		Body:        body.Body,
+		MessageID:   body.MessageID,
+		PairKey:     scope.pairKey,
+	}
+
+	// Broadcast when To is empty or the explicit "@room" sentinel.
+	if body.To == "" || body.To == "@room" {
+		params.ToLabel = ""
+		results, err := st.BroadcastLocal(ctx, params)
+		if err != nil {
+			writeJSONError(w, mapSendError(err), err.Error())
+			return
+		}
+		writeBroadcastJSON(w, results)
 		return
 	}
 
-	verb := "peer-send"
-	args := []string{"--cwd", sendCWD, "--as", body.From, "--to", body.To, "--message-stdin", "--json"}
-	if body.MessageID != "" {
-		args = append(args, "--message-id", body.MessageID)
+	result, err := st.Send(ctx, params)
+	if err != nil {
+		writeJSONError(w, mapSendError(err), err.Error())
+		return
 	}
-	broadcast := false
-	if body.To == "" || body.To == "@room" {
-		verb = "peer-broadcast"
-		args = []string{"--cwd", sendCWD, "--as", body.From, "--message-stdin"}
-		broadcast = true
-	}
+	writeSendJSON(w, result)
+}
 
-	cmd := exec.CommandContext(ctx, "python3", append([]string{script, verb}, args...)...)
-	cmd.Stdin = strings.NewReader(body.Body)
-	stdout, err := cmd.Output()
-	ok := err == nil
-	var stderr string
-	var exitCode int
-	if exitErr, ok2 := err.(*exec.ExitError); ok2 {
-		stderr = string(exitErr.Stderr)
-		exitCode = exitErr.ExitCode()
-	} else if err != nil {
-		stderr = err.Error()
-		exitCode = -1
+// mapSendError mirrors Python cmd_peer_send's exit codes in HTTP shape.
+// EXIT_NOT_FOUND → 404, EXIT_PEER_OFFLINE / EXIT_VALIDATION → 400.
+func mapSendError(err error) int {
+	switch {
+	case errors.Is(err, sqlitestore.ErrPeerNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, sqlitestore.ErrPeerOffline),
+		errors.Is(err, sqlitestore.ErrRoomTerminated),
+		errors.Is(err, sqlitestore.ErrTurnCapExceeded),
+		errors.Is(err, sqlitestore.ErrBodyTooLarge),
+		errors.Is(err, sqlitestore.ErrEmptyBody):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
 	}
+}
 
-	code := http.StatusOK
-	if !ok {
-		code = http.StatusBadRequest
-	}
+func writeSendJSON(w http.ResponseWriter, r sqlitestore.SendResult) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"to":          r.To,
+		"message_id":  r.MessageID,
+		"server_seq":  r.ServerSeq,
+		"push_status": r.PushStatus,
+		"dedup_hit":   r.DedupHit,
+		"terminates":  r.Terminates,
+		"mentions":    r.Mentions,
+	})
+}
 
-	resp := map[string]any{
-		"ok":     ok,
-		"exit":   exitCode,
-		"stdout": trimTrailingNewline(string(stdout)),
-		"stderr": trimTrailingNewline(stderr),
+func writeBroadcastJSON(w http.ResponseWriter, results []sqlitestore.SendResult) {
+	out := make([]map[string]any, 0, len(results))
+	for _, r := range results {
+		out = append(out, map[string]any{
+			"to":          r.To,
+			"message_id":  r.MessageID,
+			"server_seq":  r.ServerSeq,
+			"push_status": r.PushStatus,
+			"dedup_hit":   r.DedupHit,
+			"terminates":  r.Terminates,
+			"mentions":    r.Mentions,
+		})
 	}
-	// v3.3 Item 4: unicast peer-send emits structured JSON on stdout when
-	// invoked with --json. Surface message_id + server_seq at the top
-	// level of the HTTP response so HTTP retries can dedup + read-your-
-	// writes. Broadcast is not scoped to the JSON contract in v3.3 (N
-	// recipients → N (message_id, seq) pairs; shape TBD) so we leave its
-	// response payload shape as stdout-echo only.
-	if ok && !broadcast {
-		var sendResult struct {
-			MessageID  string `json:"message_id"`
-			ServerSeq  int64  `json:"server_seq"`
-			DedupHit   bool   `json:"dedup_hit"`
-			PushStatus string `json:"push_status"`
-		}
-		if jerr := json.Unmarshal(stdout, &sendResult); jerr == nil {
-			resp["message_id"] = sendResult.MessageID
-			resp["server_seq"] = sendResult.ServerSeq
-			resp["dedup_hit"] = sendResult.DedupHit
-			resp["push_status"] = sendResult.PushStatus
-		}
-	}
-	writeJSON(w, code, resp)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"broadcast":  true,
+		"recipients": out,
+	})
 }
 
 var errSenderAutoRegisterFailed = errors.New("auto-register owner failed")
@@ -197,54 +207,18 @@ func (s *Server) resolveSenderCWD(
 		wd, _ := os.Getwd()
 		ownerCWD = wd
 	}
-	script := s.resolvePeerInboxScript()
-	if script == "" {
-		return "", errSenderAutoRegisterFailed
+	if err := st.RegisterOwner(ctx, sqlitestore.RegisterOwnerParams{
+		CWD:     ownerCWD,
+		PairKey: scope.pairKey,
+	}); err != nil {
+		return "", fmt.Errorf("%w: %v", errSenderAutoRegisterFailed, err)
 	}
-	cmd := exec.CommandContext(ctx, "python3", script, "session-register",
-		"--cwd", ownerCWD,
-		"--label", "owner",
-		"--agent", "human",
-		"--role", "owner",
-		"--pair-key", scope.pairKey,
-		"--session-key", "owner-web-"+scope.pairKey,
-		"--force")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("%w: %v: %s", errSenderAutoRegisterFailed, err, string(out))
-	}
-	// Scrub stale channel_socket — Python's register walks the process
-	// tree and may bind an ancestor socket to "owner"; owner is human
-	// and has no channel listener. Python does the same via sqlite3
-	// directly; we replicate.
+	// Scrub stale channel_socket — owner is human and has no channel
+	// listener. RegisterOwner already nulls it, but if a prior row came
+	// from Python's register (which walks the process tree and may bind
+	// an ancestor socket), ClearChannelSocket is a safety net.
 	_ = st.ClearChannelSocket(ctx, ownerCWD, "owner")
 	return ownerCWD, nil
-}
-
-func (s *Server) resolvePeerInboxScript() string {
-	if v := os.Getenv("AGENT_COLLAB_PEER_INBOX_DB_SCRIPT"); v != "" {
-		if _, err := os.Stat(v); err == nil {
-			return v
-		}
-	}
-	exe, err := os.Executable()
-	if err == nil {
-		dir := filepath.Dir(exe)
-		// $repo/go/bin/peer-web → $repo/scripts/peer-inbox-db.py
-		candidate := filepath.Join(dir, "..", "..", "scripts", "peer-inbox-db.py")
-		if _, err := os.Stat(candidate); err == nil {
-			abs, _ := filepath.Abs(candidate)
-			return abs
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		candidate := filepath.Join(home, ".agent-collab", "scripts", "peer-inbox-db.py")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	return ""
 }
 
 // extractBearer parses `Authorization: Bearer <token>`. Case-insensitive
@@ -265,19 +239,5 @@ func extractBearer(h string) string {
 }
 
 func trimLabel(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\n') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t' || s[len(s)-1] == '\n') {
-		s = s[:len(s)-1]
-	}
-	return s
+	return strings.TrimSpace(s)
 }
-
-func trimTrailingNewline(s string) string {
-	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == '\r') {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
