@@ -84,8 +84,20 @@ log "updating apt + installing runtime deps"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   ca-certificates curl git python3 python3-pip \
-  sqlite3 nodejs npm \
+  sqlite3 \
   build-essential
+
+# Node 20 via NodeSource — Ubuntu's default nodejs is 18, too old for pi
+# (uses Node 20+ regex flags in pi-tui). NodeSource adds its apt repo,
+# then we install nodejs from there.
+if ! command -v node >/dev/null 2>&1 || [[ "$(node --version 2>/dev/null | tr -d 'v' | cut -d. -f1)" -lt 20 ]]; then
+  log "installing Node 20 via NodeSource"
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+  apt-get install -y nodejs >/dev/null 2>&1
+  log "  node $(node --version) / npm $(npm --version)"
+else
+  log "node $(node --version) OK"
+fi
 
 # ---- 2. Go toolchain ------------------------------------------------------
 
@@ -231,12 +243,33 @@ for bin in "${BINARIES[@]}"; do
   fi
 done
 
-# ---- 6. Per-user install via install-global-protocol ---------------------
+# ---- 6. Agent CLIs via npm ------------------------------------------------
+
+# claude-code + pi CLIs (+ pi's ecosystem) installed globally so the
+# daemon can spawn them from /usr/local/bin. These are the runtime
+# peers the daemon manages — install-global-protocol only configures
+# their dotfiles; the binaries have to be present separately.
+log "installing agent CLIs globally (claude-code, pi, pi-subagents, pi-zai-glm)"
+npm install -g --silent \
+  @anthropic-ai/claude-code \
+  @mariozechner/pi-coding-agent \
+  pi-subagents \
+  pi-zai-glm 2>&1 | grep -vE '^npm WARN EBADENGINE|npm WARN deprecated' | tail -5 || true
+for cli in claude pi; do
+  loc="$(command -v "$cli" 2>/dev/null || true)"
+  if [[ -n "$loc" ]]; then
+    log "  $cli → $loc"
+  else
+    log "  warning: $cli not found post-install (check npm global prefix)"
+  fi
+done
+
+# ---- 7. Per-user install via install-global-protocol ---------------------
 
 log "running install-global-protocol as $AC_USER"
 sudo -u "$AC_USER" -H bash -lc "cd $PROJECT_ROOT && ./scripts/install-global-protocol"
 
-# ---- 7. /etc/agent-collab/env template -----------------------------------
+# ---- 8. /etc/agent-collab/env template -----------------------------------
 
 install -d -m 750 -o root -g "$AC_USER" "$ENV_TARGET_DIR"
 if [[ -f "$ENV_SRC" ]]; then
@@ -249,7 +282,7 @@ if [[ ! -f "$ENV_TARGET_REAL" ]]; then
   log "note: $ENV_TARGET_REAL does not exist yet. copy from env.example and fill in secrets before starting services."
 fi
 
-# ---- 8. systemd units ----------------------------------------------------
+# ---- 9. systemd units ----------------------------------------------------
 
 if [[ -d "$SYSTEMD_SRC_DIR" ]]; then
   log "installing systemd units"
@@ -262,7 +295,7 @@ else
   log "warning: $SYSTEMD_SRC_DIR not found — systemd units not installed"
 fi
 
-# ---- 9. Next steps -------------------------------------------------------
+# ---- 10. Next steps -------------------------------------------------------
 
 cat <<EOF
 
