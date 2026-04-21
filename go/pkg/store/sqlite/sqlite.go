@@ -40,8 +40,12 @@ const (
 	// for the Topic 3 v0.1 (Arch D) 0003 migration that adds
 	// sessions.daemon_cli_session_id; daemon's resume helpers read this
 	// column at spawn time, so pre-0003 DBs must fail-open here before
-	// reaching the SQL.
-	GooseVersionRequired = 3
+	// reaching the SQL. Bumped 3 → 4 for v3.3 symmetric-federation's 0004
+	// migration that adds peer_rooms.home_host; peer-web's /rooms.json and
+	// routing helpers consult the column, so pre-0004 DBs must fail the
+	// schema check first. Bumped 4 → 5 for v3.3 Item 4's 0005 migration
+	// that adds inbox.server_seq for per-room monotonic ack ids.
+	GooseVersionRequired = 5
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

@@ -82,10 +82,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verb := "peer-send"
-	args := []string{"--cwd", sendCWD, "--as", body.From, "--to", body.To, "--message-stdin"}
+	args := []string{"--cwd", sendCWD, "--as", body.From, "--to", body.To, "--message-stdin", "--json"}
+	broadcast := false
 	if body.To == "" || body.To == "@room" {
 		verb = "peer-broadcast"
 		args = []string{"--cwd", sendCWD, "--as", body.From, "--message-stdin"}
+		broadcast = true
 	}
 
 	cmd := exec.CommandContext(ctx, "python3", append([]string{script, verb}, args...)...)
@@ -106,12 +108,34 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		code = http.StatusBadRequest
 	}
-	writeJSON(w, code, map[string]any{
+
+	resp := map[string]any{
 		"ok":     ok,
 		"exit":   exitCode,
 		"stdout": trimTrailingNewline(string(stdout)),
 		"stderr": trimTrailingNewline(stderr),
-	})
+	}
+	// v3.3 Item 4: unicast peer-send emits structured JSON on stdout when
+	// invoked with --json. Surface message_id + server_seq at the top
+	// level of the HTTP response so HTTP retries can dedup + read-your-
+	// writes. Broadcast is not scoped to the JSON contract in v3.3 (N
+	// recipients → N (message_id, seq) pairs; shape TBD) so we leave its
+	// response payload shape as stdout-echo only.
+	if ok && !broadcast {
+		var sendResult struct {
+			MessageID  string `json:"message_id"`
+			ServerSeq  int64  `json:"server_seq"`
+			DedupHit   bool   `json:"dedup_hit"`
+			PushStatus string `json:"push_status"`
+		}
+		if jerr := json.Unmarshal(stdout, &sendResult); jerr == nil {
+			resp["message_id"] = sendResult.MessageID
+			resp["server_seq"] = sendResult.ServerSeq
+			resp["dedup_hit"] = sendResult.DedupHit
+			resp["push_status"] = sendResult.PushStatus
+		}
+	}
+	writeJSON(w, code, resp)
 }
 
 var errSenderAutoRegisterFailed = errors.New("auto-register owner failed")

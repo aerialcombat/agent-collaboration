@@ -50,9 +50,13 @@ type WebPair struct {
 
 // WebRoom is the pair-key-mode room aggregate. Members is ordered by
 // label (ASC); activity is the max (freshest) across members, with
-// "terminated" overriding when peer_rooms flags it.
+// "terminated" overriding when peer_rooms flags it. HomeHost carries
+// the v3.3-federation home-host label read from peer_rooms.home_host;
+// rendered alongside PairKey as `<HomeHost>:<PairKey>` at the display
+// layer.
 type WebRoom struct {
 	PairKey      string
+	HomeHost     string
 	Key          string
 	Activity     string
 	Total        int64
@@ -260,11 +264,12 @@ func (s *SQLiteLocal) FetchRooms(ctx context.Context, pairKey string) ([]WebRoom
 		turnCount    sql.NullInt64
 		terminatedAt sql.NullString
 		terminatedBy sql.NullString
+		homeHost     sql.NullString
 	)
 	err = s.db.QueryRowContext(ctx, `
-		SELECT turn_count, terminated_at, terminated_by
+		SELECT turn_count, terminated_at, terminated_by, home_host
 		FROM peer_rooms WHERE room_key = ?`, roomKey).Scan(
-		&turnCount, &terminatedAt, &terminatedBy)
+		&turnCount, &terminatedAt, &terminatedBy, &homeHost)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("FetchRooms: peer_rooms: %w", err)
 	}
@@ -279,6 +284,7 @@ func (s *SQLiteLocal) FetchRooms(ctx context.Context, pairKey string) ([]WebRoom
 
 	return []WebRoom{{
 		PairKey:      pairKey,
+		HomeHost:     nullString(homeHost),
 		Key:          pairKey,
 		Activity:     activity,
 		Total:        total.Int64,

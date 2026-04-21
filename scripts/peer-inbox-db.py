@@ -91,8 +91,12 @@ PYTHON_MIN = (3, 9)
 # v0.1 (Arch D) 0003 migration that adds sessions.daemon_cli_session_id for
 # CLI-native session-resume identity persistence. Daemon's session-resume
 # verb references the column, so pre-0003 DBs must fail the schema check
-# before the query runs.
-GOOSE_VERSION_REQUIRED = 3
+# before the query runs. Bumped 3 → 4 for v3.3 symmetric-federation's 0004
+# migration that adds peer_rooms.home_host so rooms declare which host owns
+# writes; display + CLI routing consult the column. Bumped 4 → 5 for v3.3
+# Item 4's 0005 migration that adds inbox.server_seq for per-room monotonic
+# ack ids (read-your-writes + idempotent retries).
+GOOSE_VERSION_REQUIRED = 5
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",
@@ -259,6 +263,66 @@ def validate_pair_key(key: str) -> None:
         )
 
 
+# Host label accepts the same alphabet as a pair key (lowercase alnum + dash).
+# This keeps `<host>:<pair_key>` unambiguously parseable on a single colon.
+HOST_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def validate_host_label(host: str) -> None:
+    if not HOST_LABEL_RE.match(host):
+        err(
+            f"invalid host label {host!r} (allowed: [a-z0-9][a-z0-9-]{{0,63}})",
+            EXIT_VALIDATION,
+        )
+
+
+def self_host() -> str:
+    """Return this host's federation label.
+
+    Resolution order per plans/v3.3-symmetric-federation-scoping.md §5 Item 3:
+      1. AGENT_COLLAB_SELF_HOST env var — operator-set at install time.
+      2. socket.gethostname() lowercased + sanitized — fallback for fresh
+         installs where the env var has not been set yet.
+
+    Sanitization replaces characters outside HOST_LABEL_RE's alphabet with '-'
+    and trims leading/trailing dashes so the hostname fallback matches the
+    same rules as an explicit label.
+    """
+    explicit = os.environ.get("AGENT_COLLAB_SELF_HOST", "").strip().lower()
+    if explicit:
+        validate_host_label(explicit)
+        return explicit
+    import socket
+    raw = socket.gethostname().lower()
+    sanitized = re.sub(r"[^a-z0-9-]", "-", raw).strip("-")
+    if not sanitized or not HOST_LABEL_RE.match(sanitized):
+        # Hostname was unusable (empty, or all non-alphanumeric). Fall back to
+        # a generic label; operator should set AGENT_COLLAB_SELF_HOST.
+        return "localhost"
+    return sanitized
+
+
+def parse_room_id(s: str) -> tuple[str, str]:
+    """Parse a room ID into (home_host, pair_key).
+
+    Accepts both qualified (`<host>:<slug>`) and bare (`<slug>`) forms. Bare
+    form defaults home_host to self_host() — matches pre-v3.3 behavior where
+    every room implicitly belonged to the host running the CLI.
+    """
+    if ":" in s:
+        host, _, slug = s.partition(":")
+        validate_host_label(host)
+        validate_pair_key(slug)
+        return host, slug
+    validate_pair_key(s)
+    return self_host(), s
+
+
+def format_room_id(home_host: str, pair_key: str) -> str:
+    """Render a room ID as `<host>:<slug>` for display at CLI/API boundaries."""
+    return f"{home_host}:{pair_key}"
+
+
 def generate_pair_key() -> str:
     """Return a fresh memorable pair key (adjective-noun-XXXX)."""
     import secrets
@@ -266,6 +330,30 @@ def generate_pair_key() -> str:
     noun = secrets.choice(PAIR_KEY_NOUNS)
     suffix = secrets.token_hex(2)  # 4 hex chars
     return f"{adj}-{noun}-{suffix}"
+
+
+# Crockford's base32 alphabet (ULID canonical — omits I, L, O, U).
+_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def generate_ulid() -> str:
+    """Return a 26-char ULID: 48-bit ms timestamp + 80-bit randomness.
+
+    Zero-dep implementation per plans/v3.3-symmetric-federation-scoping.md
+    §5 Item 4. Time-sortable (lex order == creation order within the same
+    ms), unique (2^80 random per ms), and short enough to fit in a URL or
+    log line. Used as the inbox.idempotency_key so retries dedup cleanly.
+    """
+    import secrets
+    import time
+    ts_ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand = secrets.randbits(80)
+    combined = (ts_ms << 80) | rand
+    out = bytearray(26)
+    for i in range(25, -1, -1):
+        out[i] = ord(_ULID_ALPHABET[combined & 0x1F])
+        combined >>= 5
+    return out.decode("ascii")
 
 
 def generate_label() -> str:
@@ -528,7 +616,28 @@ def open_db() -> sqlite3.Connection:
         apply_migrations(path)
         conn = _connect(path)
     check_schema_version(conn)
+    backfill_peer_rooms_home_host(conn)
     return conn
+
+
+def backfill_peer_rooms_home_host(conn: sqlite3.Connection) -> None:
+    """Stamp pre-v3.3 rows in peer_rooms with this host's self-label.
+
+    0004 migration adds home_host with DEFAULT '' so existing rows end up
+    empty. Those rooms were created before the federation scheme existed,
+    which means they all implicitly belong to whichever host owns this DB —
+    there is no cross-host ambiguity to resolve. One-shot UPDATE stamps
+    every empty row with self_host(). Idempotent: once the column is
+    populated, the WHERE filter matches nothing and the statement is a
+    no-op. Runs on every open_db — cheap, and keeps hosts that were
+    installed before their AGENT_COLLAB_SELF_HOST got set from staying
+    stuck on an earlier fallback value.
+    """
+    host = self_host()
+    conn.execute(
+        "UPDATE peer_rooms SET home_host = ? WHERE home_host = ''",
+        (host,),
+    )
 
 
 # ---- Channel pairing --------------------------------------------------------
@@ -658,6 +767,21 @@ def _get_room(conn: sqlite3.Connection, room_key: str) -> Optional[sqlite3.Row]:
         "WHERE room_key = ?",
         (room_key,),
     ).fetchone()
+
+
+def _next_server_seq(conn: sqlite3.Connection, room_key: str) -> int:
+    """Return the next per-room monotonic server_seq for an INSERT.
+
+    Caller must already hold the BEGIN IMMEDIATE write lock; SQLite's
+    per-DB write serialization plus the same-txn INSERT then make the
+    MAX+1 computation race-free.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(server_seq), 0) + 1 AS nxt FROM inbox "
+        "WHERE room_key = ?",
+        (room_key,),
+    ).fetchone()
+    return int(row["nxt"])
 
 
 def _bump_room(
@@ -1049,13 +1173,16 @@ def emit_system_event(
     try:
         conn.execute("BEGIN IMMEDIATE")
         for r in live:
+            next_seq = _next_server_seq(conn, room_key)
             conn.execute(
                 """
                 INSERT INTO inbox
-                  (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at,
+                   room_key, server_seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (r["cwd"], r["label"], self_cwd, self_label, body, now, room_key),
+                (r["cwd"], r["label"], self_cwd, self_label, body, now,
+                 room_key, next_seq),
             )
         conn.execute("COMMIT")
     finally:
@@ -1504,65 +1631,91 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
         if self_pair_key else f"peer reset --to {args.to}"
     )
 
+    message_id = getattr(args, "message_id", None) or generate_ulid()
+
     conn = open_db()
+    dedup_hit = False
+    server_seq: int = 0
+    terminates = False
+    recipient_socket = None
     try:
         conn.execute("BEGIN IMMEDIATE")
-        target = conn.execute(
-            "SELECT last_seen_at, channel_socket FROM sessions WHERE cwd = ? AND label = ?",
-            (str(to_cwd), args.to),
+
+        # Idempotency dedup: if a prior send already persisted this
+        # message_id, skip the insert and return the stored server_seq.
+        # Matches the plan's "duplicate POST returns 200 with original
+        # server_seq, not 409" contract so HTTP retries are safe.
+        existing = conn.execute(
+            "SELECT server_seq, to_label FROM inbox "
+            "WHERE idempotency_key = ? AND workspace_id = 'default'",
+            (message_id,),
         ).fetchone()
-        if target is None:
+        if existing is not None:
             conn.execute("ROLLBACK")
-            err(f"peer not found: {args.to} in {to_cwd}", EXIT_NOT_FOUND)
-        if seconds_since(target["last_seen_at"]) > STALE_THRESHOLD_SECS:
-            conn.execute("ROLLBACK")
-            err(
-                f"peer offline: {args.to} (last seen "
-                f"{int(seconds_since(target['last_seen_at']))}s ago)",
-                EXIT_PEER_OFFLINE,
+            dedup_hit = True
+            server_seq = existing["server_seq"] or 0
+        else:
+            target = conn.execute(
+                "SELECT last_seen_at, channel_socket FROM sessions WHERE cwd = ? AND label = ?",
+                (str(to_cwd), args.to),
+            ).fetchone()
+            if target is None:
+                conn.execute("ROLLBACK")
+                err(f"peer not found: {args.to} in {to_cwd}", EXIT_NOT_FOUND)
+            if seconds_since(target["last_seen_at"]) > STALE_THRESHOLD_SECS:
+                conn.execute("ROLLBACK")
+                err(
+                    f"peer offline: {args.to} (last seen "
+                    f"{int(seconds_since(target['last_seen_at']))}s ago)",
+                    EXIT_PEER_OFFLINE,
+                )
+
+            room = _get_room(conn, room_key)
+            if room and room["terminated_at"]:
+                conn.execute("ROLLBACK")
+                err(
+                    f"room terminated at {room['terminated_at']} "
+                    f"by {room['terminated_by']}; "
+                    f"run 'agent-collab {reset_hint}' to resume",
+                    EXIT_VALIDATION,
+                )
+            current = room["turn_count"] if room else 0
+            max_turns = _max_room_turns()
+            if current >= max_turns:
+                conn.execute("ROLLBACK")
+                err(
+                    f"room reached max turns ({current}/{max_turns}); "
+                    f"set AGENT_COLLAB_MAX_PAIR_TURNS or run "
+                    f"'agent-collab {reset_hint}'",
+                    EXIT_VALIDATION,
+                )
+
+            terminates = TERMINATION_TOKEN.lower() in body.lower()
+            now = now_iso()
+
+            server_seq = _next_server_seq(conn, room_key)
+
+            conn.execute(
+                """
+                INSERT INTO inbox
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at,
+                   room_key, idempotency_key, server_seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(to_cwd), args.to, str(self_cwd), self_label, body, now,
+                 room_key, message_id, server_seq),
             )
+            _bump_room(conn, room_key, self_pair_key)
+            if terminates:
+                _terminate_room(conn, room_key, self_pair_key, self_label)
+            bump_last_seen(conn, str(self_cwd), self_label)
+            conn.execute("COMMIT")
 
-        room = _get_room(conn, room_key)
-        if room and room["terminated_at"]:
-            conn.execute("ROLLBACK")
-            err(
-                f"room terminated at {room['terminated_at']} "
-                f"by {room['terminated_by']}; "
-                f"run 'agent-collab {reset_hint}' to resume",
-                EXIT_VALIDATION,
-            )
-        current = room["turn_count"] if room else 0
-        max_turns = _max_room_turns()
-        if current >= max_turns:
-            conn.execute("ROLLBACK")
-            err(
-                f"room reached max turns ({current}/{max_turns}); "
-                f"set AGENT_COLLAB_MAX_PAIR_TURNS or run "
-                f"'agent-collab {reset_hint}'",
-                EXIT_VALIDATION,
-            )
-
-        terminates = TERMINATION_TOKEN.lower() in body.lower()
-
-        now = now_iso()
-        conn.execute(
-            """
-            INSERT INTO inbox
-              (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (str(to_cwd), args.to, str(self_cwd), self_label, body, now, room_key),
-        )
-        _bump_room(conn, room_key, self_pair_key)
-        if terminates:
-            _terminate_room(conn, room_key, self_pair_key, self_label)
-        bump_last_seen(conn, str(self_cwd), self_label)
-        conn.execute("COMMIT")
-
-        recipient_socket = target["channel_socket"]
+            recipient_socket = target["channel_socket"]
     finally:
         conn.close()
-    mark_inbox_dirty()
+    if not dedup_hit:
+        mark_inbox_dirty()
 
     members = _room_members(str(self_cwd), self_label, self_pair_key)
     mentions = _resolve_mentions(
@@ -1588,7 +1741,22 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
 
     term_note = " [[end]]→room terminated" if terminates else ""
     mention_note = f" @mentions[{','.join(mentions)}]" if mentions else ""
-    print(f"sent to {args.to} ({push_status}){term_note}{mention_note}")
+
+    if getattr(args, "json_output", False):
+        import json as _json
+        print(_json.dumps({
+            "ok": True,
+            "to": args.to,
+            "message_id": message_id,
+            "server_seq": server_seq,
+            "push_status": "deduped" if dedup_hit else push_status,
+            "dedup_hit": dedup_hit,
+            "terminates": terminates,
+            "mentions": mentions,
+        }))
+    else:
+        dedup_note = " [deduped]" if dedup_hit else ""
+        print(f"sent to {args.to} ({push_status}){term_note}{mention_note}{dedup_note}")
     return EXIT_OK
 
 
@@ -1717,13 +1885,16 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
                 )
 
         for r, room_key in recipients:
+            next_seq = _next_server_seq(conn, room_key)
             conn.execute(
                 """
                 INSERT INTO inbox
-                  (to_cwd, to_label, from_cwd, from_label, body, created_at, room_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (to_cwd, to_label, from_cwd, from_label, body, created_at,
+                   room_key, server_seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (r["cwd"], r["label"], str(self_cwd), self_label, body, now, room_key),
+                (r["cwd"], r["label"], str(self_cwd), self_label, body, now,
+                 room_key, next_seq),
             )
 
         # Bump each distinct room exactly once. In pair_key mode that's a
@@ -2878,15 +3049,20 @@ def cmd_peer_web(args: argparse.Namespace) -> int:
             last_at = stats["last_at"] if stats else None
 
             room_state = c.execute(
-                "SELECT turn_count, terminated_at, terminated_by FROM peer_rooms "
-                "WHERE room_key = ?",
+                "SELECT turn_count, terminated_at, terminated_by, home_host "
+                "FROM peer_rooms WHERE room_key = ?",
                 (f"pk:{pair_key}",),
             ).fetchone()
             activity = best_activity if members else "unknown"
             if room_state and room_state["terminated_at"]:
                 activity = "terminated"
+            home_host = room_state["home_host"] if room_state else self_host()
+            if not home_host:
+                home_host = self_host()
             return [{
                 "pair_key": pair_key,
+                "home_host": home_host,
+                "room_id": format_room_id(home_host, pair_key),
                 "key": pair_key,
                 "activity": activity,
                 "total": total,
@@ -3894,16 +4070,17 @@ def cmd_room_create(args: argparse.Namespace) -> int:
                 f"room {pair_key!r} already exists",
                 EXIT_LABEL_COLLISION,
             )
+        host = self_host()
         conn.execute(
-            "INSERT INTO peer_rooms (room_key, pair_key, turn_count) "
-            "VALUES (?, ?, 0)",
-            (room_key, pair_key),
+            "INSERT INTO peer_rooms (room_key, pair_key, turn_count, home_host) "
+            "VALUES (?, ?, 0, ?)",
+            (room_key, pair_key, host),
         )
         conn.execute("COMMIT")
     finally:
         conn.close()
 
-    print(f"created: {pair_key} (empty room)")
+    print(f"created: {format_room_id(host, pair_key)} (empty room)")
     print(
         f"  join: agent-collab session register --pair-key {pair_key} "
         "--agent <claude|codex|gemini|pi>"
@@ -4355,6 +4532,19 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--message")
     ps.add_argument("--message-file")
     ps.add_argument("--message-stdin", action="store_true")
+    ps.add_argument(
+        "--message-id",
+        help="client-generated idempotency id (ULID). If a prior send "
+             "already persisted with this id, the existing row's server_seq "
+             "is returned instead of inserting again — safe retry on POST "
+             "timeouts. Auto-generated when omitted.",
+    )
+    ps.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="emit a single JSON object on stdout instead of the human "
+             "summary line. Carries message_id + server_seq for HTTP "
+             "callers (peer-web /api/send).",
+    )
     ps.set_defaults(func=cmd_peer_send)
 
     pb = sub.add_parser("peer-broadcast")

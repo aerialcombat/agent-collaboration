@@ -344,8 +344,15 @@ func roomsToJSON(rooms []sqlitestore.WebRoom) []map[string]any {
 		for _, m := range r.Members {
 			members = append(members, memberToJSON(m, true))
 		}
+		homeHost := r.HomeHost
+		roomID := r.PairKey
+		if homeHost != "" {
+			roomID = homeHost + ":" + r.PairKey
+		}
 		out = append(out, map[string]any{
 			"pair_key":      r.PairKey,
+			"home_host":     orNull(homeHost),
+			"room_id":       roomID,
 			"key":           r.Key,
 			"activity":      r.Activity,
 			"total":         r.Total,
