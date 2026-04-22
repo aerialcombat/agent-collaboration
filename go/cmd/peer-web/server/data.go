@@ -419,13 +419,15 @@ func memberToJSON(m sqlitestore.WebMember, includeLabel bool) map[string]any {
 // state column plus reachability heuristics. Three-color palette:
 //
 //	"active"       — green. turn in progress (raw state=active).
-//	"waiting"      — yellow. alive + idle (raw state=idle).
-//	"disconnected" — red. unreachable OR no state data yet; anything
-//	                  we can't positively confirm as active-or-waiting
-//	                  collapses into this bucket so the dot never
-//	                  silently lies. Covers: dead process, stale
-//	                  last_seen, NULL state column (pre-v3.8 session
-//	                  or a session that hasn't fired its first hook).
+//	"waiting"      — yellow. agent is present (live channel + recent
+//	                  last_seen) and not generating. This includes
+//	                  sessions with state=idle AND sessions whose
+//	                  state column is still NULL (pre-v3.8 session or
+//	                  one that hasn't fired its first hook yet). A
+//	                  reachable agent that isn't busy IS waiting, by
+//	                  definition — we don't need a hook to confirm it.
+//	"disconnected" — red. actually unreachable: no channel socket, or
+//	                  stale last_seen. The process can't be signalled.
 //	"human"        — hidden. agent=human (owner in peer-web browser).
 //
 // The function is pure — no DB reads — so it's cheap to call on every
@@ -434,23 +436,20 @@ func deriveStateDisplay(m sqlitestore.WebMember) string {
 	if m.Agent == "human" {
 		return "human"
 	}
-	// Disconnected: no live channel AND activity bucket is "stale" or
-	// "unknown". Last_seen_at > 24h means the session is effectively
-	// dead regardless of what state says.
-	if !m.Channel && (m.Activity == "stale" || m.Activity == "unknown") {
+	// Reachability: a present agent has a live channel socket AND a
+	// non-stale last_seen_at (activity bucket is "active" or "idle").
+	// Anything else is disconnected regardless of what state says.
+	reachable := m.Channel && (m.Activity == "active" || m.Activity == "idle")
+	if !reachable {
 		return "disconnected"
 	}
-	switch m.State {
-	case "active":
+	if m.State == "active" {
 		return "active"
-	case "idle":
-		return "waiting"
-	default:
-		// No state signal yet — treat as disconnected. Better to show
-		// red than to silently assert "alive and waiting" when we have
-		// no evidence the agent's hook has ever fired.
-		return "disconnected"
 	}
+	// Reachable + (state=idle OR state=NULL) → waiting. Null state on
+	// a reachable agent just means the hook hasn't fired yet; the agent
+	// is alive and not mid-turn, so "waiting" is the honest display.
+	return "waiting"
 }
 
 func orNull(s string) any {
