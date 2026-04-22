@@ -1571,6 +1571,10 @@ def emit_system_event(
     mark_inbox_dirty()
 
     push_meta_base: dict[str, str] = {"system": kind}
+    # v3.6: stamp pair_key so multi-room recipients can attribute the
+    # system event to the right room.
+    if pair_key:
+        push_meta_base["pair_key"] = pair_key
     if extra_meta:
         for k, v in extra_meta.items():
             if all(c.isalnum() or c == "_" for c in k):
@@ -2192,6 +2196,10 @@ def cmd_peer_send(args: argparse.Namespace) -> int:
     push_status = "no-channel"
     if recipient_socket and Path(recipient_socket).exists():
         push_meta: dict[str, str] = {"to": args.to}
+        # v3.6: see emit_system_event. pair_key lets multi-room receivers
+        # identify which room the message came from.
+        if self_pair_key:
+            push_meta["pair_key"] = self_pair_key
         if mentions:
             push_meta["mentions"] = ",".join(mentions)
         code, resp = _send_over_unix_socket(
@@ -2396,6 +2404,10 @@ def cmd_peer_broadcast(args: argparse.Namespace) -> int:
                 "to": r["label"],
                 "broadcast": "1",
             }
+            # v3.6: see cmd_peer_send / emit_system_event. pair_key lets
+            # multi-room receivers route replies back to the right room.
+            if self_pair_key:
+                push_meta["pair_key"] = self_pair_key
             if cohort_labels is not None:
                 push_meta["cohort"] = cohort_labels
             if mentions:

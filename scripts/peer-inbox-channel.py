@@ -121,6 +121,17 @@ REPLY_TOOL = {
                     {"type": "array", "items": {"type": "string"}, "minItems": 1},
                 ],
             },
+            "pair_key": {
+                "type": "string",
+                "description": (
+                    "Target room for this reply. Only meaningful when the "
+                    "session is joined into multiple rooms over the same "
+                    "channel (see the `pair_key` meta on incoming <channel> "
+                    "tags). Omit to default to the room the most recent "
+                    "incoming message came from; when the session is in "
+                    "exactly one room, can be omitted unconditionally."
+                ),
+            },
         },
         "required": ["body"],
         "additionalProperties": False,
@@ -131,6 +142,14 @@ _stdout_lock = threading.Lock()
 _initialized = threading.Event()
 _socket_path: Path | None = None
 _pending_path: Path | None = None
+
+# v3.6 multi-room: a single channel socket may be bound to multiple
+# sessions rows (one per room the Claude joined). Incoming pushes carry
+# meta.pair_key so we can (a) stamp the correct pair_key on the
+# <channel> system-reminder and (b) default peer_inbox_reply back into
+# the room the last message came from.
+_last_incoming_lock = threading.Lock()
+_last_incoming_pair_key: str | None = None
 
 
 def stderr(*args):
@@ -231,7 +250,13 @@ def handle_mcp(req: dict) -> None:
                     "Reply with peer_inbox_reply (preferred). Shell "
                     "fallback: `agent-collab peer broadcast --message ...`, "
                     "`peer broadcast --to a --to b --message ...`, "
-                    "`peer send --to a --message ...`."
+                    "`peer send --to a --message ...`.\n\n"
+                    "MULTI-ROOM (rare): when this session is joined into "
+                    "multiple rooms at once, every <channel> tag's "
+                    "meta.pair_key identifies which room it came from. "
+                    "peer_inbox_reply defaults to the room of the most "
+                    "recent incoming message; pass `pair_key: \"<key>\"` "
+                    "to send into a different room explicitly."
                 ),
             },
         )
@@ -277,18 +302,80 @@ def _agent_collab_bin() -> str:
     return "agent-collab"
 
 
-def _room_roster() -> tuple[str | None, list[str], str | None] | None:
-    """Look up the receiver's pair_key, roster, and mediator label.
+def _resolve_selves_from_socket() -> list[dict]:
+    """Return every sessions row bound to this channel socket.
+
+    In v3.6 a single Claude session can be registered into multiple
+    rooms at once — each room gets its own (cwd, label, pair_key) row,
+    all sharing the same channel_socket. Callers pick the row that
+    matches the pair_key they care about (incoming meta, explicit
+    reply arg, or the only-one-room fallback).
+    """
+    if not _socket_path or not DB_PATH.exists():
+        return []
+    socket_uri = f"unix://{_socket_path}"
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            # Match both the v3.5 URI form (`unix:///path/.sock`) and the
+            # legacy bare-path form the Python daemon still writes.
+            rows = conn.execute(
+                "SELECT cwd, label, pair_key FROM sessions "
+                "WHERE channel_socket = ? OR channel_socket = ? "
+                "ORDER BY label",
+                (str(_socket_path), socket_uri),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        stderr(f"[peer-inbox-channel] sqlite error in resolve: {e}")
+        return []
+    return [
+        {"cwd": r["cwd"], "label": r["label"], "pair_key": r["pair_key"]}
+        for r in rows
+    ]
+
+
+def _pick_self(pair_key: str | None) -> dict | None:
+    """Pick the (cwd, label, pair_key) row for the given pair_key.
+
+    pair_key=None → return the unique row if the session is bound to
+    exactly one room; otherwise return None (ambiguous). pair_key set →
+    exact match; None when no such registration exists.
+    """
+    rows = _resolve_selves_from_socket()
+    if not rows:
+        return None
+    if pair_key is not None:
+        for r in rows:
+            if r["pair_key"] == pair_key:
+                return r
+        return None
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
+
+def _room_roster(pair_key: str | None) -> tuple[str | None, list[str], str | None] | None:
+    """Look up roster + mediator for the room identified by pair_key.
 
     Returns (pair_key, members, mediator_label). `members` is sorted,
     self-inclusive. `mediator_label` is the label of whatever session
     in the room registered with role='mediator', or None if the room
     has no appointed mediator (party mode).
+
+    pair_key=None falls back to "the only room this channel is bound
+    to" — the v3.5-and-earlier single-room behaviour. When the session
+    is in multiple rooms and no pair_key is given, we can't pick a
+    roster, so we return None (the enrichment step just skips).
     """
-    resolved = _resolve_self_from_socket()
-    if resolved is None:
+    self_row = _pick_self(pair_key)
+    if self_row is None:
         return None
-    self_cwd, self_label, self_pair_key = resolved
+    self_cwd = self_row["cwd"]
+    self_label = self_row["label"]
+    self_pair_key = self_row["pair_key"]
     try:
         conn = sqlite3.connect(str(DB_PATH))
         conn.row_factory = sqlite3.Row
@@ -318,29 +405,6 @@ def _room_roster() -> tuple[str | None, list[str], str | None] | None:
     if self_label not in members:
         members.append(self_label)
     return (self_pair_key, sorted(members), mediator)
-
-
-def _resolve_self_from_socket() -> tuple[str, str, str | None] | None:
-    """Look up (cwd, label, pair_key) for the session bound to this channel."""
-    if not _socket_path or not DB_PATH.exists():
-        return None
-    try:
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
-        try:
-            row = conn.execute(
-                "SELECT cwd, label, pair_key FROM sessions "
-                "WHERE channel_socket = ?",
-                (str(_socket_path),),
-            ).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error as e:
-        stderr(f"[peer-inbox-channel] sqlite error in resolve: {e}")
-        return None
-    if row is None:
-        return None
-    return row["cwd"], row["label"], row["pair_key"]
 
 
 def _call_peer(
@@ -407,6 +471,12 @@ def handle_tools_call(req_id, params: dict) -> None:
     body = arguments.get("body")
     to = arguments.get("to")
     mention = arguments.get("mention")
+    pair_key_arg = arguments.get("pair_key")
+    if pair_key_arg is not None and (
+        not isinstance(pair_key_arg, str) or not pair_key_arg
+    ):
+        _tool_error(req_id, "error: `pair_key` must be a non-empty string or omitted")
+        return
     if not isinstance(body, str) or not body:
         _tool_error(req_id, "error: `body` is required and must be a non-empty string")
         return
@@ -451,15 +521,58 @@ def handle_tools_call(req_id, params: dict) -> None:
         _tool_error(req_id, "error: `mention` must be a string, an array, or omitted")
         return
 
-    resolved = _resolve_self_from_socket()
-    if resolved is None:
+    # v3.6 multi-room resolution. Precedence for picking which room to
+    # reply into:
+    #   1. explicit `pair_key` argument
+    #   2. the pair_key of the most recent incoming message on this socket
+    #   3. the unique registered room (single-room fallback; pre-v3.6 default)
+    # When none of those resolves, error with a listing of available rooms
+    # so the caller can retry with `pair_key=...`.
+    all_selves = _resolve_selves_from_socket()
+    if not all_selves:
         _tool_error(
             req_id,
             "error: no session bound to this channel yet — "
             "run `agent-collab session register` first.",
         )
         return
-    self_cwd, self_label, self_pair_key = resolved
+
+    chosen: dict | None = None
+    if pair_key_arg is not None:
+        chosen = next(
+            (r for r in all_selves if r["pair_key"] == pair_key_arg), None
+        )
+        if chosen is None:
+            keys = sorted(r["pair_key"] or "" for r in all_selves)
+            _tool_error(
+                req_id,
+                f"error: no registered room with pair_key={pair_key_arg!r}; "
+                f"known pair_keys: {keys}",
+            )
+            return
+    else:
+        with _last_incoming_lock:
+            last_pk = _last_incoming_pair_key
+        if last_pk:
+            chosen = next(
+                (r for r in all_selves if r["pair_key"] == last_pk), None
+            )
+        if chosen is None:
+            if len(all_selves) == 1:
+                chosen = all_selves[0]
+            else:
+                keys = sorted(r["pair_key"] or "" for r in all_selves)
+                _tool_error(
+                    req_id,
+                    "error: session is in "
+                    f"{len(all_selves)} rooms and no `pair_key` given "
+                    "(and no recent incoming message to infer from). "
+                    f"Pass `pair_key` (one of: {keys}) to disambiguate.",
+                )
+                return
+
+    self_cwd = chosen["cwd"]
+    self_label = chosen["label"]
 
     if isinstance(to, str):
         ok, msg = _call_peer(
@@ -585,13 +698,23 @@ def handle_socket_client(conn: socket.socket) -> None:
         if all(c.isalnum() or c == "_" for c in key):
             meta[key] = str(v)
 
+    # v3.6: if the sender stamped meta.pair_key, it authoritatively
+    # identifies which of our registered rooms this message came from.
+    # Remember it so peer_inbox_reply defaults back into the same room,
+    # and use it to scope the roster lookup below.
+    incoming_pair_key = meta.get("pair_key") or None
+    if incoming_pair_key:
+        with _last_incoming_lock:
+            global _last_incoming_pair_key
+            _last_incoming_pair_key = incoming_pair_key
+
     # Enrich with room context so the receiving agent knows whether this
     # is a 1:1 pair or a group chat, and can see the full roster + any
     # appointed mediator before choosing reply/broadcast/multicast.
-    # Resolution looks up the receiver's own session row via
-    # channel_socket; if registration is still pending we just skip
-    # enrichment.
-    roster = _room_roster()
+    # Scope the roster by the incoming pair_key when available so a
+    # multi-room session sees only the room this push came from.
+    # Registration still pending → skip enrichment.
+    roster = _room_roster(incoming_pair_key)
     if roster is not None:
         pair_key, members, mediator_label = roster
         if pair_key:

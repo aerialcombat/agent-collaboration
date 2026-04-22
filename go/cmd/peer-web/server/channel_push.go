@@ -63,6 +63,22 @@ func (s *Server) handleChannelPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v3.6 multi-room: propagate pair_key from the query string into
+	// payload.meta so the Python channel MCP can stamp the correct
+	// <channel pair_key=...> header and route replies back into the
+	// right room. Legacy senders (pre-v3.6 binaries) don't include
+	// meta.pair_key; payload values from v3.6 senders win.
+	if pairKey != "" {
+		meta, ok := payload["meta"].(map[string]any)
+		if !ok {
+			meta = map[string]any{}
+		}
+		if _, has := meta["pair_key"]; !has {
+			meta["pair_key"] = pairKey
+		}
+		payload["meta"] = meta
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	st, err := storeOpen(ctx)

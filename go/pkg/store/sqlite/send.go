@@ -239,6 +239,12 @@ func (s *SQLiteLocal) Send(ctx context.Context, p SendParams) (SendResult, error
 	push := "no-channel"
 	if recvSock != "" && channelAlive(recvSock) {
 		meta := map[string]string{"to": p.ToLabel}
+		// v3.6: stamp the sender's pair_key so recipients in multiple
+		// rooms over the same channel socket can tell which room this
+		// came from (and default replies back into the same room).
+		if p.PairKey != "" {
+			meta["pair_key"] = p.PairKey
+		}
 		if len(mentions) > 0 {
 			meta["mentions"] = strings.Join(mentions, ",")
 		}
@@ -412,6 +418,11 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 			continue
 		}
 		meta := map[string]string{"to": r.toLabel, "broadcast": "1"}
+		// v3.6: see Send — pair_key lets multi-room recipients route
+		// replies back into the room the broadcast came from.
+		if p.PairKey != "" {
+			meta["pair_key"] = p.PairKey
+		}
 		if cohortLabels != "" {
 			meta["cohort"] = cohortLabels
 		}

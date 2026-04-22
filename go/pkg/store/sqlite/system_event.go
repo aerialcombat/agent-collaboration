@@ -127,6 +127,11 @@ func (s *SQLiteLocal) EmitSystemEvent(ctx context.Context, p SystemEventParams) 
 	// Filter ExtraMeta by Python's validation rule (alnum/_ keys only)
 	// so Go and Python push identical meta for the same input.
 	base := map[string]string{"system": p.Kind}
+	// v3.6: stamp pair_key so multi-room recipients can identify which
+	// room the system event came from (join/leave attribution).
+	if p.PairKey != "" {
+		base["pair_key"] = p.PairKey
+	}
 	for k, v := range p.ExtraMeta {
 		if systemMetaKeyRE.MatchString(k) {
 			base[k] = v
