@@ -80,6 +80,63 @@ function updateChannelSocket(cwd: string, label: string, value: string | null) {
 	execFileSync("python3", ["-c", script, ...args], { timeout: 5000 });
 }
 
+// v3.8 agent state. Writes sessions.state + state_changed_at so peer-web
+// can render a busy/waiting indicator next to this pi session. Called on
+// turn-start (active) and turn-end (idle). Fire-and-forget: failures are
+// swallowed — the state column is a visibility signal, not a source of
+// truth for message routing.
+//
+// Prefers the peer-inbox Go CLI (session-state verb) when available
+// since it's ~10× cheaper than a python3 cold start; falls back to the
+// inline-SQL python path used by updateChannelSocket. Either path is
+// already fast enough to run on every turn.
+let _peerInboxBinPath: string | null | undefined;
+function resolvePeerInboxBin(): string | null {
+	if (_peerInboxBinPath !== undefined) return _peerInboxBinPath;
+	const env = process.env.AGENT_COLLAB_PEER_INBOX_BIN;
+	if (env && fs.existsSync(env)) { _peerInboxBinPath = env; return env; }
+	const local = path.join(os.homedir(), ".local/bin/peer-inbox");
+	if (fs.existsSync(local)) { _peerInboxBinPath = local; return local; }
+	// PATH lookup as last resort (synchronous execFile would block; skip
+	// and let the python fallback path handle this case).
+	_peerInboxBinPath = null;
+	return null;
+}
+
+function writeSessionState(cwd: string, label: string, state: "active" | "idle") {
+	const bin = resolvePeerInboxBin();
+	if (bin) {
+		// Fire-and-forget, no callback. The CLI is fail-open on unknown
+		// targets, so we don't need to distinguish "row doesn't exist"
+		// from real failures.
+		execFile(
+			bin,
+			["session-state", state, "--cwd", cwd, "--label", label, "--quiet"],
+			{ timeout: 5000, env: { ...process.env, AGENT_COLLAB_INBOX_DB: INBOX_DB } },
+			() => { /* swallow */ },
+		);
+		return;
+	}
+	// Fallback: direct SQL via python3. Matches the no-op-on-unchanged
+	// semantic the Go CLI has (state_changed_at only moves on transitions).
+	const script =
+		`import sqlite3,sys,datetime\n` +
+		`db,cwd,label,new = sys.argv[1:5]\n` +
+		`now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")\n` +
+		`c = sqlite3.connect(db)\n` +
+		`row = c.execute("SELECT state FROM sessions WHERE cwd=? AND label=?",(cwd,label)).fetchone()\n` +
+		`if row is not None and row[0] != new:\n` +
+		`    c.execute("UPDATE sessions SET state=?, state_changed_at=? WHERE cwd=? AND label=?",(new,now,cwd,label))\n` +
+		`    c.commit()\n` +
+		`c.close()\n`;
+	execFile(
+		"python3",
+		["-c", script, INBOX_DB, cwd, label, state],
+		{ timeout: 5000 },
+		() => { /* swallow */ },
+	);
+}
+
 export default function (pi: ExtensionAPI) {
 	let state: State | null = null;
 	let currentUserSender: string | null = null;
@@ -385,6 +442,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_start", async (event) => {
 		const msg = (event as { message?: { role?: string; content?: Array<{ type: string; text?: string }> } }).message;
 		if (!msg || msg.role !== "user") return;
+		// v3.8: user message just arrived → this session is about to
+		// process it. Flip state=active so peer-web sidebar pulses green.
+		if (state) writeSessionState(state.cwd, state.label, "active");
 		const content = msg.content || [];
 		for (const c of content) {
 			if (c.type === "text" && typeof c.text === "string") {
@@ -397,6 +457,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (event) => {
 		const msg = (event as { message?: { role?: string; content?: Array<{ type: string; text?: string }> } }).message;
+		// v3.8: assistant turn finished → flip back to idle regardless of
+		// whether we're relaying to a peer. Fires for every assistant
+		// message so idle takes effect even on non-peer conversations.
+		if (state && msg && msg.role === "assistant") {
+			writeSessionState(state.cwd, state.label, "idle");
+		}
 		if (!state || !msg || msg.role !== "assistant" || !currentUserSender) {
 			currentUserSender = null;
 			return;

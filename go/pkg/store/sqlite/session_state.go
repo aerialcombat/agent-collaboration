@@ -77,6 +77,38 @@ func (s *SQLiteLocal) SetSessionState(
 	return nil
 }
 
+// SweepStaleActive flips any session rows whose state="active" and
+// whose state_changed_at is older than cutoff back to state="idle".
+// Returns the number of rows updated.
+//
+// The watchdog calls this periodically (see peer-web's state_watchdog)
+// to protect against "agent crashed mid-turn, Stop hook never fired"
+// leaving UI stuck on busy forever. Cutoff should be comfortably
+// longer than any legitimate turn; 30min is the default.
+func (s *SQLiteLocal) SweepStaleActive(
+	ctx context.Context, cutoff time.Duration, now time.Time,
+) (int64, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nowISO := now.Format("2006-01-02T15:04:05Z")
+	// Compute the "newest acceptable state_changed_at" — anything
+	// older than this is eligible to be swept.
+	cutoffISO := now.Add(-cutoff).Format("2006-01-02T15:04:05Z")
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sessions
+		   SET state = 'idle', state_changed_at = ?
+		 WHERE state = 'active'
+		   AND state_changed_at IS NOT NULL
+		   AND state_changed_at < ?`,
+		nowISO, cutoffISO)
+	if err != nil {
+		return 0, fmt.Errorf("SweepStaleActive: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // SetSessionStateByKey resolves the session via its session_key (the
 // token the hook already carries in CLAUDE_SESSION_ID / AGENT_COLLAB_
 // SESSION_KEY) and applies the state update. Preferred over

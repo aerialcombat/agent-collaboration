@@ -33,6 +33,7 @@ type webStore interface {
 	BroadcastLocal(ctx context.Context, params sqlitestore.SendParams) ([]sqlitestore.SendResult, error)
 	RegisterOwner(ctx context.Context, params sqlitestore.RegisterOwnerParams) error
 	ForwardLocalPush(ctx context.Context, label, pairKey string, payload map[string]any) (int, string, error)
+	SweepStaleActive(ctx context.Context, cutoff time.Duration, now time.Time) (int64, error)
 	Close() error
 }
 
@@ -399,12 +400,54 @@ func memberToJSON(m sqlitestore.WebMember, includeLabel bool) map[string]any {
 		// feeds the "busy for Xs" tooltip.
 		"state":            orNull(m.State),
 		"state_changed_at": orNull(m.StateChangedAt),
+		// v3.8 phase 2: derived state for UI display. Accounts for
+		// sessions whose agent process is unreachable (no channel
+		// socket + stale last_seen) even though their state column
+		// still reads "active" or "idle". Keeps the raw `state`
+		// field as the truth from the hook/extension writes, while
+		// `state_display` is what the UI should render.
+		"state_display": deriveStateDisplay(m),
 	}
 	if includeLabel {
 		out["label"] = m.Label
 		out["cwd"] = orNull(m.CWD)
 	}
 	return out
+}
+
+// deriveStateDisplay composes a UI-ready state label from the raw
+// state column plus reachability heuristics. Values:
+//
+//	"active"       — turn in progress (raw state=active)
+//	"waiting"      — waiting for input (raw state=idle)
+//	"disconnected" — no channel + last_seen older than the activity
+//	                  threshold (activityState() == "stale")
+//	"unknown"      — agent reachable but state column is NULL
+//	                  (pre-v3.8 session or one that hasn't hit its
+//	                  first hook yet)
+//	"human"        — agent=human (owner in peer-web browser); no
+//	                  activity dot expected or rendered.
+//
+// The function is pure — no DB reads — so it's cheap to call on every
+// member render.
+func deriveStateDisplay(m sqlitestore.WebMember) string {
+	if m.Agent == "human" {
+		return "human"
+	}
+	// Disconnected: no live channel AND activity bucket is "stale" or
+	// "unknown". Last_seen_at > 24h means the session is effectively
+	// dead regardless of what state says.
+	if !m.Channel && (m.Activity == "stale" || m.Activity == "unknown") {
+		return "disconnected"
+	}
+	switch m.State {
+	case "active":
+		return "active"
+	case "idle":
+		return "waiting"
+	default:
+		return "unknown"
+	}
 }
 
 func orNull(s string) any {

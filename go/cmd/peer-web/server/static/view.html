@@ -62,14 +62,19 @@
   /* v3.8 agent state — distinct from the activity dot above. The
      state dot sits next to the member's label and pulses green when
      the agent is actively generating a turn (set by Claude Code's
-     UserPromptSubmit hook; cleared by Stop hook). */
+     UserPromptSubmit hook or pi's message_start event). Grey when
+     the agent has finished its turn and is waiting. Red when the
+     agent process is unreachable. Hidden entirely for humans and
+     for agents with no data yet. */
   .state-dot { width:7px; height:7px; border-radius:50%;
     display:inline-block; margin-right:4px; vertical-align:middle;
-    background:#3b82f6; }
-  .state-dot.active { background:#22c55e; box-shadow:0 0 0 0 rgba(34,197,94,.7);
+    background:#4b5563; }
+  .state-dot.active { background:#22c55e;
     animation: state-pulse 1.6s infinite; }
-  .state-dot.idle { background:#4b5563 }
-  .state-dot.unknown { display:none }
+  .state-dot.waiting { background:#4b5563 }
+  .state-dot.disconnected { background:#dc2626 }
+  .state-dot.unknown { background:#374151; opacity:.6 }
+  .state-dot.human { display:none }
   @keyframes state-pulse {
     0%   { box-shadow:0 0 0 0 rgba(34,197,94,.55) }
     70%  { box-shadow:0 0 0 6px rgba(34,197,94,0) }
@@ -271,17 +276,23 @@
     if (text !== undefined) e.textContent = text;
     return e;
   }
-  // v3.8 agent-state pulse. Reads m.state ("active" | "idle" | null)
-  // from the /api/pairs / /api/rooms member payload. Active pulses
-  // green; idle is a flat grey dot; null is hidden entirely.
+  // v3.8 agent-state pulse. Reads m.state_display from the /api/pairs
+  // / /api/rooms member payload. Server composes four UI-ready
+  // values ("active" | "waiting" | "disconnected" | "unknown") plus
+  // "human" for browser-origin labels. Client maps 1:1 to a CSS dot
+  // class; never re-derives from the raw state field.
   function stateDot(m) {
-    const s = (m && m.state) || 'unknown';
+    const s = (m && m.state_display) || 'unknown';
     const d = document.createElement('span');
     d.className = 'state-dot ' + s;
-    if (s !== 'unknown') {
-      const label = s === 'active' ? 'active' : 'idle';
-      const since = (m && m.state_changed_at) || '';
-      d.title = since ? `${label} since ${since}` : label;
+    const tooltipLabel = {
+      active: 'busy', waiting: 'waiting for input',
+      disconnected: 'disconnected', unknown: 'status unknown',
+      human: '',
+    }[s] || s;
+    const since = (m && m.state_changed_at) || '';
+    if (tooltipLabel) {
+      d.title = since ? `${tooltipLabel} since ${since}` : tooltipLabel;
     }
     return d;
   }

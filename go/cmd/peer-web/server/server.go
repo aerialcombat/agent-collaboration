@@ -77,6 +77,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.http.ListenAndServe() }()
 
+	// v3.8: start the stale-active watchdog. Runs for the server's
+	// lifetime; cancels cleanly when ctx is cancelled.
+	go s.runStaleActiveWatchdog(ctx)
+
 	select {
 	case <-ctx.Done():
 		return nil

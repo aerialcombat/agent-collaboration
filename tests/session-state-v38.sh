@@ -172,4 +172,90 @@ else
   echo "skip S5: $HOOK_BIN not built"
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 2 scenarios.
+#
+# S6 — SweepStaleActive flips active sessions older than cutoff → idle.
+# S7 — /api/rooms state_display derivation: human / disconnected / unknown.
+
+# S6. Register a fresh session, mark active with a stale timestamp, confirm
+# the sweep brings it back.
+CWD_STALE="$TMP/stale"; mkdir -p "$CWD_STALE"
+pi() { AGENT_COLLAB_INBOX_DB="$DB" "$PI_BIN" "$@"; }
+pi session-register --cwd "$CWD_STALE" --label zombie --agent claude \
+  --session-key "zombie-sk-$$" --pair-key "$PK" --force >/dev/null
+# Push a stuck-active row 40 minutes into the past.
+sqlite3 "$DB" "UPDATE sessions SET state='active', state_changed_at='$(python3 -c '
+import datetime, sys
+t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=40)
+print(t.strftime("%Y-%m-%dT%H:%M:%SZ"))
+')' WHERE label='zombie'"
+[ "$(sqlite3 "$DB" "SELECT state FROM sessions WHERE label='zombie'")" = "active" ] \
+  || fail "S6: pre-condition — zombie didn't read active"
+
+# Drive the sweep via a short-lived peer-web (the watchdog ticks on boot).
+SWEEP_PORT=$((40000 + RANDOM % 10000))
+AGENT_COLLAB_INBOX_DB="$DB" "$PW_BIN" --port "$SWEEP_PORT" --cwd "$CWD_A" >/tmp/v38-sweep.log 2>&1 &
+SWEEP_PID=$!
+for _ in 1 2 3 4 5; do
+  sleep 0.3
+  curl -sf "http://127.0.0.1:$SWEEP_PORT/" >/dev/null 2>&1 && break
+done
+# Watchdog runs on boot; give it a moment to land the write.
+sleep 0.6
+kill "$SWEEP_PID" 2>/dev/null; wait "$SWEEP_PID" 2>/dev/null
+
+[ "$(sqlite3 "$DB" "SELECT state FROM sessions WHERE label='zombie'")" = "idle" ] \
+  || fail "S6: watchdog did not flip stale-active to idle (got=$(sqlite3 "$DB" "SELECT state FROM sessions WHERE label='zombie'"))"
+
+echo "OK  S6 — stale-active watchdog flips stuck sessions back to idle"
+
+# S7 — state_display derivation.
+# Reset alpha to idle (S5 left it active via the hook-binary run).
+pi session-state idle --cwd "$CWD_A" --label alpha --quiet >/dev/null
+# Register a human and a disconnected session; confirm state_display on API.
+pi session-register --cwd "$CWD_A" --label the-human --agent human --role owner \
+  --session-key "human-sk-$$" --pair-key "$PK" --force >/dev/null
+# Manufacture a disconnected session: stale last_seen, no channel, no state.
+sqlite3 "$DB" "UPDATE sessions SET last_seen_at='2025-01-01T00:00:00Z', channel_socket=NULL WHERE label='zombie'"
+
+DISPLAY_PORT=$((40000 + RANDOM % 10000))
+AGENT_COLLAB_INBOX_DB="$DB" "$PW_BIN" --port "$DISPLAY_PORT" --cwd "$CWD_A" >/tmp/v38-display.log 2>&1 &
+DISPLAY_PID=$!
+for _ in 1 2 3 4 5 6 7 8; do
+  sleep 0.25
+  curl -sf "http://127.0.0.1:$DISPLAY_PORT/" >/dev/null 2>&1 && break
+done
+resp="$(curl -sS --max-time 3 "http://127.0.0.1:$DISPLAY_PORT/api/rooms?pair_key=$PK")"
+kill "$DISPLAY_PID" 2>/dev/null; wait "$DISPLAY_PID" 2>/dev/null
+
+echo "$resp" | python3 - "$resp" <<'PY' || fail "S7: state_display mismatch"
+import json, sys
+d = json.loads(sys.argv[1])
+rooms = d.get("rooms") or []
+if not rooms:
+    print("no rooms", file=sys.stderr); sys.exit(1)
+members = {m["label"]: m for m in (rooms[0].get("members") or [])}
+want = {
+    "the-human": "human",
+    "zombie":    "disconnected",
+    "alpha":     "waiting",  # was idle from earlier
+}
+fail_lines = []
+for label, expected in want.items():
+    m = members.get(label)
+    if not m:
+        fail_lines.append(f"  missing member {label}")
+        continue
+    got = m.get("state_display")
+    if got != expected:
+        fail_lines.append(f"  {label}: got={got!r} want={expected!r} (state={m.get('state')!r}, channel={m.get('channel')}, activity={m.get('activity')!r})")
+if fail_lines:
+    print("state_display mismatches:", file=sys.stderr)
+    for l in fail_lines: print(l, file=sys.stderr)
+    sys.exit(1)
+PY
+
+echo "OK  S7 — state_display derives human/disconnected/waiting correctly"
+
 echo "all v3.8 session-state checks passed"
