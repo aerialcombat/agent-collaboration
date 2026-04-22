@@ -143,6 +143,20 @@ func run() int {
 		return 0
 	}
 
+	// v3.8: UserPromptSubmit (the only hook event that invokes this
+	// binary today) is the "user just typed a prompt" moment — mark the
+	// session active. The setter skips the UPDATE when state is already
+	// "active", so the hot path eats at most one probe per prompt when
+	// state is stable and one UPDATE on transitions. Best-effort — we
+	// never fail the hook for a state-write error.
+	if serr := st.SetSessionState(ctx, self.CWD, self.Label,
+		sqlitestore.SessionStateActive, time.Now().UTC()); serr != nil {
+		if !errors.Is(serr, sqlitestore.ErrSessionNotFound) {
+			log.Info("hook.state_write_failed",
+				"session", self.Label, "err", serr.Error())
+		}
+	}
+
 	rows, err := st.ReadUnread(ctx, self)
 	if err != nil {
 		// Read failed mid-transaction: rollback already happened in

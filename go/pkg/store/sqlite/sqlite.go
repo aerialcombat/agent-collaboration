@@ -49,8 +49,10 @@ const (
 	// for the laptop-side federation queue. Bumped 6 → 7 for v3.3 Item 7's
 	// 0007 migration that adds sessions.auth_token — peer-web /api/send's
 	// bearer-token validation reads this column, so pre-0007 DBs must
-	// fail the schema check first.
-	GooseVersionRequired = 7
+	// fail the schema check first. Bumped 7 → 8 for v3.8's 0008 migration
+	// that adds sessions.state + sessions.state_changed_at for agent
+	// activity monitoring; the hook binary writes these on every prompt.
+	GooseVersionRequired = 8
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

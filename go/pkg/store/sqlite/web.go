@@ -21,14 +21,22 @@ const (
 // can span cwds); cwd-mode pair responses leave it empty. Activity is
 // derived from last_seen_at via activityState(); Channel reflects
 // whether sessions.channel_socket is non-NULL.
+//
+// v3.8: State is the hook-driven busy/idle signal ("active" | "idle" |
+// ""). Distinct from Activity (which bucketizes last_seen_at);
+// State captures whether the agent is currently generating a turn.
+// StateChangedAt is the ISO timestamp of the last state transition
+// (used for "busy for Xs" tooltips on the UI).
 type WebMember struct {
-	Label      string
-	CWD        string
-	Agent      string
-	Role       string
-	Activity   string
-	LastSeenAt string
-	Channel    bool
+	Label          string
+	CWD            string
+	Agent          string
+	Role           string
+	Activity       string
+	LastSeenAt     string
+	Channel        bool
+	State          string
+	StateChangedAt string
 }
 
 // WebPair mirrors the Python _fetch_pairs per-pair shape. Peers is
@@ -600,11 +608,12 @@ func (s *SQLiteLocal) fetchSessionByPairKey(ctx context.Context, pairKey, label 
 	var (
 		cwd, agent, role, lastSeen sql.NullString
 		channel                    sql.NullString
+		state, stateChanged        sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT cwd, last_seen_at, agent, role, channel_socket
+		SELECT cwd, last_seen_at, agent, role, channel_socket, state, state_changed_at
 		FROM sessions WHERE pair_key = ? AND label = ?`,
-		pairKey, label).Scan(&cwd, &lastSeen, &agent, &role, &channel)
+		pairKey, label).Scan(&cwd, &lastSeen, &agent, &role, &channel, &state, &stateChanged)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -612,12 +621,14 @@ func (s *SQLiteLocal) fetchSessionByPairKey(ctx context.Context, pairKey, label 
 		return nil, err
 	}
 	return &WebMember{
-		Label:      label,
-		CWD:        nullString(cwd),
-		Agent:      nullString(agent),
-		Role:       nullString(role),
-		LastSeenAt: nullString(lastSeen),
-		Channel:    channel.Valid && channel.String != "",
+		Label:          label,
+		CWD:            nullString(cwd),
+		Agent:          nullString(agent),
+		Role:           nullString(role),
+		LastSeenAt:     nullString(lastSeen),
+		Channel:        channel.Valid && channel.String != "",
+		State:          nullString(state),
+		StateChangedAt: nullString(stateChanged),
 	}, nil
 }
 
@@ -635,11 +646,12 @@ func (s *SQLiteLocal) lookupMember(ctx context.Context, opts FetchPairsOpts, lab
 	var (
 		agent, role, lastSeen sql.NullString
 		channel               sql.NullString
+		state, stateChanged   sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
-		SELECT last_seen_at, agent, role, channel_socket
+		SELECT last_seen_at, agent, role, channel_socket, state, state_changed_at
 		FROM sessions WHERE cwd = ? AND label = ?`,
-		opts.CWD, label).Scan(&lastSeen, &agent, &role, &channel)
+		opts.CWD, label).Scan(&lastSeen, &agent, &role, &channel, &state, &stateChanged)
 	if err == sql.ErrNoRows {
 		return WebMember{Label: label, Activity: "unknown"}, nil
 	}
@@ -647,11 +659,13 @@ func (s *SQLiteLocal) lookupMember(ctx context.Context, opts FetchPairsOpts, lab
 		return WebMember{}, err
 	}
 	return WebMember{
-		Label:      label,
-		Agent:      nullString(agent),
-		Role:       nullString(role),
-		LastSeenAt: nullString(lastSeen),
-		Channel:    channel.Valid && channel.String != "",
+		Label:          label,
+		Agent:          nullString(agent),
+		Role:           nullString(role),
+		LastSeenAt:     nullString(lastSeen),
+		Channel:        channel.Valid && channel.String != "",
+		State:          nullString(state),
+		StateChangedAt: nullString(stateChanged),
 	}, nil
 }
 

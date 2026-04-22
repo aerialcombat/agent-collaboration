@@ -394,6 +394,11 @@ func memberToJSON(m sqlitestore.WebMember, includeLabel bool) map[string]any {
 		"activity":     m.Activity,
 		"last_seen_at": orNull(m.LastSeenAt),
 		"channel":      m.Channel,
+		// v3.8 activity monitoring: "active" | "idle" | null. Client
+		// renders a pulse dot when state == "active"; state_changed_at
+		// feeds the "busy for Xs" tooltip.
+		"state":            orNull(m.State),
+		"state_changed_at": orNull(m.StateChangedAt),
 	}
 	if includeLabel {
 		out["label"] = m.Label

@@ -99,8 +99,10 @@ PYTHON_MIN = (3, 9)
 # Item 5's 0006 migration that adds the pending_outbound table for the
 # laptop-side federation queue. Bumped 6 → 7 for v3.3 Item 7's 0007
 # migration that adds sessions.auth_token for per-session bearer auth on
-# /api/send.
-GOOSE_VERSION_REQUIRED = 7
+# /api/send. Bumped 7 → 8 for v3.8's 0008 migration that adds
+# sessions.state + sessions.state_changed_at for agent activity
+# monitoring.
+GOOSE_VERSION_REQUIRED = 8
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",

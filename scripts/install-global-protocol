@@ -19,6 +19,7 @@ PEER_INBOX_HOOKS_DIR="$PEER_INBOX_HOME/hooks"
 PEER_INBOX_DB_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-db.py"
 PEER_INBOX_CHANNEL_SCRIPT="$PEER_INBOX_SCRIPTS_DIR/peer-inbox-channel.py"
 PEER_INBOX_HOOK_SCRIPT="$PEER_INBOX_HOOKS_DIR/peer-inbox-inject.sh"
+PEER_INBOX_STATE_HOOK="$PEER_INBOX_HOOKS_DIR/peer-inbox-state.sh"
 # Topic 3 v0 (auto-reply daemon) — go binaries + config dir.
 PEER_INBOX_DAEMONS_DIR="$PEER_INBOX_HOME/daemons"
 PEER_INBOX_DAEMON_BIN="$BIN_DIR/agent-collab-daemon"
@@ -799,11 +800,15 @@ if not isinstance(entries, list):
     print(f"error: {settings_path} hooks.{event_name} is not a list", file=sys.stderr)
     sys.exit(1)
 
+# Use the basename of the command as the uniqueness key so this helper
+# works for multiple peer-inbox hook scripts (inject.sh, state.sh, ...).
+match_key = os.path.basename(hook_command.split()[0] if hook_command else "")
+
 def matcher_has_our_command(matcher):
     if not isinstance(matcher, dict):
         return False
     for h in matcher.get("hooks", []) or []:
-        if isinstance(h, dict) and "peer-inbox-inject.sh" in (h.get("command") or ""):
+        if isinstance(h, dict) and match_key and match_key in (h.get("command") or ""):
             return True
     return False
 
@@ -1017,10 +1022,17 @@ case "$MODE" in
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-db.py" "$PEER_INBOX_DB_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/scripts/peer-inbox-channel.py" "$PEER_INBOX_CHANNEL_SCRIPT"
     install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-inject.sh" "$PEER_INBOX_HOOK_SCRIPT"
+    # v3.8: Stop-hook that flips sessions.state=idle when the agent's turn
+    # ends. Paired with the Go UserPromptSubmit hook which flips to active.
+    install_peer_inbox_file "$PROJECT_ROOT/hooks/peer-inbox-state.sh" "$PEER_INBOX_STATE_HOOK"
     # pi-coding-agent extension: gives any pi session a channel_socket for
     # realtime peer-inbox integration. Safe no-op if pi isn't installed.
     install_peer_inbox_file "$PROJECT_ROOT/extensions/peer-inbox-pi.ts" "$PI_PEER_INBOX_EXTENSION"
     merge_claude_hook "$CLAUDE_SETTINGS" "$PEER_INBOX_HOOK_SCRIPT" "$TIMESTAMP"
+    # Wire the Stop hook alongside UserPromptSubmit. merge_hook_json's
+    # basename-derived dedupe keeps multiple peer-inbox hooks on the
+    # same settings file happy.
+    merge_hook_json "$CLAUDE_SETTINGS" "Stop" "$PEER_INBOX_STATE_HOOK" 5 "$TIMESTAMP"
     # Register the same unified hook with Codex and Gemini if their homes
     # exist (detected via $HOME/.{codex,gemini} already ensured by mkdir
     # above). The hook script is schema-agnostic — all three CLIs parse

@@ -107,6 +107,8 @@ func run(args []string) int {
 		return runSessionAdopt(rest)
 	case "session-close":
 		return runSessionClose(rest)
+	case "session-state":
+		return runSessionState(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
