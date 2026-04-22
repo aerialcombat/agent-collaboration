@@ -100,6 +100,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/messages", s.handleMessages)
 	s.mux.HandleFunc("/api/index", s.handleIndex)
 	s.mux.HandleFunc("/api/send", s.handleSend)
+	s.mux.HandleFunc("/api/channel-push", s.handleChannelPush)
 	s.mux.HandleFunc("/api/rooms/terminate-inactive", s.handleTerminateInactive)
 	s.mux.HandleFunc("/view", s.handleView)
 	// Root serves the multi-room index. Anything else falls through to

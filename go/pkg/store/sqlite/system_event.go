@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"fmt"
-	"os"
 	"regexp"
 	"time"
 )
@@ -135,10 +134,7 @@ func (s *SQLiteLocal) EmitSystemEvent(ctx context.Context, p SystemEventParams) 
 	}
 
 	for _, r := range live {
-		if r.sock == "" {
-			continue
-		}
-		if _, err := os.Stat(r.sock); err != nil {
+		if !channelAlive(r.sock) {
 			continue
 		}
 		meta := make(map[string]string, len(base)+1)
@@ -146,7 +142,7 @@ func (s *SQLiteLocal) EmitSystemEvent(ctx context.Context, p SystemEventParams) 
 			meta[k] = v
 		}
 		meta["to"] = r.label
-		_, _ = sendOverUnixSocket(r.sock, map[string]any{
+		_, _ = pushChannel(r.sock, map[string]any{
 			"from": p.SelfLabel,
 			"body": p.Body,
 			"meta": meta,

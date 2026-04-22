@@ -32,6 +32,7 @@ type webStore interface {
 	Send(ctx context.Context, params sqlitestore.SendParams) (sqlitestore.SendResult, error)
 	BroadcastLocal(ctx context.Context, params sqlitestore.SendParams) ([]sqlitestore.SendResult, error)
 	RegisterOwner(ctx context.Context, params sqlitestore.RegisterOwnerParams) error
+	ForwardLocalPush(ctx context.Context, label, pairKey string, payload map[string]any) (int, string, error)
 	Close() error
 }
 

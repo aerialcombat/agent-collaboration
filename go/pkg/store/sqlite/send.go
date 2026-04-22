@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -9,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -234,22 +237,20 @@ func (s *SQLiteLocal) Send(ctx context.Context, p SendParams) (SendResult, error
 	mentions := resolveMentions(p.Body, p.Mentions, members, p.SenderLabel)
 
 	push := "no-channel"
-	if recvSock != "" {
-		if _, err := os.Stat(recvSock); err == nil {
-			meta := map[string]string{"to": p.ToLabel}
-			if len(mentions) > 0 {
-				meta["mentions"] = strings.Join(mentions, ",")
-			}
-			code, _ := sendOverUnixSocket(recvSock, map[string]any{
-				"from": p.SenderLabel,
-				"body": p.Body,
-				"meta": meta,
-			})
-			if code == 200 {
-				push = "pushed"
-			} else {
-				push = fmt.Sprintf("push-failed(%d)", code)
-			}
+	if recvSock != "" && channelAlive(recvSock) {
+		meta := map[string]string{"to": p.ToLabel}
+		if len(mentions) > 0 {
+			meta["mentions"] = strings.Join(mentions, ",")
+		}
+		code, _ := pushChannel(recvSock, map[string]any{
+			"from": p.SenderLabel,
+			"body": p.Body,
+			"meta": meta,
+		})
+		if code == 200 {
+			push = "pushed"
+		} else {
+			push = fmt.Sprintf("push-failed(%d)", code)
 		}
 	}
 
@@ -406,11 +407,7 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 		cohortLabels = strings.Join(labels, ",")
 	}
 	for i, r := range recipients {
-		if r.channelSocket == "" {
-			results[i].PushStatus = "no-channel"
-			continue
-		}
-		if _, err := os.Stat(r.channelSocket); err != nil {
+		if !channelAlive(r.channelSocket) {
 			results[i].PushStatus = "no-channel"
 			continue
 		}
@@ -421,7 +418,7 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 		if len(mentions) > 0 {
 			meta["mentions"] = strings.Join(mentions, ",")
 		}
-		code, _ := sendOverUnixSocket(r.channelSocket, map[string]any{
+		code, _ := pushChannel(r.channelSocket, map[string]any{
 			"from": p.SenderLabel,
 			"body": p.Body,
 			"meta": meta,
@@ -872,6 +869,95 @@ func NewULID(now time.Time) string {
 		hi >>= 5
 	}
 	return string(out[:])
+}
+
+// channelAlive returns true when the URI looks deliverable. For unix paths,
+// stats the socket file (existing pre-dial check preserves the "no-channel"
+// vs "push-failed" distinction Python has). For http/https, always returns
+// true — reachability is a runtime answer determined by the POST itself.
+func channelAlive(uri string) bool {
+	if uri == "" {
+		return false
+	}
+	// Fast path: bare unix path (no scheme).
+	if !strings.Contains(uri, "://") {
+		_, err := os.Stat(uri)
+		return err == nil
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "unix":
+		_, err := os.Stat(u.Path)
+		return err == nil
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+// ---- Channel push dispatcher ----------------------------------------------
+
+// pushChannel is the v3.5 unified channel-push entry point. The `uri` is
+// pulled from sessions.channel_socket (historical name; now holds a URI).
+// Scheme dispatch:
+//
+//   unix:///path/to.sock      → sendOverUnixSocket (same-host)
+//   /path/to.sock (bare)      → sendOverUnixSocket (legacy unix-path format)
+//   http://host/.../channel-push?label=X   → sendOverHTTPChannelPush
+//   https://...               → sendOverHTTPChannelPush (TLS)
+//
+// Returns (httpStatusCode, bodyOrError). code==0 means the transport failed
+// before any status line was read; the string payload carries the diagnostic.
+func pushChannel(uri string, payload map[string]any) (int, string) {
+	if uri == "" {
+		return 0, "no channel"
+	}
+	// Heuristic: if the value has no scheme (no ://), treat as a bare unix
+	// socket path — this matches every channel_socket ever written before v3.5.
+	if !strings.Contains(uri, "://") {
+		return sendOverUnixSocket(uri, payload)
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return 0, "parse uri: " + err.Error()
+	}
+	switch u.Scheme {
+	case "unix":
+		return sendOverUnixSocket(u.Path, payload)
+	case "http", "https":
+		return sendOverHTTPChannelPush(uri, payload)
+	default:
+		return 0, "unsupported channel scheme: " + u.Scheme
+	}
+}
+
+// sendOverHTTPChannelPush POSTs the channel payload to a peer host's
+// /api/channel-push endpoint. The URL carries label + pair_key as query
+// params (set by session-register when the URI was minted). The receiving
+// peer-web looks up its own local session with that label and forwards to
+// the local unix socket. PoC: unauthenticated. v3.5.1 adds bearer auth.
+func sendOverHTTPChannelPush(pushURL string, payload map[string]any) (int, string) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "marshal error: " + err.Error()
+	}
+	req, err := http.NewRequest("POST", pushURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, "new request: " + err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: channelSocketTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(respBody)
 }
 
 // ---- Unix-socket push -----------------------------------------------------

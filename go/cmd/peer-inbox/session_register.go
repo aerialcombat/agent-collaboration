@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
@@ -35,6 +36,7 @@ func runSessionRegister(args []string) int {
 		newPair     = fs.Bool("new-pair", false, "mint a fresh pair-key slug and print it")
 		receiveMode = fs.String("receive-mode", "", "interactive | daemon (Topic 3 §3.4 (b) verb-entry gate)")
 		homeHost    = fs.String("home-host", "", "v3.3 federation home host (defaults to AGENT_COLLAB_SELF_HOST / hostname)")
+		channelURI  = fs.String("channel-uri", "", "v3.5 explicit channel URI (unix:// or http(s)://...); overrides auto-detected unix socket")
 		force       = fs.Bool("force", false, "override idle-collision guard")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -129,7 +131,14 @@ func runSessionRegister(args []string) int {
 	// Pair with the channel MCP server Claude spawned at session start.
 	// Best-effort: silently no-op when no channel is live (e.g. codex /
 	// gemini sessions, or a Claude session whose channel exited).
-	channelSocket := findPendingChannelSocket()
+	//
+	// v3.5: --channel-uri <uri> overrides the auto-detected unix socket.
+	// Operators pass an http(s):// URL here to make the session
+	// cross-host-reachable via the remote peer-web's /api/channel-push.
+	channelSocket := *channelURI
+	if channelSocket == "" {
+		channelSocket = findPendingChannelSocket()
+	}
 
 	res, err := st.RegisterSession(ctx, sqlitestore.SessionRegisterParams{
 		CWD: resolvedCWD, Label: finalLabel, Agent: *agent, Role: *role,
@@ -183,7 +192,15 @@ func runSessionRegister(args []string) int {
 	}
 	channelNote := " [channel: none]"
 	if channelSocket != "" {
-		channelNote = " [channel: paired]"
+		// v3.5: distinguish unix (same-host push) from http (cross-host
+		// reachable) so operators can verify their --channel-uri took.
+		kind := "paired"
+		if strings.HasPrefix(channelSocket, "http://") || strings.HasPrefix(channelSocket, "https://") {
+			kind = "http"
+		} else if strings.HasPrefix(channelSocket, "unix://") {
+			kind = "unix"
+		}
+		channelNote = fmt.Sprintf(" [channel: %s]", kind)
 	}
 	pairNote := ""
 	if res.PairKey != "" {
