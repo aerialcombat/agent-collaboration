@@ -168,11 +168,11 @@ for audit.
 
 ```
 --all-cwds           show sessions in every cwd (default: this cwd only)
---include-stale      include sessions not seen in > 30 min
+--include-stale      include sessions not seen in > 6 hr
 --json               machine-readable output
 ```
 
-Activity states: `active` (<5 min), `idle` (5–30 min), `stale` (excluded
+Activity states: `active` (<5 min), `idle` (5 min – 6 hr), `stale` (excluded
 by default).
 
 ### Messaging: send / receive / list
@@ -190,9 +190,9 @@ by default).
 
 Rules enforced:
 - Body cap 8 KB.
-- Recipient inactive >30 min → error `peer offline: <label>`.
+- Recipient inactive >6 hr → error `peer offline: <label>`.
 - Pair `[[end]]`-terminated → rejected (see [reset](#agent-collab-peer-reset)).
-- Pair turn count `>= AGENT_COLLAB_MAX_PAIR_TURNS` (default 20) → rejected.
+- Pair turn count `>= AGENT_COLLAB_MAX_PAIR_TURNS` (default 500) → rejected.
 - Body containing `[[end]]` (case-insensitive) marks pair terminated.
 
 Output prefixed with push status: `(pushed)`, `(no-channel)`, or
@@ -223,7 +223,7 @@ Format notes:
 
 ```
 --as <label>          optional
---include-stale       include peers not seen in > 30 min
+--include-stale       include peers not seen in > 6 hr
 --json                machine-readable output
 ```
 
@@ -375,7 +375,7 @@ in its running context **without a user prompt**.
 
 #### Guardrails shipped by default
 
-- **Max turns per pair.** Default 20 (`AGENT_COLLAB_MAX_PAIR_TURNS`).
+- **Max turns per pair.** Default 500 (`AGENT_COLLAB_MAX_PAIR_TURNS`).
   Further sends return an error with reset hint.
 - **Explicit termination.** Any `peer send` whose body contains
   `[[end]]` (case-insensitive) marks the pair as terminated; subsequent
@@ -706,7 +706,7 @@ agent-collab session adopt --label <your-label> --session-id <claude-uuid>
 
 ### `peer offline: <label>`
 
-The recipient hasn't been seen in > 30 min. Check:
+The recipient hasn't been seen in > 6 hr. Check:
 
 ```bash
 agent-collab peer list --include-stale
@@ -770,7 +770,7 @@ Environment variables read by `peer-inbox-db.py` and the channel server:
 | `CLAUDE_SESSION_ID` | (set by hook) | Claude's runtime session ID; propagated by the hook |
 | `CODEX_SESSION_ID` | — | Session discriminator for Codex runs |
 | `GEMINI_SESSION_ID` | — | Session discriminator for Gemini runs |
-| `AGENT_COLLAB_MAX_PAIR_TURNS` | `20` | Max turns per pair before send rejection |
+| `AGENT_COLLAB_MAX_PAIR_TURNS` | `500` | Max turns per pair before send rejection |
 | `AGENT_COLLAB_HOOK_LOG` | `~/.agent-collab/hook.log` | Hook failure log location |
 | `PEER_INBOX_SOCKET_DIR` | `/tmp/peer-inbox` | Channel Unix socket directory (short, for macOS AF_UNIX 104-char cap) |
 | `PEER_INBOX_PENDING_DIR` | `~/.agent-collab/pending-channels` | Channel-server process registry (for register pairing) |

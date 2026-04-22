@@ -10,7 +10,7 @@ import (
 // Default from AGENT_COLLAB_MAX_PAIR_TURNS in the Python CLI. Kept in
 // parity so turn-cap warnings land at the same threshold the sender
 // hits at cap-time.
-const defaultMaxPairTurns = 100
+const defaultMaxPairTurns = 500
 
 // ScopeResponse mirrors the Python /scope.json payload with additions
 // for multi-room mode. The Python version always returned exactly one

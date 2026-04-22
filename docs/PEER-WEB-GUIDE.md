@@ -74,7 +74,7 @@ available as the From option and auto-registers on first send in
 pair-key mode.
 
 **Turn-cap meter.** Detail-page header shows `N/MAX turns (P%)`. Colors
-yellow at ≥80% of `AGENT_COLLAB_MAX_PAIR_TURNS` (default 100). Warns
+yellow at ≥80% of `AGENT_COLLAB_MAX_PAIR_TURNS` (default 500). Warns
 before you hit the cap mid-broadcast.
 
 **Stale-member filter.** Detail-page sidebar has a `show stale members`

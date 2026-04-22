@@ -26,7 +26,7 @@ DEFAULT_DB = Path.home() / ".agent-collab" / "sessions.db"
 DEFAULT_CLAUDE_SESSION_LOG_DIR = Path.home() / ".agent-collab" / "claude-sessions-seen"
 DEFAULT_PENDING_CHANNELS_DIR = Path.home() / ".agent-collab" / "pending-channels"
 SESSIONS_DIR_REL = ".agent-collab/sessions"
-DEFAULT_MAX_PAIR_TURNS = 100
+DEFAULT_MAX_PAIR_TURNS = 500
 TERMINATION_TOKEN = "[[end]]"
 LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PAIR_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
@@ -76,7 +76,7 @@ PAIR_KEY_NOUNS = (
 )
 MAX_BODY_BYTES = int(os.environ.get("AGENT_COLLAB_MAX_BODY_BYTES", 8 * 1024))
 HOOK_BLOCK_BUDGET = int(os.environ.get("AGENT_COLLAB_HOOK_BLOCK_BUDGET", 4 * 1024))
-STALE_THRESHOLD_SECS = 30 * 60
+STALE_THRESHOLD_SECS = 6 * 60 * 60
 IDLE_THRESHOLD_SECS = 5 * 60
 SQLITE_MIN_VERSION = (3, 35, 0)
 PYTHON_MIN = (3, 9)

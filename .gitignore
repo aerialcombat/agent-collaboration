@@ -1,29 +1,25 @@
-.DS_Store
-.agent-collab/reviews/
-.agent-collab/replay-*.html
-.agent-collab/sessions/
-docs/superpowers/
-scripts/__pycache__/
-**/__pycache__/
-
-# Go build artifacts
-go/bin/
-
-# Scratch / ad-hoc polling
-poll_messages.sh
-
-# Topic 3 daemon runtime artifacts (v3.x auto-reply-driver)
-.agent-collab/daemon/
-*.daemon.pid
-*.daemon.log
 
 # Claude Code per-user local settings + worktrees
+# Go build artifacts
+# Scratch / ad-hoc polling
+# Topic 3 daemon runtime artifacts (v3.x auto-reply-driver)
+# on failing runs; never checked in.
+# pi-mono per-repo scratch (messenger / etc.)
+# v3.4 parity harness debug snapshots — written by tests/parity/run.sh
+**/__pycache__/
+*.daemon.log
+*.daemon.pid
+.DS_Store
+.agent-collab/daemon/
+.agent-collab/replay-*.html
+.agent-collab/reviews/
+.agent-collab/sessions/
 .claude/settings.local.json
 .claude/worktrees/
-
-# pi-mono per-repo scratch (messenger / etc.)
 .pi/
-
-# v3.4 parity harness debug snapshots — written by tests/parity/run.sh
-# on failing runs; never checked in.
+docs/superpowers/
+go/.agent-collab/
+go/bin/
+poll_messages.sh
+scripts/__pycache__/
 tests/fixtures/parity/**/*.actual.json

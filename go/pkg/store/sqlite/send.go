@@ -45,7 +45,7 @@ const (
 	// Mirror of scripts/peer-inbox-db.py's DEFAULT_MAX_PAIR_TURNS +
 	// TERMINATION_TOKEN + STALE_THRESHOLD_SECS constants. Kept here
 	// so the Go port doesn't need to re-derive them at every call site.
-	defaultMaxPairTurns  = 100
+	defaultMaxPairTurns  = 500
 	terminationToken     = "[[end]]"
 	defaultMaxBodyBytes  = 8 * 1024
 	channelSocketTimeout = 2 * time.Second

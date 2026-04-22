@@ -115,8 +115,8 @@ Worktrees and symlinks resolve to distinct canonical paths, so labels
 never collide across worktrees of the same repo.
 
 `agent-collab peer list` shows active peers in the caller's repo. Activity
-is derived from `last_seen_at`: active (< 5 min), idle (5-30 min), stale
-(> 30 min; excluded from list by default, sends return `peer offline`).
+is derived from `last_seen_at`: active (< 5 min), idle (5 min – 6 hr), stale
+(> 6 hr; excluded from list by default, sends return `peer offline`).
 
 ### Message exchange
 
