@@ -245,6 +245,18 @@ func (s *SQLiteLocal) Send(ctx context.Context, p SendParams) (SendResult, error
 		if p.PairKey != "" {
 			meta["pair_key"] = p.PairKey
 		}
+		// v3.7: stamp sender's role + agent so receivers can
+		// distinguish a human (agent=human / role=owner) from agents.
+		// Lets the MCP prioritize owner messages instead of applying
+		// party-mode silence defaults to human pings.
+		if fromRole, fromAgent, err := s.GetSessionRoleAgent(ctx, p.SenderCWD, p.SenderLabel); err == nil {
+			if fromRole != "" {
+				meta["from_role"] = fromRole
+			}
+			if fromAgent != "" {
+				meta["from_agent"] = fromAgent
+			}
+		}
 		if len(mentions) > 0 {
 			meta["mentions"] = strings.Join(mentions, ",")
 		}
@@ -400,6 +412,10 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 	for i := range results {
 		results[i].Mentions = mentions
 	}
+	// v3.7: resolve sender role + agent once for the whole fan-out so
+	// every recipient's push meta carries the same from_role/from_agent.
+	fromRole, fromAgent, _ := s.GetSessionRoleAgent(ctx, p.SenderCWD, p.SenderLabel)
+
 	// Push meta includes broadcast="1" on every fan-out push, plus a
 	// sorted cohort-labels list when the send is a multicast (ToLabel !=
 	// ""). Mirrors Python cmd_peer_broadcast:2395-2402.
@@ -422,6 +438,14 @@ func (s *SQLiteLocal) BroadcastLocal(ctx context.Context, p SendParams) ([]SendR
 		// replies back into the room the broadcast came from.
 		if p.PairKey != "" {
 			meta["pair_key"] = p.PairKey
+		}
+		// v3.7: same role/agent stamping as Send, so broadcast-mode
+		// human pings aren't lost in party-mode silence.
+		if fromRole != "" {
+			meta["from_role"] = fromRole
+		}
+		if fromAgent != "" {
+			meta["from_agent"] = fromAgent
 		}
 		if cohortLabels != "" {
 			meta["cohort"] = cohortLabels

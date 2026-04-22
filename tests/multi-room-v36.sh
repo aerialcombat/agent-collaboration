@@ -226,6 +226,25 @@ PY
   fi
 }
 
+assert_meta_key_for_body() {
+  local body_substr="$1" want_key="$2" want_val="$3"
+  local line
+  line="$(grep -F "$body_substr" "$MCP_OUT" | head -1 || true)"
+  [ -n "$line" ] || fail "no channel notification found for body '$body_substr'"
+  if ! python3 - "$line" "$want_key" "$want_val" <<'PY'; then
+import json, sys
+line, want_key, want_val = sys.argv[1], sys.argv[2], sys.argv[3]
+obj = json.loads(line)
+meta = (obj.get("params") or {}).get("meta") or {}
+got = meta.get(want_key)
+if got != want_val:
+    print(f"meta.{want_key} mismatch: got={got!r} want={want_val!r} (body={line!r})", file=sys.stderr)
+    sys.exit(1)
+PY
+    fail "meta.$want_key mismatch for body '$body_substr' (want $want_val)"
+  fi
+}
+
 assert_meta_pair_key_for_body "hello-from-A" "$PK_A"
 assert_meta_pair_key_for_body "hello-from-B" "$PK_B"
 
@@ -393,4 +412,49 @@ kill "$MCP2_PID" 2>/dev/null; wait "$MCP2_PID" 2>/dev/null
 
 echo "OK  M3 — ambiguous reply errors with helpful disambiguation message"
 
-echo "all multi-room v3.6 checks passed"
+# ---------------------------------------------------------------------------
+# M4 — v3.7 from_role / from_agent stamping. A human owner (agent=human,
+# role=owner) sending into the room must stamp meta.from_role="owner" and
+# meta.from_agent="human" on the channel push so receiving MCPs can
+# distinguish human pings from agent chatter.
+CWD_OWNER="$TMP/owner-cwd"; mkdir -p "$CWD_OWNER"
+pi session-register \
+  --cwd "$CWD_OWNER" --label human-owner --agent human --role owner \
+  --session-key "owner-m4-$$" --pair-key "$PK_A" --force >/dev/null \
+  || fail "register human-owner"
+
+pi peer-send \
+  --cwd "$CWD_OWNER" --as human-owner --to recv \
+  --message "v3.7 owner ping: respond now" >/dev/null \
+  || fail "human-owner peer-send"
+
+sleep 0.4
+
+assert_meta_key_for_body "v3.7 owner ping" "from_role" "owner"
+assert_meta_key_for_body "v3.7 owner ping" "from_agent" "human"
+
+# An agent peer send should carry from_agent but not from_role=owner.
+pi peer-send \
+  --cwd "$CWD_A" --as peer-a --to recv \
+  --message "v3.7 agent ping: routine chatter" >/dev/null \
+  || fail "peer-a agent peer-send"
+sleep 0.3
+assert_meta_key_for_body "v3.7 agent ping" "from_agent" "claude"
+# peer-a has role="peer" (see session-register above) — stamping is
+# correct regardless, what matters is it's NOT "owner".
+if grep -F "v3.7 agent ping" "$MCP_OUT" | python3 -c '
+import json, sys
+line = sys.stdin.read().strip()
+obj = json.loads(line)
+meta = (obj.get("params") or {}).get("meta") or {}
+if meta.get("from_role") == "owner":
+    sys.exit(1)
+'; then
+  :
+else
+  fail "agent send wrongly stamped from_role=owner"
+fi
+
+echo "OK  M4 — v3.7 from_role / from_agent stamped per sender"
+
+echo "all multi-room v3.6 + v3.7 checks passed"

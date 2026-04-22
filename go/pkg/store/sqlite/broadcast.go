@@ -97,3 +97,33 @@ func (s *SQLiteLocal) GetSessionRole(ctx context.Context, cwd, label string) (st
 	}
 	return role.String, nil
 }
+
+// GetSessionRoleAgent reads the role + agent columns for (cwd, label),
+// returning ("", "", nil) when the row is missing or the columns are
+// NULL. v3.7: used by Send / BroadcastLocal / EmitSystemEvent to stamp
+// meta.from_role and meta.from_agent on channel pushes so receiving
+// MCPs can distinguish a human owner's broadcast from agent chatter
+// (the motivating case: owner messages in peer-web should pull
+// responses, not drift past as party-mode silence).
+func (s *SQLiteLocal) GetSessionRoleAgent(ctx context.Context, cwd, label string) (string, string, error) {
+	var role, agent sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT role, agent FROM sessions WHERE cwd = ? AND label = ?`,
+		cwd, label,
+	).Scan(&role, &agent)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", nil
+		}
+		return "", "", fmt.Errorf("GetSessionRoleAgent: %w", err)
+	}
+	r := ""
+	if role.Valid {
+		r = role.String
+	}
+	a := ""
+	if agent.Valid {
+		a = agent.String
+	}
+	return r, a, nil
+}
