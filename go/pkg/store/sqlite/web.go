@@ -13,7 +13,7 @@ import (
 // seconds + a helper for parity with the Python heuristic.
 const (
 	activeThresholdSecs = 5 * 60
-	staleThresholdSecs  = 6 * 60 * 60
+	staleThresholdSecs  = 24 * 60 * 60
 )
 
 // WebMember is a peer entry in a pair or room listing. Label is the

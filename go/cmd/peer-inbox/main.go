@@ -674,7 +674,7 @@ func stringContains(s, sub string) bool {
 // will surface drift on the next CI run.
 const (
 	idleThresholdSecs  = 5 * 60
-	staleThresholdSecs = 6 * 60 * 60
+	staleThresholdSecs = 24 * 60 * 60
 )
 
 // sessionListRowJSON is the per-row JSON shape Python emits. Keys and

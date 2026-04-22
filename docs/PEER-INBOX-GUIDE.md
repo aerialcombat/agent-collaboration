@@ -168,11 +168,11 @@ for audit.
 
 ```
 --all-cwds           show sessions in every cwd (default: this cwd only)
---include-stale      include sessions not seen in > 6 hr
+--include-stale      include sessions not seen in > 24 hr
 --json               machine-readable output
 ```
 
-Activity states: `active` (<5 min), `idle` (5 min – 6 hr), `stale` (excluded
+Activity states: `active` (<5 min), `idle` (5 min – 24 hr), `stale` (excluded
 by default).
 
 ### Messaging: send / receive / list
@@ -190,7 +190,7 @@ by default).
 
 Rules enforced:
 - Body cap 8 KB.
-- Recipient inactive >6 hr → error `peer offline: <label>`.
+- Recipient inactive >24 hr → error `peer offline: <label>`.
 - Pair `[[end]]`-terminated → rejected (see [reset](#agent-collab-peer-reset)).
 - Pair turn count `>= AGENT_COLLAB_MAX_PAIR_TURNS` (default 500) → rejected.
 - Body containing `[[end]]` (case-insensitive) marks pair terminated.
@@ -223,7 +223,7 @@ Format notes:
 
 ```
 --as <label>          optional
---include-stale       include peers not seen in > 6 hr
+--include-stale       include peers not seen in > 24 hr
 --json                machine-readable output
 ```
 
@@ -706,7 +706,7 @@ agent-collab session adopt --label <your-label> --session-id <claude-uuid>
 
 ### `peer offline: <label>`
 
-The recipient hasn't been seen in > 6 hr. Check:
+The recipient hasn't been seen in > 24 hr. Check:
 
 ```bash
 agent-collab peer list --include-stale
