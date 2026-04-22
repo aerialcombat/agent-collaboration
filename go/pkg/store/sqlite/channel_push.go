@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // v3.5 channel-push gateway support. Peers on other hosts POST to this
@@ -77,6 +78,29 @@ func (s *SQLiteLocal) ForwardLocalPush(
 	code, body := pushChannel(uri, payload)
 	if code == 0 {
 		return 0, body, fmt.Errorf("forward unix push: %s", body)
+	}
+
+	// v3.8 phase 2 follow-up: a successful forward proves the receiving
+	// MCP is alive and responsive. Bump last_seen_at on the row we
+	// just delivered to so it doesn't drift into the stale bucket
+	// just because it never originates sends of its own. Without this,
+	// agents whose only traffic is *inbound* (e.g. laptop-client
+	// receiving from a federated orange) look disconnected after the
+	// 24hr stale threshold even though the socket was being written
+	// to moments ago.
+	if code == 200 {
+		nowISO := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		if pairKey == "" {
+			_, _ = s.db.ExecContext(ctx,
+				`UPDATE sessions SET last_seen_at = ?
+				 WHERE label = ? AND pair_key IS NULL`,
+				nowISO, label)
+		} else {
+			_, _ = s.db.ExecContext(ctx,
+				`UPDATE sessions SET last_seen_at = ?
+				 WHERE label = ? AND pair_key = ?`,
+				nowISO, label, pairKey)
+		}
 	}
 	return code, body, nil
 }
