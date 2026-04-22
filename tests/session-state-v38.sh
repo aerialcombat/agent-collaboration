@@ -238,8 +238,8 @@ if not rooms:
 members = {m["label"]: m for m in (rooms[0].get("members") or [])}
 want = {
     "the-human": "human",
-    "zombie":    "disconnected",
-    "alpha":     "waiting",  # was idle from earlier
+    "zombie":    "disconnected",   # no channel + stale last_seen
+    "alpha":     "waiting",        # state=idle, channel=yes
 }
 fail_lines = []
 for label, expected in want.items():

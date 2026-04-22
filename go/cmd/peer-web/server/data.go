@@ -416,17 +416,17 @@ func memberToJSON(m sqlitestore.WebMember, includeLabel bool) map[string]any {
 }
 
 // deriveStateDisplay composes a UI-ready state label from the raw
-// state column plus reachability heuristics. Values:
+// state column plus reachability heuristics. Three-color palette:
 //
-//	"active"       — turn in progress (raw state=active)
-//	"waiting"      — waiting for input (raw state=idle)
-//	"disconnected" — no channel + last_seen older than the activity
-//	                  threshold (activityState() == "stale")
-//	"unknown"      — agent reachable but state column is NULL
-//	                  (pre-v3.8 session or one that hasn't hit its
-//	                  first hook yet)
-//	"human"        — agent=human (owner in peer-web browser); no
-//	                  activity dot expected or rendered.
+//	"active"       — green. turn in progress (raw state=active).
+//	"waiting"      — yellow. alive + idle (raw state=idle).
+//	"disconnected" — red. unreachable OR no state data yet; anything
+//	                  we can't positively confirm as active-or-waiting
+//	                  collapses into this bucket so the dot never
+//	                  silently lies. Covers: dead process, stale
+//	                  last_seen, NULL state column (pre-v3.8 session
+//	                  or a session that hasn't fired its first hook).
+//	"human"        — hidden. agent=human (owner in peer-web browser).
 //
 // The function is pure — no DB reads — so it's cheap to call on every
 // member render.
@@ -446,7 +446,10 @@ func deriveStateDisplay(m sqlitestore.WebMember) string {
 	case "idle":
 		return "waiting"
 	default:
-		return "unknown"
+		// No state signal yet — treat as disconnected. Better to show
+		// red than to silently assert "alive and waiting" when we have
+		// no evidence the agent's hook has ever fired.
+		return "disconnected"
 	}
 }
 
