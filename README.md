@@ -47,6 +47,8 @@ channels are an additive push signal.
 Docs:
 - [Peer Inbox Guide](docs/PEER-INBOX-GUIDE.md) — install, daily use, troubleshooting
 - [Peer Inbox Architecture](docs/PEER-INBOX-ARCHITECTURE.md) — system design, schema, delivery paths
+- [Peer Web Guide](docs/PEER-WEB-GUIDE.md) — browser dashboard routes + features
+- [iOS Companion](ios/README.md) — native SwiftUI app that talks to `peer-web`
 - [CHANGELOG](CHANGELOG.md) — v1.0 through v1.7
 
 ## What This Project Contains

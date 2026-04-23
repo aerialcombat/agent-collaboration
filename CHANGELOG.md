@@ -10,6 +10,18 @@ Commit SHAs reference the `agent-collaboration` repo.
 ## Unreleased — 2026-04-23
 
 ### Added
+- **Native iOS companion app** (`ios/`). SwiftUI, iOS 18+, no
+  third-party dependencies. Three-view surface — Settings, RoomsList,
+  Room — hitting peer-web's REST API with bearer-token auth. Feature
+  parity floor with the web view: rooms list sorted by `last_at`,
+  open a room and land on newest messages, scroll-up loads older 100
+  via the `&before=` cursor, compose + send `@room` broadcasts, 3s
+  tail poll for new arrivals. Verified end-to-end in the iPhone 17
+  Pro simulator against `:18081` (`d52d971`, `2abc618`, `3ffe2f8`).
+  Build: `cd ios && xcodegen generate && open PeerInbox.xcodeproj`.
+  Deferred: push notifications, WebSocket streaming, state dots in
+  the roster, to:label composer, mention highlighting. Full guide at
+  [`ios/README.md`](ios/README.md).
 - **Infinite-scroll pagination on the web UI.** `/api/messages` now
   accepts `&before=N` + `&limit=M` for backward pages and returns
   `has_more` + `oldest_id` cursors. The detail page loads the newest
