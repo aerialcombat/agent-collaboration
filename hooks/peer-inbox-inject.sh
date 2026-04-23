@@ -102,6 +102,22 @@ if [[ -n "$session_id" ]]; then
   # Record seen session_id so future `session register` calls can find it.
   agent-collab hook log-session --cwd "$use_cwd" --session-id "$session_id" \
     >/dev/null 2>>"$LOG" || log "hook log-session failed"
+
+  # v3.8 state=active write. Unconditional counterpart to the Stop hook's
+  # idle write — must run regardless of whether the inbox fast-path below
+  # short-circuits the Go binary (which previously owned this write). Uses
+  # --session-key so it resolves by session_key index alone and works even
+  # when no marker is reachable from $use_cwd.
+  state_bin=""
+  if command -v peer-inbox >/dev/null 2>&1; then
+    state_bin="$(command -v peer-inbox)"
+  elif [[ -x "$HOME/.local/bin/peer-inbox" ]]; then
+    state_bin="$HOME/.local/bin/peer-inbox"
+  fi
+  if [[ -n "$state_bin" ]]; then
+    "$state_bin" session-state active --session-key "$session_id" --quiet \
+      >/dev/null 2>>"$LOG" || log "session-state active failed"
+  fi
 fi
 
 # Fast-path: if the inbox-dirty marker exists and is older than the last
