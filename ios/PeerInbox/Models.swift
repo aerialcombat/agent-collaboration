@@ -27,7 +27,7 @@ struct Room: Decodable, Hashable, Identifiable {
     let lastId: Int?
     let activity: String?
     let lastActiveAt: String?
-    let members: [String: Member]?
+    let members: [Member]?
 
     var id: String { pairKey }
 
@@ -37,7 +37,7 @@ struct Room: Decodable, Hashable, Identifiable {
         case turnCount = "turn_count"
         case lastId = "last_id"
         case activity
-        case lastActiveAt = "last_active_at"
+        case lastActiveAt = "last_at"
         case members
     }
 }
