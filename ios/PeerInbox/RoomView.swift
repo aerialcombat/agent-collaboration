@@ -78,9 +78,14 @@ struct RoomView: View {
                 }
             }
             .listStyle(.plain)
+            // iOS 18: anchor initial scroll to the newest row so users
+            // land on the live conversation (matches web behavior).
+            // defaultScrollAnchor handles the first-paint case that
+            // onChange below misses because it fires before rows lay out.
+            .defaultScrollAnchor(.bottom)
             .onChange(of: messages.last?.id) { _, newId in
                 guard let newId else { return }
-                // Auto-stick to bottom on new arrivals.
+                // Auto-stick to bottom on new arrivals (after initial load).
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(newId, anchor: .bottom)
                 }
