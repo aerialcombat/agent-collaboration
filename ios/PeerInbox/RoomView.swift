@@ -21,15 +21,16 @@ struct RoomView: View {
             if let error {
                 Text(error)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Palette.error)
                     .padding(.horizontal)
                     .padding(.vertical, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.12))
+                    .background(Palette.error.opacity(0.12))
             }
             messagesList
             composer
         }
+        .background(Palette.background)
         .navigationTitle(room.pairKey)
         .navigationBarTitleDisplayMode(.inline)
         .task { await initialLoad() }
@@ -65,19 +66,22 @@ struct RoomView: View {
                     } else if !hasMore {
                         Text("start of history")
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(Palette.tertiaryText)
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.vertical, 4)
                     } else {
                         Text("scroll up for older")
                             .font(.caption2)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(Palette.tertiaryText)
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.vertical, 4)
                     }
                 }
+                .listRowBackground(Palette.background)
             }
             .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(Palette.background)
             // iOS 18: anchor initial scroll to the newest row so users
             // land on the live conversation (matches web behavior).
             // defaultScrollAnchor handles the first-paint case that
@@ -99,9 +103,10 @@ struct RoomView: View {
             TextField("Message…", text: $composeBody, axis: .vertical)
                 .lineLimit(1...5)
                 .textFieldStyle(.plain)
+                .foregroundStyle(Palette.primaryText)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(Color(.secondarySystemBackground))
+                .background(Palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: 18))
             Button {
                 Task { await send() }
@@ -113,11 +118,12 @@ struct RoomView: View {
                 }
             }
             .buttonStyle(.borderedProminent)
+            .tint(Palette.accent)
             .disabled(composeBody.trimmingCharacters(in: .whitespaces).isEmpty || sending)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(.bar)
+        .background(Palette.surface)
     }
 
     // MARK: - Networking
@@ -203,14 +209,14 @@ private struct MessageRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text("\(message.from) → \(message.to)")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Palette.secondaryText)
             Text(message.body)
                 .font(.body)
-                .foregroundStyle(.primary)
+                .foregroundStyle(Palette.primaryText)
                 .fixedSize(horizontal: false, vertical: true)
             Text(message.createdAt.replacingOccurrences(of: "T", with: " ").replacingOccurrences(of: "Z", with: ""))
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Palette.tertiaryText)
         }
         .padding(.vertical, 4)
     }

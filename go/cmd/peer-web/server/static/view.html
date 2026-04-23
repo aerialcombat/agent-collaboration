@@ -4,8 +4,10 @@
 <title>__TITLE__</title>
 <style>
   :root {
-    /* Kraken palette: jet black + deep purple, crypto-fintech precision */
-    --bg:#111111; --fg:#FFFFFF; --muted:#8A8A8A; --accent:#5841D8;
+    /* Dark palette. Primary text is #E5E5E5 (≈87% white) rather than
+       pure white — pure-white-on-near-black causes shimmer/halation on
+       long reads. Target contrast ~12:1, well above WCAG AAA (7:1). */
+    --bg:#121212; --fg:#E5E5E5; --muted:#8A8A8A; --accent:#5841D8;
     --panel:#1A1A1A; --border:rgba(128,128,128,0.22); --sidebar-bg:#0B0B0B;
     --hover:rgba(128,128,128,0.08); --selected:rgba(88,65,216,0.15); --unread:#5841D8;
     --terminated:#f59e0b;
@@ -126,7 +128,7 @@
     display:flex; align-items:center; gap:8px; }
   .pair-header .sub { color:var(--muted); font-size:12px; margin-top:4px;
     display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-  .pill { color:#FFFFFF; padding:2px 8px; border-radius:4px;
+  .pill { color:var(--fg); padding:2px 8px; border-radius:4px;
     font-weight:600; font-size:11px; }
   .arrow { color:var(--muted) }
 

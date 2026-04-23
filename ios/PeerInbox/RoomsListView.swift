@@ -17,14 +17,18 @@ struct RoomsListView: View {
                 VStack(spacing: 8) {
                     Text("Couldn't load rooms.")
                         .font(.headline)
+                        .foregroundStyle(Palette.primaryText)
                     Text(error)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Palette.secondaryText)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
                     Button("Retry") { Task { await load() } }
+                        .tint(Palette.accent)
                         .padding(.top)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Palette.background)
             } else {
                 List {
                     ForEach(rooms) { room in
@@ -33,22 +37,26 @@ struct RoomsListView: View {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(room.pairKey)
                                         .font(.body)
-                                        .foregroundStyle(.primary)
+                                        .foregroundStyle(Palette.primaryText)
                                     Text(roomSubtitle(room))
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(Palette.secondaryText)
                                 }
                                 Spacer()
                                 Image(systemName: "chevron.right")
-                                    .foregroundStyle(.tertiary)
+                                    .foregroundStyle(Palette.tertiaryText)
                                     .imageScale(.small)
                             }
                         }
+                        .listRowBackground(Palette.background)
                     }
                 }
+                .scrollContentBackground(.hidden)
+                .background(Palette.background)
                 .refreshable { await load() }
             }
         }
+        .background(Palette.background)
         .navigationTitle("Rooms")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
