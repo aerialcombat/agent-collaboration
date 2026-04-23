@@ -96,18 +96,33 @@ type FetchPairsOpts struct {
 	CWD     string
 }
 
-// FetchMessagesOpts picks the message stream. After is the last
-// seen id (returns id > after). Pair narrows to one (a, b) edge within
-// the scope; leave zero-valued to return all messages for the scope.
-// PairKey/CWD match FetchPairsOpts semantics.
+// FetchMessagesOpts picks the message stream. Three fetch modes:
+//
+//   - Before > 0:  backward pagination (scroll up). Returns the newest
+//     Limit messages with id < Before, ordered ASC.
+//   - After > 0:   forward polling. Returns up to Limit messages with
+//     id > After, ordered ASC. Used by the tail-poll loop.
+//   - neither:     initial load. Returns the newest Limit messages
+//     overall, ordered ASC.
+//
+// Limit <= 0 is treated as DefaultMessageLimit (100). PairKey/CWD match
+// FetchPairsOpts semantics (exactly one required). Pair narrows to one
+// (a, b) edge within the scope.
 type FetchMessagesOpts struct {
 	PairKey string
 	CWD     string
 	After   int64
+	Before  int64  // id < Before for backward pagination
+	Limit   int64  // max rows returned; <= 0 means DefaultMessageLimit
 	A       string // pair narrowing — both A and B must be set together
 	B       string
 	AsLabel string // cwd-mode + no pair narrowing: filter to conversations involving this label
 }
+
+// DefaultMessageLimit caps /api/messages and FetchMessages when the
+// caller doesn't specify Limit. 100 is the page size the web client
+// uses for both initial load and scroll-up pagination.
+const DefaultMessageLimit = 100
 
 // SessionAuth represents the identity derived from a bearer token on the
 // /api/send path (v3.3 Item 7). Label + CWD tell the request handler who
@@ -507,64 +522,86 @@ func (s *SQLiteLocal) FetchPairs(ctx context.Context, opts FetchPairsOpts) ([]We
 	return out, nil
 }
 
-// FetchMessages returns inbox rows > opts.After, filtered per scope.
-func (s *SQLiteLocal) FetchMessages(ctx context.Context, opts FetchMessagesOpts) ([]WebMessage, error) {
+// FetchMessages returns up to Limit inbox rows per the opts fetch mode
+// (see FetchMessagesOpts). hasMore is true when at least one more row
+// exists beyond what was returned — computed by over-fetching a single
+// probe row so the caller gets a precise "is there another page"
+// signal without a second round-trip. Output is always ASC by id,
+// regardless of the internal query direction.
+func (s *SQLiteLocal) FetchMessages(ctx context.Context, opts FetchMessagesOpts) ([]WebMessage, bool, error) {
 	if (opts.PairKey == "") == (opts.CWD == "") {
-		return nil, fmt.Errorf("FetchMessages: exactly one of PairKey/CWD required")
+		return nil, false, fmt.Errorf("FetchMessages: exactly one of PairKey/CWD required")
 	}
-	hasPair := opts.A != "" && opts.B != ""
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = DefaultMessageLimit
+	}
 
-	var (
-		rows *sql.Rows
-		err  error
-	)
+	// Build the scope clause (WHERE filter on room membership / pair /
+	// cwd / label). Each case returns a fragment like "room_key = ?"
+	// plus its bound args.
+	hasPair := opts.A != "" && opts.B != ""
+	var scopeClause string
+	var scopeArgs []any
 	switch {
 	case opts.PairKey != "" && hasPair:
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, from_label, to_label, body, created_at, read_at
-			FROM inbox
-			WHERE id > ? AND room_key = ?
+		scopeClause = `room_key = ?
 			  AND ((from_label = ? AND to_label = ?)
-			    OR (from_label = ? AND to_label = ?))
-			ORDER BY id ASC`,
-			opts.After, "pk:"+opts.PairKey,
-			opts.A, opts.B, opts.B, opts.A)
+			    OR (from_label = ? AND to_label = ?))`
+		scopeArgs = []any{"pk:" + opts.PairKey, opts.A, opts.B, opts.B, opts.A}
 	case opts.PairKey != "":
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, from_label, to_label, body, created_at, read_at
-			FROM inbox
-			WHERE id > ? AND room_key = ?
-			ORDER BY id ASC`,
-			opts.After, "pk:"+opts.PairKey)
+		scopeClause = `room_key = ?`
+		scopeArgs = []any{"pk:" + opts.PairKey}
 	case hasPair:
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, from_label, to_label, body, created_at, read_at
-			FROM inbox
-			WHERE id > ? AND to_cwd = ? AND from_cwd = ?
+		scopeClause = `to_cwd = ? AND from_cwd = ?
 			  AND ((from_label = ? AND to_label = ?)
-			    OR (from_label = ? AND to_label = ?))
-			ORDER BY id ASC`,
-			opts.After, opts.CWD, opts.CWD,
-			opts.A, opts.B, opts.B, opts.A)
+			    OR (from_label = ? AND to_label = ?))`
+		scopeArgs = []any{opts.CWD, opts.CWD, opts.A, opts.B, opts.B, opts.A}
 	case opts.AsLabel != "":
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, from_label, to_label, body, created_at, read_at
-			FROM inbox
-			WHERE id > ?
-			  AND ((to_cwd = ? AND to_label = ?)
-			    OR (from_cwd = ? AND from_label = ?))
-			ORDER BY id ASC`,
-			opts.After, opts.CWD, opts.AsLabel, opts.CWD, opts.AsLabel)
+		scopeClause = `((to_cwd = ? AND to_label = ?)
+			    OR (from_cwd = ? AND from_label = ?))`
+		scopeArgs = []any{opts.CWD, opts.AsLabel, opts.CWD, opts.AsLabel}
 	default:
-		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, from_label, to_label, body, created_at, read_at
-			FROM inbox
-			WHERE id > ? AND (to_cwd = ? OR from_cwd = ?)
-			ORDER BY id ASC`,
-			opts.After, opts.CWD, opts.CWD)
+		scopeClause = `(to_cwd = ? OR from_cwd = ?)`
+		scopeArgs = []any{opts.CWD, opts.CWD}
 	}
+
+	// Pick id-bound + direction per mode.
+	var idClause, orderClause string
+	var idArg int64
+	reverseOutput := false
+	switch {
+	case opts.Before > 0:
+		idClause = `id < ?`
+		idArg = opts.Before
+		orderClause = `ORDER BY id DESC`
+		reverseOutput = true
+	case opts.After > 0:
+		idClause = `id > ?`
+		idArg = opts.After
+		orderClause = `ORDER BY id ASC`
+	default:
+		// Initial load: newest Limit overall.
+		idClause = `id > ?`
+		idArg = 0
+		orderClause = `ORDER BY id DESC`
+		reverseOutput = true
+	}
+
+	// Over-fetch by 1 so a len == limit+1 result signals has_more without
+	// a COUNT query.
+	query := fmt.Sprintf(`
+		SELECT id, from_label, to_label, body, created_at, read_at
+		FROM inbox
+		WHERE %s AND %s
+		%s
+		LIMIT ?`, idClause, scopeClause, orderClause)
+	args := append([]any{idArg}, scopeArgs...)
+	args = append(args, limit+1)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("FetchMessages: query: %w", err)
+		return nil, false, fmt.Errorf("FetchMessages: query: %w", err)
 	}
 	defer rows.Close()
 
@@ -573,12 +610,25 @@ func (s *SQLiteLocal) FetchMessages(ctx context.Context, opts FetchMessagesOpts)
 		var m WebMessage
 		var readAt sql.NullString
 		if err := rows.Scan(&m.ID, &m.From, &m.To, &m.Body, &m.CreatedAt, &readAt); err != nil {
-			return nil, fmt.Errorf("FetchMessages: scan: %w", err)
+			return nil, false, fmt.Errorf("FetchMessages: scan: %w", err)
 		}
 		m.Read = readAt.Valid && readAt.String != ""
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	hasMore := int64(len(out)) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	if reverseOutput {
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+	}
+	return out, hasMore, nil
 }
 
 type pairMember struct {

@@ -23,7 +23,7 @@ var storeOpen = func(ctx context.Context) (webStore, error) {
 type webStore interface {
 	FetchPairs(ctx context.Context, opts sqlitestore.FetchPairsOpts) ([]sqlitestore.WebPair, error)
 	FetchRooms(ctx context.Context, pairKey string) ([]sqlitestore.WebRoom, error)
-	FetchMessages(ctx context.Context, opts sqlitestore.FetchMessagesOpts) ([]sqlitestore.WebMessage, error)
+	FetchMessages(ctx context.Context, opts sqlitestore.FetchMessagesOpts) ([]sqlitestore.WebMessage, bool, error)
 	AllPairKeys(ctx context.Context) ([]string, error)
 	SenderCWD(ctx context.Context, scope sqlitestore.SenderScope, label string) (string, error)
 	ClearChannelSocket(ctx context.Context, cwd, label string) error
@@ -272,10 +272,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	limit, _ := strconv.ParseInt(q.Get("limit"), 10, 64)
 	opts := sqlitestore.FetchMessagesOpts{
 		PairKey: scope.pairKey,
 		CWD:     scope.cwd,
 		After:   after,
+		Before:  before,
+		Limit:   limit,
 		A:       q.Get("a"),
 		B:       q.Get("b"),
 		AsLabel: q.Get("as_label"),
@@ -290,7 +294,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.Close()
 
-	msgs, err := st.FetchMessages(ctx, opts)
+	msgs, hasMore, err := st.FetchMessages(ctx, opts)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -303,11 +307,19 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			pair = opts.B + "+" + opts.A
 		}
 	}
+	// oldest_id is the cursor the client feeds back as `before` on the
+	// next scroll-up page. Zero when the result set is empty.
+	var oldestID int64
+	if len(msgs) > 0 {
+		oldestID = msgs[0].ID
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"cwd":      s.cfg.CWD,
-		"pair_key": orNull(scope.pairKey),
-		"pair":     orNull(pair),
-		"messages": messagesToJSON(msgs),
+		"cwd":       s.cfg.CWD,
+		"pair_key":  orNull(scope.pairKey),
+		"pair":      orNull(pair),
+		"messages":  messagesToJSON(msgs),
+		"has_more":  hasMore,
+		"oldest_id": oldestID,
 	})
 }
 

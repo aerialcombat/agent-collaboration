@@ -57,7 +57,7 @@ cd go && go build -o bin/peer-web ./cmd/peer-web/
 - `GET /api/index` — all pair-key rooms with summary (for the index page).
 - `GET /api/pairs?pair_key=K` or `?cwd=P` — parity with Python `/pairs.json`.
 - `GET /api/rooms?pair_key=K` — parity with Python `/rooms.json`.
-- `GET /api/messages?pair_key=K&after=N` or `?cwd=P&a=L&b=M&after=N` — parity with Python `/messages.json`.
+- `GET /api/messages?pair_key=K[&after=N|&before=N][&limit=M]` or `?cwd=P&a=L&b=M&...` — paginated. Three modes: no cursor = newest `limit` messages (default 100); `after=N` = forward poll (id > N); `before=N` = backward page (id < N). Response adds `has_more` bool and `oldest_id` cursor for scroll-up pagination.
 - `POST /api/send` + `?pair_key=K` — composer. Body: `{from, to, body}`. Shells to `peer-inbox-db.py peer-send` / `peer-broadcast`; auto-registers `owner` on first send in pair-key mode.
 - `POST /api/rooms/terminate-inactive` — marks every stale room (activity=stale) as `peer_rooms.terminated_at`. Rejected under `--only-pair-key` lock.
 
@@ -74,8 +74,15 @@ available as the From option and auto-registers on first send in
 pair-key mode.
 
 **Turn-cap meter.** Detail-page header shows `N/MAX turns (P%)`. Colors
-yellow at ≥80% of `AGENT_COLLAB_MAX_PAIR_TURNS` (default 500). Warns
+yellow at ≥80% of `AGENT_COLLAB_MAX_PAIR_TURNS` (default 2000). Warns
 before you hit the cap mid-broadcast.
+
+**Infinite-scroll pagination.** The stream loads the newest 100 messages
+on room open, then fetches the previous 100 whenever the user scrolls
+within 200px of the top. Scroll position is anchored across prepends so
+the viewport doesn't jump. New messages continue to stream in at the
+bottom via the existing `?after=` tail poll. Large rooms (3000+
+messages) open near-instantly instead of downloading the full history.
 
 **Stale-member filter.** Detail-page sidebar has a `show stale members`
 checkbox. Hides members whose `last_seen_at` is older than 10 min.

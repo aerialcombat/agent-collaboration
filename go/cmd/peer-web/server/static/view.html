@@ -247,6 +247,9 @@
     messagesByPair: {},       // key -> [messages]
     lastIdByPair: {},         // key -> highest seen id
     lastSeenIdByPair: {},     // key -> id up to which the viewer has seen
+    oldestIdByPair: {},       // key -> lowest id in cache (cursor for scroll-up)
+    hasMoreByPair: {},        // key -> true if older history exists beyond cache
+    loadingOlderByPair: {},   // key -> true while a scroll-up fetch is in-flight
     autoScroll: true,
     maxPairTurns: 100,        // from /api/scope (AGENT_COLLAB_MAX_PAIR_TURNS); 80% triggers warn
     staleThresholdSecs: 600,  // from /api/scope (10min default)
@@ -749,7 +752,8 @@
                   (state.lastIdByPair[pairKey] || 0);
     const p = state.pairs[pairKey];
     if (!p) return;
-    let url = '/api/messages?' + scopeQS() + '&after=' + since;
+    const isInitial = !state.messagesByPair[pairKey];
+    let url = '/api/messages?' + scopeQS() + '&after=' + since + '&limit=100';
     if (state.mode !== 'pair_key') {
       // cwd mode narrows by the selected pair's (a, b).
       url += '&a=' + encodeURIComponent(p.a) + '&b=' + encodeURIComponent(p.b);
@@ -757,7 +761,15 @@
     try {
       const r = await fetch(url, { cache: 'no-store' });
       const data = await r.json();
-      if (!(data.messages && data.messages.length)) return;
+      if (!(data.messages && data.messages.length)) {
+        // Empty initial response still needs to seed the cache so the
+        // pair is treated as "loaded" (prevents a select→fetch loop).
+        if (isInitial) {
+          state.messagesByPair[pairKey] = [];
+          state.hasMoreByPair[pairKey] = false;
+        }
+        return;
+      }
       const arr = state.messagesByPair[pairKey] || [];
       let maxId = state.lastIdByPair[pairKey] || 0;
       const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
@@ -767,6 +779,14 @@
       }
       state.messagesByPair[pairKey] = arr;
       state.lastIdByPair[pairKey] = maxId;
+      // On the initial load (cache was empty), `after=0` triggers the
+      // server's newest-N path and the response carries oldest_id +
+      // has_more cursors so scroll-up pagination knows what to ask next.
+      // Tail polls (after > 0) don't need to touch these cursors.
+      if (isInitial) {
+        state.oldestIdByPair[pairKey] = data.oldest_id || (arr[0] && arr[0].id) || 0;
+        state.hasMoreByPair[pairKey] = !!data.has_more;
+      }
       if (pairKey === state.selectedKey) {
         renderStream(pairKey);
         state.lastSeenIdByPair[pairKey] = maxId;
@@ -782,10 +802,61 @@
     }
   }
 
+  // fetchOlderMessages loads the previous page of history when the user
+  // scrolls near the top of the stream. Prepends to the cache and
+  // restores scroll position so the viewport doesn't jump.
+  async function fetchOlderMessages(pairKey) {
+    if (!pairKey) return;
+    if (state.loadingOlderByPair[pairKey]) return;
+    if (!state.hasMoreByPair[pairKey]) return;
+    const before = state.oldestIdByPair[pairKey];
+    if (!before) return;
+    const p = state.pairs[pairKey];
+    if (!p) return;
+    state.loadingOlderByPair[pairKey] = true;
+    let url = '/api/messages?' + scopeQS() + '&before=' + before + '&limit=100';
+    if (state.mode !== 'pair_key') {
+      url += '&a=' + encodeURIComponent(p.a) + '&b=' + encodeURIComponent(p.b);
+    }
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      const data = await r.json();
+      const older = (data && data.messages) || [];
+      if (!older.length) {
+        state.hasMoreByPair[pairKey] = false;
+        return;
+      }
+      // Anchor scroll: capture the pre-prepend scroll metrics, prepend,
+      // then restore so the user's current line of text stays put.
+      const prevScrollHeight = stream.scrollHeight;
+      const prevScrollTop = stream.scrollTop;
+      const arr = state.messagesByPair[pairKey] || [];
+      state.messagesByPair[pairKey] = older.concat(arr);
+      state.oldestIdByPair[pairKey] = older[0].id;
+      state.hasMoreByPair[pairKey] = !!data.has_more;
+      if (pairKey === state.selectedKey) {
+        renderStream(pairKey);
+        requestAnimationFrame(() => {
+          stream.scrollTop = prevScrollTop + (stream.scrollHeight - prevScrollHeight);
+        });
+      }
+    } catch (e) {
+      console.warn('older messages fetch failed', e);
+    } finally {
+      state.loadingOlderByPair[pairKey] = false;
+    }
+  }
+
   stream.addEventListener('scroll', () => {
     const atBottom = stream.scrollHeight - stream.scrollTop <= stream.clientHeight + 40;
     state.autoScroll = atBottom;
     if (atBottom) scrollBtn.classList.remove('show');
+    // Trigger scroll-up pagination when the user gets within ~200px
+    // of the top of the stream. fetchOlderMessages is debounced by
+    // loadingOlderByPair so rapid scroll events don't stack.
+    if (stream.scrollTop < 200 && state.selectedKey) {
+      fetchOlderMessages(state.selectedKey);
+    }
   });
   scrollBtn.addEventListener('click', () => {
     state.autoScroll = true;

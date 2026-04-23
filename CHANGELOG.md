@@ -7,6 +7,36 @@ Commit SHAs reference the `agent-collaboration` repo.
 
 ---
 
+## Unreleased — 2026-04-23
+
+### Added
+- **Infinite-scroll pagination on the web UI.** `/api/messages` now
+  accepts `&before=N` + `&limit=M` for backward pages and returns
+  `has_more` + `oldest_id` cursors. The detail page loads the newest
+  100 on room open and prepends the next 100 whenever the user scrolls
+  within 200px of the top; scroll position stays anchored across
+  prepends. Large rooms (3000+ messages) open near-instantly.
+  (`go/pkg/store/sqlite/web.go`, `go/cmd/peer-web/server/data.go`,
+  `go/cmd/peer-web/server/static/view.html`)
+
+### Changed
+- `DEFAULT_MAX_PAIR_TURNS` 500 → 2000 across the Python CLI and both
+  Go packages. Env-var override `AGENT_COLLAB_MAX_PAIR_TURNS` unchanged.
+  Running services enforce the old default until rebuilt + restarted.
+  (`055201d`)
+
+### Fixed
+- `state=active` is now written on every `UserPromptSubmit`, not only on
+  prompts that have new peer messages to drain. The write used to live
+  inside the Go `peer-inbox-hook` binary, which the shell wrapper
+  short-circuits on quiet prompts, leaving state stuck. Moved the write
+  into `peer-inbox-inject.sh` as an unconditional `peer-inbox
+  session-state active --session-key $SID` call — parallel to the Stop
+  hook's idle write. Uses `SetSessionStateByKey` so no marker walk is
+  required. (`ea112f2`)
+
+---
+
 ## v2.0 — 2026-04-17
 
 **Group chats + reply tool.** Peer-inbox becomes a room transport
