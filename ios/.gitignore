@@ -1,0 +1,22 @@
+# Xcode project is generated from project.yml via xcodegen.
+# Don't commit it — regenerate locally with `xcodegen generate`.
+PeerInbox.xcodeproj/
+
+# Generated Info.plist (xcodegen writes this from project.yml metadata).
+PeerInbox/Info.plist
+
+# Xcode user state + build artifacts.
+xcuserdata/
+*.xcworkspace
+DerivedData/
+build/
+*.xcarchive
+
+# Swift package manager
+.build/
+Packages/
+Package.resolved
+.swiftpm/
+
+# macOS
+.DS_Store

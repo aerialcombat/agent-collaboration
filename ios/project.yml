@@ -1,0 +1,43 @@
+# xcodegen spec. Regenerate PeerInbox.xcodeproj with:
+#     cd ios && xcodegen generate
+name: PeerInbox
+options:
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  PeerInbox:
+    type: application
+    platform: iOS
+    sources:
+      - path: PeerInbox
+    info:
+      path: PeerInbox/Info.plist
+      properties:
+        CFBundleDisplayName: peer-inbox
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen:
+          UIColorName: ""
+          UIImageName: ""
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        # Personal use: talks to a local / LAN peer-web over http://.
+        # NSAllowsArbitraryLoads is the dev-mode blanket permission.
+        # Tighten to NSExceptionDomains when shipping to TestFlight.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.ooocorp.peerinbox
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        IPHONEOS_DEPLOYMENT_TARGET: "18.0"
