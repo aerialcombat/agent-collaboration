@@ -147,8 +147,37 @@
     font-size:11px; color:var(--muted); margin-bottom:5px; }
   .time { margin-left:auto; font-family:SF Mono,Menlo,monospace; }
   .id { font-family:SF Mono,Menlo,monospace; opacity:.5 }
-  .body { margin:0; white-space:pre-wrap; word-wrap:break-word;
-    color:var(--fg); font:13px/1.55 SF Mono,Menlo,Consolas,monospace; }
+  /* Reading surface: proportional sans for prose, monospace only for
+     code spans + fenced blocks. Agents write a lot of markdown; this
+     renders it visually so the stream feels like a doc, not a tty. */
+  .body { margin:0; word-wrap:break-word; color:var(--fg);
+    font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,
+      Helvetica,Arial,sans-serif; }
+  .body > p { margin:.4em 0; }
+  .body > p:first-child { margin-top:0; }
+  .body > p:last-child { margin-bottom:0; }
+  .body h1, .body h2, .body h3 { margin:.8em 0 .3em;
+    font-weight:600; line-height:1.3; }
+  .body h1 { font-size:1.25em; }
+  .body h2 { font-size:1.15em; }
+  .body h3 { font-size:1.05em; }
+  .body ul, .body ol { margin:.4em 0; padding-left:1.4em; }
+  .body li { margin:.12em 0; }
+  .body blockquote { margin:.4em 0; padding:.1em .8em;
+    border-left:3px solid var(--border); color:var(--muted); }
+  .body code { font:12.5px/1.4 SF Mono,Menlo,Consolas,monospace;
+    background:rgba(128,128,128,0.15); padding:1px 5px;
+    border-radius:3px; }
+  .body pre { background:rgba(0,0,0,0.3); padding:10px 12px;
+    border-radius:6px; overflow-x:auto; margin:.5em 0; }
+  .body pre code { background:none; padding:0; font-size:12px;
+    color:var(--fg); }
+  .body a { color:#9985ff; text-decoration:underline;
+    text-underline-offset:2px; }
+  .body a:hover { color:#b7a8ff; }
+  .body strong { font-weight:600; color:var(--fg); }
+  .body em { font-style:italic; }
+  .body hr { border:0; border-top:1px solid var(--border); margin:.8em 0; }
   .term-banner { margin:16px 0; padding:10px 14px;
     background:rgba(245,158,11,.08); border:1px dashed var(--terminated);
     border-radius:4px; color:var(--terminated); font-size:12px;
@@ -282,6 +311,90 @@
     if (cls) e.className = cls;
     if (text !== undefined) e.textContent = text;
     return e;
+  }
+
+  // Minimal markdown renderer. Handles the subset agents actually use
+  // (fenced + inline code, bold/italic, headings, lists, blockquotes,
+  // links, bare URLs, paragraphs, hard line-breaks). No external dep;
+  // ~10 regex passes per body. Safe because HTML is escaped BEFORE
+  // any markdown-to-HTML substitution; code-block contents are
+  // escaped when reinserted.
+  function escapeHTML(s) {
+    return s.replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+  }
+  function renderMarkdown(src) {
+    if (!src) return '';
+    // 1. Extract fenced code blocks (placeholder-substitute so their
+    //    contents aren't reinterpreted as markdown).
+    const codeBlocks = [];
+    let t = src.replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g,
+      (_, lang, code) => {
+        codeBlocks.push({ lang, code });
+        return '§§CB' + (codeBlocks.length - 1) + '§§';
+      });
+    // 2. Extract inline code spans (same placeholder trick).
+    const inlineCodes = [];
+    t = t.replace(/`([^`\n]+)`/g, (_, code) => {
+      inlineCodes.push(code);
+      return '§§IC' + (inlineCodes.length - 1) + '§§';
+    });
+    // 3. Escape everything else.
+    t = escapeHTML(t);
+    // 4. Headings (line-anchored).
+    t = t.replace(/^### +(.+)$/gm, '<h3>$1</h3>')
+         .replace(/^## +(.+)$/gm, '<h2>$1</h2>')
+         .replace(/^# +(.+)$/gm, '<h1>$1</h1>');
+    // 5. Horizontal rule.
+    t = t.replace(/^---+$/gm, '<hr>');
+    // 6. Blockquotes.
+    t = t.replace(/(?:^&gt; .+(?:\n|$))+/gm, block => {
+      const inner = block.replace(/^&gt; /gm, '').replace(/\n$/, '');
+      return '<blockquote>' + inner + '</blockquote>';
+    });
+    // 7. Bullet lists (collapse adjacent - / * items into one <ul>).
+    t = t.replace(/(?:^[-*] .+(?:\n|$))+/gm, block => {
+      const items = block.trim().split('\n')
+        .map(l => '<li>' + l.replace(/^[-*] /, '') + '</li>').join('');
+      return '<ul>' + items + '</ul>';
+    });
+    // 8. Bold + italic. Bold first to win over italic's single-star.
+    t = t.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+         .replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+    // 9. Links: match [text](url) first, then bare URLs. Single pass
+    //    avoids double-wrapping the URL inside an already-formed <a>.
+    t = t.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^)\s"'<]+)\)|(\bhttps?:\/\/[^\s<)"']+)/g,
+      (_, txt, url1, url2) => {
+        const url = url1 || url2;
+        const label = txt || url;
+        return '<a href="' + url + '" target="_blank" rel="noopener">' + label + '</a>';
+      });
+    // 10. Paragraph breaks: blank-line-delimited chunks become <p>.
+    //     Inside each paragraph, single newlines become <br>. Leave
+    //     chunks that already open with a block tag alone.
+    t = t.split(/\n{2,}/).map(chunk => {
+      const trimmed = chunk.trim();
+      if (!trimmed) return '';
+      if (/^<(h[1-3]|ul|ol|blockquote|pre|hr)/i.test(trimmed)) return trimmed;
+      // A chunk that's only a fenced-code sentinel stays block-level;
+      // wrapping it in <p> would yield invalid <p><pre>…</pre></p>.
+      if (/^§§CB\d+§§$/.test(trimmed)) return trimmed;
+      return '<p>' + trimmed.replace(/\n/g, '<br>') + '</p>';
+    }).join('');
+    // 11. Restore inline code (escape its content now).
+    t = t.replace(/§§IC(\d+)§§/g,
+      (_, i) => '<code>' + escapeHTML(inlineCodes[+i]) + '</code>');
+    // 12. Restore fenced code blocks.
+    t = t.replace(/§§CB(\d+)§§/g, (_, i) => {
+      const { lang, code } = codeBlocks[+i];
+      const cls = lang ? ' class="lang-' + lang.replace(/[^a-zA-Z0-9]/g, '') + '"' : '';
+      return '<pre><code' + cls + '>' + escapeHTML(code) + '</code></pre>';
+    });
+    return t;
   }
   // v3.8 agent-state pulse. Reads m.state_display from the /api/pairs
   // / /api/rooms member payload. Server composes four UI-ready
@@ -525,7 +638,9 @@
       meta.appendChild(el('span', 'id', '#' + g.ids[0] +
         (g.ids.length > 1 ? '+' + (g.ids.length - 1) : '')));
       wrap.appendChild(meta);
-      wrap.appendChild(el('pre', 'body', g.body || ''));
+      const body = el('div', 'body');
+      body.innerHTML = renderMarkdown(g.body || '');
+      wrap.appendChild(body);
       stream.appendChild(wrap);
     }
     if (p && p.terminated_at) {
