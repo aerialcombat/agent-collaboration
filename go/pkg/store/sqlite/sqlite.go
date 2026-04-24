@@ -52,7 +52,9 @@ const (
 	// fail the schema check first. Bumped 7 → 8 for v3.8's 0008 migration
 	// that adds sessions.state + sessions.state_changed_at for agent
 	// activity monitoring; the hook binary writes these on every prompt.
-	GooseVersionRequired = 8
+	// Bumped 8 → 9 for v3.9's 0009 migration that adds the cards +
+	// card_dependencies tables backing the kanban medium.
+	GooseVersionRequired = 9
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

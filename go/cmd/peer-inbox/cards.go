@@ -1,0 +1,434 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
+)
+
+// Card CLI verbs (v3.9). Output contract is `--format json|plain`, the
+// same choice set peer-receive and session-list use. The MCP server
+// (peer-inbox-channel.py) wraps these verbs, so any shape change here
+// has to be mirrored in the tool schemas.
+
+const cardsDefaultTimeout = 15 * time.Second
+
+func cardCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), cardsDefaultTimeout)
+}
+
+// runCardCreate — card-create --pair-key K --title T [--body B]
+// [--needs-role R] [--created-by LABEL] [--priority N] [--tags JSON]
+// [--context-refs JSON] [--format json|plain]
+func runCardCreate(args []string) int {
+	fs := flag.NewFlagSet("card-create", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	pairKey := fs.String("pair-key", "", "room / board scope (required)")
+	title := fs.String("title", "", "card title (required)")
+	body := fs.String("body", "", "markdown body / spec")
+	needsRole := fs.String("needs-role", "", "role-based claim target (e.g. ios, qa, review)")
+	createdBy := fs.String("created-by", "", "label of the creator (required)")
+	priority := fs.Int("priority", 0, "-1 low, 0 normal, 1 high")
+	tags := fs.String("tags", "", "JSON array of tags (e.g. [\"feed-card-epic\"])")
+	ctxRefs := fs.String("context-refs", "", "JSON object {msg_ids:[], files:[], urls:[], cards:[]}")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *pairKey == "" || *title == "" || *createdBy == "" {
+		fmt.Fprintln(os.Stderr, "card-create: --pair-key, --title, --created-by required")
+		return exitUsage
+	}
+	if *format != "plain" && *format != "json" {
+		fmt.Fprintf(os.Stderr, "card-create: --format must be plain or json\n")
+		return exitUsage
+	}
+	if *tags != "" && !isValidJSON(*tags) {
+		fmt.Fprintln(os.Stderr, "card-create: --tags must be valid JSON")
+		return exitUsage
+	}
+	if *ctxRefs != "" && !isValidJSON(*ctxRefs) {
+		fmt.Fprintln(os.Stderr, "card-create: --context-refs must be valid JSON")
+		return exitUsage
+	}
+
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-create: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	card, err := st.CreateCard(ctx, sqlitestore.CreateCardParams{
+		PairKey:     *pairKey,
+		HomeHost:    sqlitestore.SelfHost(),
+		Title:       *title,
+		Body:        *body,
+		NeedsRole:   *needsRole,
+		CreatedBy:   *createdBy,
+		Priority:    *priority,
+		Tags:        *tags,
+		ContextRefs: *ctxRefs,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-create: %v\n", err)
+		return exitInternal
+	}
+	return emitCard(card, *format)
+}
+
+// runCardList — card-list [--pair-key K] [--status S] [--needs-role R]
+// [--claimed-by L] [--ready-only] [--blocked-only] [--limit N] [--format]
+func runCardList(args []string) int {
+	fs := flag.NewFlagSet("card-list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	pairKey := fs.String("pair-key", "", "scope to one room")
+	status := fs.String("status", "", "filter by status")
+	needsRole := fs.String("needs-role", "", "filter by needs_role")
+	claimedBy := fs.String("claimed-by", "", "filter by claimed_by label")
+	readyOnly := fs.Bool("ready-only", false, "status=todo AND no open blockers")
+	blockedOnly := fs.Bool("blocked-only", false, "status=todo AND >=1 open blocker")
+	limit := fs.Int("limit", 0, "max rows (0 = all)")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *format != "plain" && *format != "json" {
+		fmt.Fprintln(os.Stderr, "card-list: --format must be plain or json")
+		return exitUsage
+	}
+
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-list: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	cards, err := st.ListCards(ctx, sqlitestore.CardListFilter{
+		PairKey:     *pairKey,
+		Status:      *status,
+		NeedsRole:   *needsRole,
+		ClaimedBy:   *claimedBy,
+		ReadyOnly:   *readyOnly,
+		BlockedOnly: *blockedOnly,
+		Limit:       *limit,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-list: %v\n", err)
+		return exitInternal
+	}
+	return emitCards(cards, *format)
+}
+
+// runCardGet — card-get --id N [--format]
+func runCardGet(args []string) int {
+	fs := flag.NewFlagSet("card-get", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.Int64("id", 0, "card id (required)")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *id == 0 {
+		fmt.Fprintln(os.Stderr, "card-get: --id required")
+		return exitUsage
+	}
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-get: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	card, err := st.GetCard(ctx, *id)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		fmt.Fprintf(os.Stderr, "card-get: not found: %d\n", *id)
+		return exitNotFound
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-get: %v\n", err)
+		return exitInternal
+	}
+	return emitCard(card, *format)
+}
+
+// runCardClaim — card-claim --id N --as LABEL [--force] [--format]
+func runCardClaim(args []string) int {
+	fs := flag.NewFlagSet("card-claim", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.Int64("id", 0, "card id (required)")
+	label := fs.String("as", "", "claimer label (required)")
+	force := fs.Bool("force", false, "override prior claim by a different label")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *id == 0 || *label == "" {
+		fmt.Fprintln(os.Stderr, "card-claim: --id and --as required")
+		return exitUsage
+	}
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-claim: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	card, err := st.ClaimCard(ctx, *id, *label, *force)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		fmt.Fprintf(os.Stderr, "card-claim: not found: %d\n", *id)
+		return exitNotFound
+	}
+	if errors.Is(err, sqlitestore.ErrCardAlreadyClaimed) {
+		fmt.Fprintf(os.Stderr, "card-claim: %v (use --force to override)\n", err)
+		return exitDataErr
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-claim: %v\n", err)
+		return exitInternal
+	}
+	return emitCard(card, *format)
+}
+
+// runCardUpdateStatus — card-update-status --id N --status S [--format]
+func runCardUpdateStatus(args []string) int {
+	fs := flag.NewFlagSet("card-update-status", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.Int64("id", 0, "card id (required)")
+	status := fs.String("status", "", "new status (required): "+
+		"todo|in_progress|in_review|done|cancelled")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *id == 0 || *status == "" {
+		fmt.Fprintln(os.Stderr, "card-update-status: --id and --status required")
+		return exitUsage
+	}
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-update-status: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	card, err := st.UpdateCardStatus(ctx, *id, *status)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		fmt.Fprintf(os.Stderr, "card-update-status: not found: %d\n", *id)
+		return exitNotFound
+	}
+	if errors.Is(err, sqlitestore.ErrCardInvalidStatus) {
+		fmt.Fprintf(os.Stderr, "card-update-status: %v\n", err)
+		return exitUsage
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-update-status: %v\n", err)
+		return exitInternal
+	}
+	return emitCard(card, *format)
+}
+
+// runCardAddDep — card-add-dep --blocker N --blockee M --as LABEL [--format]
+func runCardAddDep(args []string) int {
+	fs := flag.NewFlagSet("card-add-dep", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	blocker := fs.Int64("blocker", 0, "blocker card id (required)")
+	blockee := fs.Int64("blockee", 0, "blockee card id (required)")
+	as := fs.String("as", "", "label of the caller (required, for audit)")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *blocker == 0 || *blockee == 0 || *as == "" {
+		fmt.Fprintln(os.Stderr, "card-add-dep: --blocker, --blockee, --as required")
+		return exitUsage
+	}
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-add-dep: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	if err := st.AddCardDependency(ctx, *blocker, *blockee, *as); err != nil {
+		if errors.Is(err, sqlitestore.ErrCardDependencyCycle) ||
+			errors.Is(err, sqlitestore.ErrCardDependencySelf) {
+			fmt.Fprintf(os.Stderr, "card-add-dep: %v\n", err)
+			return exitDataErr
+		}
+		if errors.Is(err, sqlitestore.ErrCardNotFound) {
+			fmt.Fprintf(os.Stderr, "card-add-dep: %v\n", err)
+			return exitNotFound
+		}
+		fmt.Fprintf(os.Stderr, "card-add-dep: %v\n", err)
+		return exitInternal
+	}
+	return emitDepResult(*blocker, *blockee, true, *format)
+}
+
+// runCardRemoveDep — card-remove-dep --blocker N --blockee M [--format]
+func runCardRemoveDep(args []string) int {
+	fs := flag.NewFlagSet("card-remove-dep", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	blocker := fs.Int64("blocker", 0, "blocker card id (required)")
+	blockee := fs.Int64("blockee", 0, "blockee card id (required)")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *blocker == 0 || *blockee == 0 {
+		fmt.Fprintln(os.Stderr, "card-remove-dep: --blocker, --blockee required")
+		return exitUsage
+	}
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-remove-dep: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	removed, err := st.RemoveCardDependency(ctx, *blocker, *blockee)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-remove-dep: %v\n", err)
+		return exitInternal
+	}
+	return emitDepResult(*blocker, *blockee, removed, *format)
+}
+
+// --- output helpers ---------------------------------------------------------
+
+func emitCard(c *sqlitestore.Card, format string) int {
+	if format == "json" {
+		return emitJSON(cardAsMap(c))
+	}
+	fmt.Printf("%s\n", renderCardPlain(c))
+	return exitOK
+}
+
+func emitCards(cards []*sqlitestore.Card, format string) int {
+	if format == "json" {
+		arr := make([]map[string]any, 0, len(cards))
+		for _, c := range cards {
+			arr = append(arr, cardAsMap(c))
+		}
+		return emitJSON(arr)
+	}
+	if len(cards) == 0 {
+		fmt.Println("(no cards)")
+		return exitOK
+	}
+	for _, c := range cards {
+		fmt.Println(renderCardPlain(c))
+	}
+	return exitOK
+}
+
+func emitDepResult(blocker, blockee int64, ok bool, format string) int {
+	if format == "json" {
+		return emitJSON(map[string]any{
+			"blocker_id": blocker, "blockee_id": blockee, "ok": ok,
+		})
+	}
+	if ok {
+		fmt.Printf("ok: %d → %d\n", blocker, blockee)
+	} else {
+		fmt.Printf("no-op: %d → %d (edge didn't exist)\n", blocker, blockee)
+	}
+	return exitOK
+}
+
+func cardAsMap(c *sqlitestore.Card) map[string]any {
+	m := map[string]any{
+		"id":         c.ID,
+		"pair_key":   c.PairKey,
+		"home_host":  c.HomeHost,
+		"title":      c.Title,
+		"status":     c.Status,
+		"created_by": c.CreatedBy,
+		"priority":   c.Priority,
+		"created_at": c.CreatedAt,
+		"updated_at": c.UpdatedAt,
+		"blocker_ids": c.BlockerIDs,
+		"blockee_ids": c.BlockeeIDs,
+		"ready":       c.Ready,
+	}
+	if c.Body != "" {
+		m["body"] = c.Body
+	}
+	if c.NeedsRole != "" {
+		m["needs_role"] = c.NeedsRole
+	}
+	if c.ClaimedBy != "" {
+		m["claimed_by"] = c.ClaimedBy
+	}
+	if c.Tags != "" {
+		m["tags"] = json.RawMessage(c.Tags)
+	}
+	if c.ContextRefs != "" {
+		m["context_refs"] = json.RawMessage(c.ContextRefs)
+	}
+	if c.ClaimedAt != "" {
+		m["claimed_at"] = c.ClaimedAt
+	}
+	if c.CompletedAt != "" {
+		m["completed_at"] = c.CompletedAt
+	}
+	return m
+}
+
+func renderCardPlain(c *sqlitestore.Card) string {
+	line := "#" + strconv.FormatInt(c.ID, 10) + " [" + c.Status + "]"
+	if c.Ready {
+		line += " ready"
+	} else if c.Status == sqlitestore.CardStatusTodo && len(c.BlockerIDs) > 0 {
+		line += fmt.Sprintf(" blocked-by=%v", c.BlockerIDs)
+	}
+	if c.NeedsRole != "" {
+		line += " needs=" + c.NeedsRole
+	}
+	if c.ClaimedBy != "" {
+		line += " claimed=" + c.ClaimedBy
+	}
+	if c.Priority != 0 {
+		line += fmt.Sprintf(" p=%d", c.Priority)
+	}
+	line += "  " + c.Title
+	return line
+}
+
+func emitJSON(v any) int {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		fmt.Fprintf(os.Stderr, "emit-json: %v\n", err)
+		return exitInternal
+	}
+	return exitOK
+}
+
+func isValidJSON(s string) bool {
+	var v any
+	return json.Unmarshal([]byte(s), &v) == nil
+}

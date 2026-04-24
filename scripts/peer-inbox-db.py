@@ -102,7 +102,7 @@ PYTHON_MIN = (3, 9)
 # /api/send. Bumped 7 → 8 for v3.8's 0008 migration that adds
 # sessions.state + sessions.state_changed_at for agent activity
 # monitoring.
-GOOSE_VERSION_REQUIRED = 8
+GOOSE_VERSION_REQUIRED = 9
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIGRATE_BINARY_CANDIDATES = (
     Path.home() / ".local" / "bin" / "peer-inbox-migrate",

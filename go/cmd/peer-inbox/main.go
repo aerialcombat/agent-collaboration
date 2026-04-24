@@ -109,6 +109,20 @@ func run(args []string) int {
 		return runSessionClose(rest)
 	case "session-state":
 		return runSessionState(rest)
+	case "card-create":
+		return runCardCreate(rest)
+	case "card-list":
+		return runCardList(rest)
+	case "card-get":
+		return runCardGet(rest)
+	case "card-claim":
+		return runCardClaim(rest)
+	case "card-update-status":
+		return runCardUpdateStatus(rest)
+	case "card-add-dep":
+		return runCardAddDep(rest)
+	case "card-remove-dep":
+		return runCardRemoveDep(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK

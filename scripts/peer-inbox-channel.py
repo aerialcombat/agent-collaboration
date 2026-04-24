@@ -138,6 +138,157 @@ REPLY_TOOL = {
     },
 }
 
+# v3.9 kanban tools. The board is the durable-work medium; chat is the
+# volatile medium. Every tool is a thin wrapper around the `peer-inbox
+# card-*` CLI verbs (go/cmd/peer-inbox/cards.go) so the DB layer stays
+# single-sourced. Tools shell out with `--format json`, parse, and
+# return the parsed object as the tool result.
+CARD_TOOLS = [
+    {
+        "name": "card_create",
+        "description": (
+            "Create a kanban card — a durable, addressed work item that "
+            "persists across sessions. Pair with chat messages: use chat "
+            "for \"what if / heads up\", use cards for \"this is for you, "
+            "do it, mark done when done.\"\n"
+            "Cards have a status (todo | in_progress | in_review | done | "
+            "cancelled) and can carry a role (who should claim it) plus "
+            "tags (epics/groupings). Reference chat messages or files via "
+            "context_refs. Use card_add_dependency afterwards to wire "
+            "blockers."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "description": "Room scope (required)."},
+                "title": {"type": "string", "description": "One-line summary (required)."},
+                "body": {"type": "string", "description": "Markdown spec / description."},
+                "needs_role": {
+                    "type": "string",
+                    "description": "Role that should claim (e.g. ios, web, qa, review). Agents pull by role.",
+                },
+                "priority": {
+                    "type": "integer",
+                    "enum": [-1, 0, 1],
+                    "description": "-1 low, 0 normal, 1 high.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Grouping labels (epics, themes). M:N: a card can have multiple.",
+                },
+                "context_refs": {
+                    "type": "object",
+                    "description": "Pointers into chat/code: {msg_ids:[], files:[], urls:[], cards:[]}.",
+                },
+            },
+            "required": ["pair_key", "title"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_list",
+        "description": (
+            "List cards. Defaults to all cards in the caller's current "
+            "room(s). Key filter for agents: `ready_only: true` returns "
+            "status=todo cards with no pending blockers — your actionable "
+            "queue. `claimed_by: <your-label>` for your in-flight work."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string"},
+                "status": {
+                    "type": "string",
+                    "enum": ["todo", "in_progress", "in_review", "done", "cancelled"],
+                },
+                "needs_role": {"type": "string"},
+                "claimed_by": {"type": "string"},
+                "ready_only": {"type": "boolean", "description": "status=todo AND no open blockers"},
+                "blocked_only": {"type": "boolean", "description": "status=todo AND ≥1 open blocker"},
+                "limit": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_get",
+        "description": "Fetch one card by id. Returns full row + blocker_ids + blockee_ids + derived `ready`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "minimum": 1}},
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_claim",
+        "description": (
+            "Claim a card: atomically set claimed_by + bump status "
+            "todo→in_progress. Fails if another label holds it (pass "
+            "force=true to override)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "force": {"type": "boolean"},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_update_status",
+        "description": (
+            "Transition a card's status. todo | in_progress | in_review | "
+            "done | cancelled. done/cancelled terminal states stamp "
+            "completed_at. No rollup — parent status isn't auto-derived."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "status": {
+                    "type": "string",
+                    "enum": ["todo", "in_progress", "in_review", "done", "cancelled"],
+                },
+            },
+            "required": ["id", "status"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_add_dependency",
+        "description": (
+            "Add a blocker → blockee edge. Blockee can't become ready "
+            "until blocker hits done/cancelled. Cycles are rejected."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "blocker_id": {"type": "integer", "minimum": 1},
+                "blockee_id": {"type": "integer", "minimum": 1},
+            },
+            "required": ["blocker_id", "blockee_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_remove_dependency",
+        "description": "Drop a blocker → blockee edge. No-op if it didn't exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "blocker_id": {"type": "integer", "minimum": 1},
+                "blockee_id": {"type": "integer", "minimum": 1},
+            },
+            "required": ["blocker_id", "blockee_id"],
+            "additionalProperties": False,
+        },
+    },
+]
+
 _stdout_lock = threading.Lock()
 _initialized = threading.Event()
 _socket_path: Path | None = None
@@ -273,7 +424,7 @@ def handle_mcp(req: dict) -> None:
         stderr(f"[peer-inbox-channel] initialized; socket={_socket_path}")
         return
     if method == "tools/list":
-        reply(req_id, {"tools": [REPLY_TOOL]})
+        reply(req_id, {"tools": [REPLY_TOOL] + CARD_TOOLS})
         return
     if method == "tools/call":
         handle_tools_call(req_id, req.get("params") or {})
@@ -455,6 +606,244 @@ def _call_peer(
     return False, stderr_text or f"peer {subcmd} exit {res.returncode}"
 
 
+# ---- Card tools (v3.9) ------------------------------------------------------
+
+
+def _peer_inbox_bin() -> str:
+    """Return absolute path to the Go peer-inbox binary, preferred over the
+    agent-collab bash wrapper for card verbs (the wrapper currently only
+    routes `peer` and `session` top-level modes — cards call the Go
+    binary directly).
+    """
+    env = os.environ.get("AGENT_COLLAB_PEER_INBOX_BIN")
+    if env and Path(env).is_file() and os.access(env, os.X_OK):
+        return env
+    for cand in (
+        Path.home() / ".local" / "bin" / "peer-inbox",
+        Path("/Users/deeJ/Development/agent-collaboration/go/bin/peer-inbox"),
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return "peer-inbox"
+
+
+def _resolve_caller_label_and_pair(arguments: dict) -> tuple[str | None, str | None]:
+    """Pick the acting label + pair_key for a card tool call. Mirrors
+    _pick_self logic: explicit `pair_key` arg wins, else the last
+    incoming-message pair_key, else the only room this channel is in.
+    Returns (label, pair_key) or (None, None) if resolution fails.
+    """
+    arg_pair = arguments.get("pair_key")
+    selves = _resolve_selves_from_socket()
+    if not selves:
+        return (None, None)
+    if isinstance(arg_pair, str) and arg_pair:
+        chosen = next((r for r in selves if r["pair_key"] == arg_pair), None)
+    else:
+        chosen = _pick_self(None)
+    if chosen is None:
+        return (None, None)
+    return (chosen["label"], chosen["pair_key"])
+
+
+def _shell_card_verb(verb: str, flags: list[str]) -> tuple[bool, str, dict | list | None]:
+    """Shell out to `peer-inbox <verb>` with --format json and parse the
+    single-line output. Returns (ok, human_message, parsed_json_or_None).
+    """
+    cmd = [_peer_inbox_bin(), verb, *flags, "--format", "json"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"subprocess error: {e}", None
+    if res.returncode != 0:
+        return (
+            False,
+            (res.stderr or res.stdout).strip() or f"{verb} exit {res.returncode}",
+            None,
+        )
+    out = (res.stdout or "").strip()
+    if not out:
+        return True, f"{verb} ok", None
+    try:
+        return True, "", json.loads(out)
+    except json.JSONDecodeError as e:
+        return False, f"decode error: {e}: {out[:200]}", None
+
+
+def _tool_json_result(req_id, payload: dict | list | str) -> None:
+    """Return a tool result as a single text block whose body is JSON.
+    LLM clients render the JSON verbatim; reduces ambiguity vs.
+    structured content blocks we'd need to shape per-tool."""
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+    reply(req_id, {"content": [{"type": "text", "text": text}], "isError": False})
+
+
+def _card_create(req_id, arguments: dict) -> None:
+    title = arguments.get("title")
+    if not isinstance(title, str) or not title:
+        _tool_error(req_id, "error: `title` required")
+        return
+
+    label, pair_key = _resolve_caller_label_and_pair(arguments)
+    if not pair_key:
+        _tool_error(
+            req_id,
+            "error: no session bound to this channel — run `agent-collab session register` first.",
+        )
+        return
+
+    flags = [
+        "--pair-key", pair_key,
+        "--title", title,
+        "--created-by", label or "unknown",
+    ]
+    if isinstance(arguments.get("body"), str) and arguments["body"]:
+        flags.extend(["--body", arguments["body"]])
+    if isinstance(arguments.get("needs_role"), str) and arguments["needs_role"]:
+        flags.extend(["--needs-role", arguments["needs_role"]])
+    if isinstance(arguments.get("priority"), int):
+        flags.extend(["--priority", str(arguments["priority"])])
+    if isinstance(arguments.get("tags"), list):
+        flags.extend(["--tags", json.dumps(arguments["tags"])])
+    if isinstance(arguments.get("context_refs"), dict):
+        flags.extend(["--context-refs", json.dumps(arguments["context_refs"])])
+
+    ok, msg, parsed = _shell_card_verb("card-create", flags)
+    if not ok:
+        _tool_error(req_id, f"card_create: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else msg)
+
+
+def _card_list(req_id, arguments: dict) -> None:
+    label, pair_key = _resolve_caller_label_and_pair(arguments)
+    # Caller can pass an explicit pair_key or none; if no session is
+    # bound we still allow an unrestricted list so dashboards work
+    # before registration (they just don't default to a room).
+    flags: list[str] = []
+    if pair_key and not arguments.get("pair_key"):
+        flags.extend(["--pair-key", pair_key])
+    elif isinstance(arguments.get("pair_key"), str):
+        flags.extend(["--pair-key", arguments["pair_key"]])
+
+    for k, cli in (
+        ("status", "--status"),
+        ("needs_role", "--needs-role"),
+        ("claimed_by", "--claimed-by"),
+    ):
+        v = arguments.get(k)
+        if isinstance(v, str) and v:
+            flags.extend([cli, v])
+    if arguments.get("ready_only"):
+        flags.append("--ready-only")
+    if arguments.get("blocked_only"):
+        flags.append("--blocked-only")
+    if isinstance(arguments.get("limit"), int) and arguments["limit"] > 0:
+        flags.extend(["--limit", str(arguments["limit"])])
+
+    ok, msg, parsed = _shell_card_verb("card-list", flags)
+    if not ok:
+        _tool_error(req_id, f"card_list: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else [])
+
+
+def _card_get(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required and must be a positive integer")
+        return
+    ok, msg, parsed = _shell_card_verb("card-get", ["--id", str(cid)])
+    if not ok:
+        _tool_error(req_id, f"card_get: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _card_claim(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if not label:
+        _tool_error(req_id, "error: no session bound — cannot resolve claimer label")
+        return
+    flags = ["--id", str(cid), "--as", label]
+    if arguments.get("force"):
+        flags.append("--force")
+    ok, msg, parsed = _shell_card_verb("card-claim", flags)
+    if not ok:
+        _tool_error(req_id, f"card_claim: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _card_update_status(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    status = arguments.get("status")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required")
+        return
+    if not isinstance(status, str) or not status:
+        _tool_error(req_id, "error: `status` required")
+        return
+    ok, msg, parsed = _shell_card_verb(
+        "card-update-status", ["--id", str(cid), "--status", status]
+    )
+    if not ok:
+        _tool_error(req_id, f"card_update_status: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _card_add_dependency(req_id, arguments: dict) -> None:
+    blocker = arguments.get("blocker_id")
+    blockee = arguments.get("blockee_id")
+    if not (isinstance(blocker, int) and isinstance(blockee, int) and blocker > 0 and blockee > 0):
+        _tool_error(req_id, "error: `blocker_id` and `blockee_id` required (positive integers)")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    ok, msg, parsed = _shell_card_verb(
+        "card-add-dep",
+        ["--blocker", str(blocker), "--blockee", str(blockee), "--as", label or "unknown"],
+    )
+    if not ok:
+        _tool_error(req_id, f"card_add_dependency: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _card_remove_dependency(req_id, arguments: dict) -> None:
+    blocker = arguments.get("blocker_id")
+    blockee = arguments.get("blockee_id")
+    if not (isinstance(blocker, int) and isinstance(blockee, int) and blocker > 0 and blockee > 0):
+        _tool_error(req_id, "error: `blocker_id` and `blockee_id` required (positive integers)")
+        return
+    ok, msg, parsed = _shell_card_verb(
+        "card-remove-dep",
+        ["--blocker", str(blocker), "--blockee", str(blockee)],
+    )
+    if not ok:
+        _tool_error(req_id, f"card_remove_dependency: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+CARD_TOOL_HANDLERS = {
+    "card_create": _card_create,
+    "card_list": _card_list,
+    "card_get": _card_get,
+    "card_claim": _card_claim,
+    "card_update_status": _card_update_status,
+    "card_add_dependency": _card_add_dependency,
+    "card_remove_dependency": _card_remove_dependency,
+}
+
+
 def _tool_error(req_id, text: str) -> None:
     reply(req_id, {
         "content": [{"type": "text", "text": text}],
@@ -464,15 +853,18 @@ def _tool_error(req_id, text: str) -> None:
 
 def handle_tools_call(req_id, params: dict) -> None:
     name = params.get("name")
+    arguments = params.get("arguments") or {}
+    if not isinstance(arguments, dict):
+        _tool_error(req_id, "error: arguments must be an object")
+        return
+    if name in CARD_TOOL_HANDLERS:
+        CARD_TOOL_HANDLERS[name](req_id, arguments)
+        return
     if name != REPLY_TOOL["name"]:
         reply(req_id, error={
             "code": -32602,
             "message": f"unknown tool: {name}",
         })
-        return
-    arguments = params.get("arguments") or {}
-    if not isinstance(arguments, dict):
-        _tool_error(req_id, "error: arguments must be an object")
         return
 
     body = arguments.get("body")
