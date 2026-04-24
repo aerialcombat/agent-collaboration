@@ -819,6 +819,131 @@ schema.
 
 ---
 
+## Federation — cross-host peer-inbox
+
+Two machines on the same Tailnet (or any reachable network) can share
+a pair-key room by federating over peer-web's HTTP API. Each side runs
+its own `peer-web`; sends from one host get POSTed to the other's
+`/api/channel-push` with a bearer token.
+
+### Config: `~/.agent-collab/remotes.json`
+
+```json
+{
+  "orange": {
+    "base_url": "http://100.75.236.84:8789",
+    "auth_token_env": "AGENT_COLLAB_TOKEN_ORANGE"
+  }
+}
+```
+
+One entry per remote host. `auth_token_env` names an env variable
+holding the bearer token (so the token itself isn't committed). Inline
+`auth_token` is also supported for quick testing.
+
+### Minting a bearer token
+
+Tokens live in `sessions.auth_token` and are minted on registration.
+On the *remote* host, register the label that you want to send as:
+
+```bash
+AGENT_COLLAB_SESSION_KEY=<some-unique-slug> \
+  agent-collab session register \
+    --agent human --role owner \
+    --label mobile-deej \
+    --pair-key <room-pair-key> \
+    --force
+sqlite3 ~/.agent-collab/sessions.db \
+  "SELECT auth_token FROM sessions WHERE label='mobile-deej';"
+```
+
+Export that token on the **other** host as the env var the remote's
+`remotes.json` entry references.
+
+### Known gotchas
+
+- **Tokens are per-(host, label).** A token minted for `mobile-deej`
+  on orange doesn't authorize sends as any other label, and won't be
+  accepted by a different host. Re-minting invalidates the old value.
+- **`peer-send` stdout lies on remote failure.** The Go client prints
+  `sent to <label> (pushed)` even when the remote POST returns a
+  non-2xx — trust the **exit code** (non-zero on failure), and check
+  `peer-web.log` on the remote host for the HTTP status.
+- **`last_seen_at` bumps on inbound-push receive** (since `efc257b`).
+  Without this, receive-only federation peers drifted stale even when
+  a push was hitting them cleanly every turn.
+
+---
+
+## Claude Code session lifecycle
+
+Three facts about how Claude Code interacts with peer-inbox, each of
+which has bitten us at least once:
+
+1. **Hooks are loaded at process start.** `~/.claude/settings.json` is
+   read once when `claude` launches. A running session will *not*
+   pick up a new `hooks/peer-inbox-inject.sh` or `peer-inbox-state.sh`
+   entry until it exits and relaunches. Symptom: fresh hooks install,
+   but `sessions.state` never cycles `active`/`idle` for old sessions.
+   Fix: `Ctrl+C` the running Claude, restart, re-adopt the session.
+2. **`--resume <uuid>` preserves the session id.** Claude Code's
+   `session_id` (what the hook passes as `CLAUDE_SESSION_ID`) stays
+   stable across `--resume`. So `session adopt --label X --session-id
+   <uuid>` rekeys an existing DB row to that id and subsequent hook
+   writes hit it. Without `--resume`, every relaunch is a fresh
+   session id and the row's `session_key` goes stale.
+3. **Marker files must match cwd.** `ResolveSelf` walks up from the
+   process cwd looking for `.agent-collab/sessions/<sha256(session_key)
+   [:16]>.json`. If you register a session in `/private/tmp/foo` and
+   run Claude from `/Users/you/other-dir`, the hook's inbox-fetch path
+   can't find the marker. Register in the cwd you'll actually run
+   from, or use `session adopt` to rebind.
+
+Typical Claude Code launch flags we use:
+
+```bash
+# Channels mode (MCP push, paired 1:1 sessions)
+claude --dangerously-skip-permissions \
+       --dangerously-load-development-channels server:peer-inbox
+
+# Resume a specific session id (keeps CLAUDE_SESSION_ID stable)
+claude --dangerously-skip-permissions \
+       --resume <session-uuid>
+```
+
+---
+
+## Known-gotcha recovery checklist
+
+If context was wiped and state is confusing:
+
+- **`sessions.state` stuck on one value across turns** → the Claude
+  process was started before the v3.8 hook lines landed in
+  `settings.json`. Restart Claude.
+- **`peer-inbox-inject.sh` fires but no state write happens** → ACK
+  file race from a previous short-circuit generation of the script.
+  Verify the installed script at `~/.agent-collab/hooks/peer-inbox-
+  inject.sh` contains the unconditional `peer-inbox session-state
+  active --session-key $session_id` block near the top. If not,
+  re-run `scripts/install-global-protocol` from this repo.
+- **peer-web shows `max_pair_turns=500` after the 2000 bump** →
+  `AGENT_COLLAB_MAX_PAIR_TURNS` is exported in your shell. Env
+  override always wins over the baked-in default. Relaunch with
+  `env -u AGENT_COLLAB_MAX_PAIR_TURNS`.
+- **Room hits the turn cap** → `agent-collab peer reset --pair-key
+  K`. Deletes the `peer_rooms` row so the counter re-starts at 1 on
+  the next send. Does not touch inbox history.
+- **A peer "joined" but never replies** → check the backing CLI
+  process's stderr log (e.g., `/tmp/pi-<label>/stderr.log`) for
+  provider auth errors. Common case: Google Antigravity `403 Terms of
+  Service` — the account is banned; switch model/provider.
+- **Federation send appears successful but peer never sees it** →
+  check exit code (not stdout), then check `peer-web.log` on the
+  remote host for the HTTP status. Common cause: `AGENT_COLLAB_TOKEN_
+  <HOST>` not exported in the sender's shell.
+
+---
+
 ## Related docs
 
 - [ARCHITECTURE.md](./PEER-INBOX-ARCHITECTURE.md) — system design, data model, delivery paths
