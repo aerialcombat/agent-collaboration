@@ -767,6 +767,27 @@ def find_pending_channel_for_self(max_depth: int = 12) -> Optional[dict]:
     return None
 
 
+def _channel_socket_alive(socket_path: str, timeout: float = 0.2) -> bool:
+    """Return True iff something is currently listening on socket_path.
+
+    Used by session register to distinguish a live rival session from a
+    stale row whose MCP process has already exited. Any failure counts
+    as dead; register then proceeds with the re-registration. Mirrors
+    go/pkg/store/sqlite/register.go:channelSocketAlive.
+    """
+    if not socket_path:
+        return False
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(socket_path)
+        s.close()
+        return True
+    except (OSError, _socket.timeout):
+        return False
+
+
 def _send_over_unix_socket(socket_path: str, payload: dict, timeout: float = 2.0) -> tuple[int, str]:
     """POST JSON to a peer channel's Unix socket. Returns (http_status, body)."""
     import socket as _socket
@@ -1679,8 +1700,8 @@ def cmd_session_register(args: argparse.Namespace) -> int:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT agent, role, last_seen_at, session_key, pair_key, "
-            "receive_mode, auth_token FROM sessions "
+            "SELECT agent, role, last_seen_at, session_key, channel_socket, "
+            "pair_key, receive_mode, auth_token FROM sessions "
             "WHERE cwd = ? AND label = ?",
             (str(cwd), args.label),
         ).fetchone()
@@ -1689,15 +1710,22 @@ def cmd_session_register(args: argparse.Namespace) -> int:
             existing_key = row["session_key"]
             # Same session re-registering is always fine (idempotent refresh).
             # Different session claiming same label within idle window is a
-            # collision worth flagging.
+            # collision worth flagging — UNLESS the prior row's channel
+            # socket is no longer reachable, in which case the prior
+            # session is effectively gone and this is a resume (see
+            # register.go:channelSocketAlive for the Go mirror).
             if existing_key != session_key and age < IDLE_THRESHOLD_SECS:
-                conn.execute("ROLLBACK")
-                err(
-                    f"label {args.label!r} already active in {cwd} "
-                    f"(owned by a different session, last seen {int(age)}s ago); "
-                    "use --force or a different label",
-                    EXIT_LABEL_COLLISION,
-                )
+                prior_channel = row["channel_socket"] if row["channel_socket"] else ""
+                prior_channel_known = bool(prior_channel)
+                prior_alive = prior_channel_known and _channel_socket_alive(prior_channel)
+                if not prior_channel_known or prior_alive:
+                    conn.execute("ROLLBACK")
+                    err(
+                        f"label {args.label!r} already active in {cwd} "
+                        f"(owned by a different session, last seen {int(age)}s ago); "
+                        "use --force or a different label",
+                        EXIT_LABEL_COLLISION,
+                    )
 
         # Pair-key resolution:
         #   --pair-key KEY  → use KEY (join the room)

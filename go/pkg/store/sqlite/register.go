@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -88,16 +89,17 @@ func (s *SQLiteLocal) RegisterSession(ctx context.Context, p SessionRegisterPara
 		existingRole        sql.NullString
 		existingLastSeen    sql.NullString
 		existingSessionKey  sql.NullString
+		existingChannelSock sql.NullString
 		existingPairKey     sql.NullString
 		existingReceiveMode sql.NullString
 		existingAuthToken   sql.NullString
 	)
 	err = tx.QueryRowContext(ctx, `
-		SELECT agent, role, last_seen_at, session_key, pair_key, receive_mode, auth_token
+		SELECT agent, role, last_seen_at, session_key, channel_socket, pair_key, receive_mode, auth_token
 		FROM sessions WHERE cwd = ? AND label = ?
 	`, p.CWD, p.Label).Scan(
 		&existingAgent, &existingRole, &existingLastSeen,
-		&existingSessionKey, &existingPairKey,
+		&existingSessionKey, &existingChannelSock, &existingPairKey,
 		&existingReceiveMode, &existingAuthToken,
 	)
 	rowExists := err == nil
@@ -107,12 +109,26 @@ func (s *SQLiteLocal) RegisterSession(ctx context.Context, p SessionRegisterPara
 
 	// Idle-collision guard: a different session holding the same label
 	// within IDLE_THRESHOLD_SECS fails loud unless --force.
+	//
+	// Liveness exemption: if the prior row recorded a channel_socket and
+	// that socket is no longer reachable (path missing or connect refused),
+	// the prior session is effectively gone — resume is not a collision.
+	// Without this, `claude --resume` within the 5-minute idle window
+	// deterministically fails with EXIT_LABEL_COLLISION because the fresh
+	// Claude process comes up with a different session_key and the stale
+	// row is still inside the idle window. Rows with NO channel_socket
+	// record (daemon/channel-less peers) keep the conservative behavior —
+	// we have no cheap way to prove those are gone.
 	if rowExists && !p.Force && existingSessionKey.Valid && existingSessionKey.String != p.SessionKey {
 		if ls := existingLastSeen.String; ls != "" {
 			if t, perr := time.Parse("2006-01-02T15:04:05Z", ls); perr == nil {
 				if age := time.Since(t).Seconds(); age < 5*60 {
-					return SessionRegisterResult{}, fmt.Errorf("%w: label %q owned by a different session, last seen %.0fs ago; use --force or a different label",
-						ErrLabelCollision, p.Label, age)
+					priorChannelKnown := existingChannelSock.Valid && existingChannelSock.String != ""
+					priorAlive := priorChannelKnown && channelSocketAlive(existingChannelSock.String)
+					if !priorChannelKnown || priorAlive {
+						return SessionRegisterResult{}, fmt.Errorf("%w: label %q owned by a different session, last seen %.0fs ago; use --force or a different label",
+							ErrLabelCollision, p.Label, age)
+					}
 				}
 			}
 		}
@@ -255,6 +271,24 @@ func (s *SQLiteLocal) RegisterSession(ctx context.Context, p SessionRegisterPara
 		AuthToken: authToken, AuthTokenNew: authTokenNew,
 		ChannelPaired: p.ChannelSocket != "", IsNewJoin: isNewJoin,
 	}, nil
+}
+
+// channelSocketAlive returns true iff a Unix-domain socket at `path`
+// currently has a listener accepting connections. A short timeout keeps
+// session-register off the hot path if, say, the filesystem is slow.
+// Any failure (missing path, ECONNREFUSED, timeout) counts as dead —
+// session-register treats the prior row as stale and proceeds with the
+// re-registration.
+func channelSocketAlive(path string) bool {
+	if path == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // mintAuthToken mints a 32-byte URL-safe base64 token (trailing =
