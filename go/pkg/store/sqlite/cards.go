@@ -432,6 +432,143 @@ func (s *SQLiteLocal) RemoveCardDependency(ctx context.Context, blockerID, block
 	return n > 0, nil
 }
 
+// HookCardsFilter scopes CardsForHook to one room + optional role hint.
+// `Label` is required (we always filter the "claimed by me" set on it).
+// `Role` may be empty — when it is, the pullable set is empty (role-less
+// agents only see their own claimed work). Limit caps each bucket
+// independently so a long claim list doesn't crowd out role-pullable
+// suggestions.
+type HookCardsFilter struct {
+	PairKey string
+	Label   string
+	Role    string
+	Limit   int // per-bucket cap; 0 → defaultHookCardsPerBucket
+}
+
+const defaultHookCardsPerBucket = 10
+
+// HookCards is the two-bucket result returned to the hook path.
+//
+//	Claimed  — cards currently claimed_by=me in non-terminal status.
+//	           Ordered by status priority (in_progress > in_review > todo),
+//	           then priority DESC, then updated_at DESC (most-recently
+//	           worked first).
+//	Pullable — status=todo, no open blockers, claimed_by IS NULL, and
+//	           needs_role matches (if Role set). Ordered by priority
+//	           DESC then created_at ASC — highest-priority oldest-first,
+//	           the same ordering ListCards uses.
+type HookCards struct {
+	Claimed  []*Card
+	Pullable []*Card
+}
+
+// CardsForHook returns the two bundles of cards the pre-prompt hook
+// injects into the agent's context: what the agent is on the hook for
+// (claimed, active) and what's pullable by role. Scoped to PairKey so
+// a cross-room fleet doesn't see another room's board.
+//
+// Both buckets use the same underlying SELECT list as ListCards +
+// loadCardEdges, so derived Ready / BlockerIDs / BlockeeIDs are
+// populated the same way.
+func (s *SQLiteLocal) CardsForHook(ctx context.Context, f HookCardsFilter) (*HookCards, error) {
+	if f.Label == "" || f.PairKey == "" {
+		// No identity or no room scope — nothing sensible to return.
+		return &HookCards{}, nil
+	}
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultHookCardsPerBucket
+	}
+	out := &HookCards{}
+
+	// --- claimed by me (non-terminal) ---------------------------------------
+	//
+	// Status priority ordering: in_progress first (active attention), then
+	// in_review (waiting on reviewer action), then todo (queued). CASE
+	// encodes the precedence; updated_at tiebreaker surfaces freshest.
+	claimed, err := s.listCardsRaw(ctx, `
+		WHERE pair_key = ?
+		  AND claimed_by = ?
+		  AND status IN ('in_progress','in_review','todo')
+		ORDER BY
+		  CASE status
+		    WHEN 'in_progress' THEN 0
+		    WHEN 'in_review'   THEN 1
+		    WHEN 'todo'        THEN 2
+		    ELSE 3
+		  END,
+		  priority DESC,
+		  updated_at DESC
+		LIMIT ?`,
+		f.PairKey, f.Label, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out.Claimed = claimed
+
+	// --- role-pullable (todo + ready + matching role + unclaimed) -----------
+	//
+	// We only ship a "pullable" bucket when the caller has a role — role-
+	// less agents don't have a queue to drain. Ready = status=todo AND no
+	// blocker is still open (NOT IN done/cancelled).
+	if f.Role != "" {
+		pullable, err := s.listCardsRaw(ctx, `
+			WHERE pair_key = ?
+			  AND status = 'todo'
+			  AND claimed_by IS NULL
+			  AND needs_role = ?
+			  AND NOT EXISTS (
+			    SELECT 1 FROM card_dependencies d
+			    JOIN cards b ON b.id = d.blocker_id
+			    WHERE d.blockee_id = cards.id
+			      AND b.status NOT IN ('done','cancelled')
+			  )
+			ORDER BY priority DESC, created_at ASC
+			LIMIT ?`,
+			f.PairKey, f.Role, limit,
+		)
+		if err != nil {
+			return nil, err
+		}
+		out.Pullable = pullable
+	}
+	return out, nil
+}
+
+// listCardsRaw is the shared SELECT + scan + edge-load loop behind
+// ListCards and CardsForHook. Takes a pre-formed WHERE+ORDER+LIMIT
+// clause so callers don't have to re-ship the column list.
+func (s *SQLiteLocal) listCardsRaw(ctx context.Context, whereAndOrder string, args ...any) ([]*Card, error) {
+	q := `SELECT id, pair_key, home_host, title, body, status,
+	             needs_role, claimed_by, created_by, priority,
+	             tags, context_refs,
+	             created_at, updated_at, claimed_at, completed_at
+	      FROM cards ` + whereAndOrder
+	rs, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listCardsRaw query: %w", err)
+	}
+	defer rs.Close()
+	var out []*Card
+	for rs.Next() {
+		c, err := scanCard(rs)
+		if err != nil {
+			return nil, fmt.Errorf("listCardsRaw scan: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rs.Err(); err != nil {
+		return nil, err
+	}
+	for _, c := range out {
+		if err := s.loadCardEdges(ctx, c); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 // --- helpers ----------------------------------------------------------------
 
 func validCardStatus(s string) bool {

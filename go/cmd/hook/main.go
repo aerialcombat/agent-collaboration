@@ -31,9 +31,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"agent-collaboration/go/pkg/envelope"
@@ -170,7 +172,14 @@ func run() int {
 		return exitFallbackWanted
 	}
 
-	block := formatHookBlock(rows)
+	// v3.9 kanban: alongside the peer-inbox envelope, surface the agent's
+	// queue. Claimed (non-terminal) + role-pullable (ready + needs_role
+	// match + unclaimed). Best-effort — a failure here never blocks the
+	// peer-inbox path.
+	kanban := fetchKanbanBlock(ctx, st, self, log)
+
+	inbox := formatHookBlock(rows)
+	block := joinAdditionalContext(inbox, kanban)
 	if block != "" {
 		envelope := map[string]any{
 			"hookSpecificOutput": map[string]any{
@@ -275,6 +284,153 @@ func buildPeerInboxEnvelope(
 		})
 	}
 	return envelope.BuildFromHookRows(msgs, to)
+}
+
+// fetchKanbanBlock queries the agent's card queue (claimed + role-
+// pullable) and renders a <kanban>...</kanban> block. Best-effort —
+// any error swallowed to slog and returns "". Never blocks the hot
+// path.
+//
+// Cap applied inline: the kanban envelope contributes at most
+// kanbanBlockBudgetBytes to additionalContext; if rendering exceeds it,
+// truncate the pullable list first (claimed is load-bearing — the
+// agent's own work — and always fits within reason at limit=10).
+func fetchKanbanBlock(
+	ctx context.Context,
+	st *sqlitestore.SQLiteLocal,
+	self store.Session,
+	log *slog.Logger,
+) string {
+	pairKey, err := st.GetSessionPairKey(ctx, self.CWD, self.Label)
+	if err != nil || pairKey == "" {
+		log.Debug("hook.kanban_no_pair_key",
+			"cwd", self.CWD, "label", self.Label,
+			"err", fmt.Sprint(err))
+		return ""
+	}
+	role, err := st.GetSessionRole(ctx, self.CWD, self.Label)
+	if err != nil {
+		log.Debug("hook.kanban_role_lookup_failed",
+			"session", self.Label, "err", err.Error())
+		role = ""
+	}
+	bundles, err := st.CardsForHook(ctx, sqlitestore.HookCardsFilter{
+		PairKey: pairKey,
+		Label:   self.Label,
+		Role:    role,
+	})
+	if err != nil {
+		log.Info("hook.kanban_query_failed",
+			"session", self.Label, "err", err.Error())
+		return ""
+	}
+	log.Debug("hook.kanban_fetched",
+		"pair_key", pairKey, "role", role,
+		"claimed", len(bundles.Claimed),
+		"pullable", len(bundles.Pullable))
+	if len(bundles.Claimed) == 0 && len(bundles.Pullable) == 0 {
+		return ""
+	}
+	return renderKanbanBlock(pairKey, role, bundles)
+}
+
+// kanbanBlockBudgetBytes is the soft cap for the kanban section of
+// additionalContext. Kept below the peer-inbox budget (4KB default) so
+// even a packed queue + full inbox stay under transport.
+const kanbanBlockBudgetBytes = 2 * 1024
+
+// renderKanbanBlock serializes the two-bucket HookCards into a terse
+// XML-ish block parallel to <peer-inbox>. Format:
+//
+//	<kanban pair_key="K" claimed="N" pullable="M" role="R">
+//	claimed by you:
+//	- #id [status] priority? title
+//	ready for role=R:
+//	- #id [status] title
+//	</kanban>
+//
+// Designed for byte-efficiency: single line per card, attribute
+// fragments only for non-default values (priority=0, no tags shown).
+func renderKanbanBlock(pairKey, role string, b *sqlitestore.HookCards) string {
+	if b == nil || (len(b.Claimed) == 0 && len(b.Pullable) == 0) {
+		return ""
+	}
+	var sb strings.Builder
+	// Header tag carries the pair_key + counts + (if any) role hint.
+	sb.WriteString(`<kanban pair_key="`)
+	sb.WriteString(pairKey)
+	sb.WriteString(`" claimed="`)
+	sb.WriteString(strconv.Itoa(len(b.Claimed)))
+	sb.WriteString(`" pullable="`)
+	sb.WriteString(strconv.Itoa(len(b.Pullable)))
+	if role != "" {
+		sb.WriteString(`" role="`)
+		sb.WriteString(role)
+	}
+	sb.WriteString("\">\n")
+
+	if len(b.Claimed) > 0 {
+		sb.WriteString("claimed by you:\n")
+		for _, c := range b.Claimed {
+			sb.WriteString(renderCardLine(c, true))
+		}
+	}
+	if len(b.Pullable) > 0 {
+		if role != "" {
+			sb.WriteString(fmt.Sprintf("ready for role=%s:\n", role))
+		} else {
+			sb.WriteString("ready to claim:\n")
+		}
+		for _, c := range b.Pullable {
+			sb.WriteString(renderCardLine(c, false))
+		}
+	}
+
+	sb.WriteString("</kanban>")
+
+	// Soft-truncate: if we blew past the budget, retry without the
+	// pullable section. Claimed is the load-bearing half.
+	out := sb.String()
+	if len(out) > kanbanBlockBudgetBytes && len(b.Pullable) > 0 {
+		trimmed := &sqlitestore.HookCards{Claimed: b.Claimed}
+		return renderKanbanBlock(pairKey, role, trimmed)
+	}
+	return out
+}
+
+// renderCardLine formats one card on one line. `showStatus` adds the
+// [status] tag — noisy for the pullable section (always "todo"), handy
+// for claimed (mix of in_progress / in_review / todo).
+func renderCardLine(c *sqlitestore.Card, showStatus bool) string {
+	var sb strings.Builder
+	sb.WriteString("- #")
+	sb.WriteString(strconv.FormatInt(c.ID, 10))
+	if showStatus {
+		sb.WriteString(" [")
+		sb.WriteString(c.Status)
+		sb.WriteString("]")
+	}
+	if c.Priority > 0 {
+		sb.WriteString(" ⚑")
+	}
+	sb.WriteString(" ")
+	sb.WriteString(c.Title)
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+// joinAdditionalContext stitches the peer-inbox envelope and the
+// kanban block into one additionalContext payload. Either half may be
+// empty; separator is a single blank line so an LLM reading both
+// doesn't lose the section boundary.
+func joinAdditionalContext(inbox, kanban string) string {
+	if inbox == "" {
+		return kanban
+	}
+	if kanban == "" {
+		return inbox
+	}
+	return inbox + "\n\n" + kanban
 }
 
 // formatHookBlock mirrors format_hook_block in scripts/peer-inbox-db.py —
