@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>__TITLE__</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg:#111111; --fg:#E5E5E5; --muted:#8A8A8A; --accent:#5841D8;
+    --panel:#1A1A1A; --border:rgba(128,128,128,0.22);
+    --hover:rgba(128,128,128,0.08);
+    --todo:#8A8A8A; --in-progress:#5841D8; --in-review:#f59e0b;
+    --done:#22c55e; --cancelled:#ef4444;
+    --ready:#22c55e; --blocked:#f59e0b;
+    --pri-high:#ef4444;
+  }
+  * { box-sizing:border-box }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:10px;
+    padding:14px 20px; border-bottom:1px solid var(--border);
+    position:sticky; top:0; background:var(--bg); z-index:10; }
+  header .dot { width:7px; height:7px; border-radius:50%;
+    background:var(--accent); box-shadow:0 0 6px var(--accent);
+    animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+  header h1 { margin:0; font-size:12px; font-weight:600;
+    letter-spacing:.04em; text-transform:uppercase; }
+  header .sub { color:var(--muted); font-size:11px; margin-left:auto; }
+  header a { color:var(--muted); font-size:11px; text-decoration:none;
+    padding:4px 10px; border:1px solid var(--border); border-radius:4px; }
+  header a:hover { color:var(--fg); border-color:var(--accent); }
+
+  main.board { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr));
+    gap:10px; padding:14px 20px; min-height:calc(100vh - 60px); }
+  .col { background:var(--panel); border:1px solid var(--border);
+    border-radius:6px; padding:10px 10px 12px; display:flex;
+    flex-direction:column; min-width:0; }
+  .col-head { display:flex; align-items:center; gap:8px;
+    padding:4px 2px 10px; border-bottom:1px solid var(--border);
+    margin-bottom:10px; }
+  .col-label { font-size:10px; letter-spacing:.14em;
+    text-transform:uppercase; color:var(--muted); font-weight:600; }
+  .col-count { margin-left:auto; font-size:10px; color:var(--muted);
+    background:rgba(128,128,128,0.12); padding:1px 6px; border-radius:8px; }
+  .col.todo         .col-head { border-bottom-color:var(--todo); }
+  .col.in_progress  .col-head { border-bottom-color:var(--in-progress); }
+  .col.in_review    .col-head { border-bottom-color:var(--in-review); }
+  .col.done         .col-head { border-bottom-color:var(--done); }
+  .col.cancelled    .col-head { border-bottom-color:var(--cancelled); opacity:.7; }
+  .cards { display:flex; flex-direction:column; gap:8px; }
+
+  .card { background:var(--bg); border:1px solid var(--border);
+    border-radius:5px; padding:9px 10px; cursor:default;
+    transition:border-color .15s, background .15s; position:relative; }
+  .card:hover { border-color:var(--accent); background:var(--hover); }
+  .card .title { font-size:13px; line-height:1.35; color:var(--fg);
+    margin-bottom:5px; word-wrap:break-word; }
+  .card .meta { display:flex; flex-wrap:wrap; gap:4px 10px;
+    font-size:10px; color:var(--muted); }
+  .card .meta .id { color:var(--muted); font-family:SF Mono,Menlo,monospace; }
+  .card .meta .role { color:var(--accent); }
+  .card .meta .who { color:var(--fg); }
+  .card .meta .priority.high { color:var(--pri-high); font-weight:600; }
+  .card .meta .blocked { color:var(--blocked); }
+  .card .meta .ready { color:var(--ready); }
+  .card .tags { margin-top:5px; display:flex; gap:4px; flex-wrap:wrap; }
+  .card .tag { font-size:9px; padding:1px 6px; border-radius:8px;
+    background:rgba(88,65,216,0.14); color:var(--accent); }
+
+  /* ready/blocked indicator pip in upper-right */
+  .card .pip { position:absolute; top:8px; right:8px;
+    width:6px; height:6px; border-radius:50%; }
+  .card.todo.ready .pip { background:var(--ready); box-shadow:0 0 4px var(--ready); }
+  .card.todo.blocked .pip { background:var(--blocked); }
+
+  .empty { color:var(--muted); font-size:11px; font-style:italic;
+    padding:8px 4px; }
+
+  /* Responsive: stack on narrow viewport */
+  @media (max-width: 1000px) {
+    main.board { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 560px) {
+    main.board { grid-template-columns:1fr; }
+  }
+</style>
+
+<header>
+  <span class=dot></span>
+  <h1>__CWD__</h1>
+  <span class=sub id=status>loading…</span>
+  <a href=/ title="back to rooms">rooms</a>
+</header>
+
+<main class=board id=board></main>
+
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const pairKey = params.get('pair_key');
+  if (!pairKey) {
+    document.getElementById('board').innerHTML =
+      '<div style="padding:20px;color:var(--muted)">pass ?pair_key=K</div>';
+    return;
+  }
+
+  const STATUSES = ['todo','in_progress','in_review','done','cancelled'];
+  const LABELS = {
+    todo:'to do', in_progress:'in progress', in_review:'in review',
+    done:'done', cancelled:'cancelled'
+  };
+
+  const board = document.getElementById('board');
+  const statusEl = document.getElementById('status');
+
+  // Pre-render 5 empty columns — refresh just repopulates .cards inside each.
+  for (const s of STATUSES) {
+    const col = document.createElement('section');
+    col.className = 'col ' + s;
+    col.innerHTML = `
+      <div class="col-head">
+        <span class="col-label">${LABELS[s]}</span>
+        <span class="col-count" data-count="${s}">0</span>
+      </div>
+      <div class="cards" data-cards="${s}"></div>`;
+    board.appendChild(col);
+  }
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function renderCard(c) {
+    const isTodo = c.status === 'todo';
+    const pip = isTodo && c.ready ? 'ready' :
+                isTodo && (c.blocker_ids || []).length > 0 ? 'blocked' : '';
+    const cls = ['card', c.status, pip].filter(Boolean).join(' ');
+
+    const parts = [];
+    parts.push(`<span class="id">#${c.id}</span>`);
+    if (c.priority === 1) {
+      parts.push(`<span class="priority high">⚑ priority</span>`);
+    } else if (c.priority === -1) {
+      parts.push(`<span class="priority">low</span>`);
+    }
+    if (c.needs_role) parts.push(`<span class="role">needs ${esc(c.needs_role)}</span>`);
+    if (c.claimed_by) parts.push(`<span class="who">${esc(c.claimed_by)}</span>`);
+    if (isTodo) {
+      if (c.ready) {
+        parts.push(`<span class="ready">ready</span>`);
+      } else if ((c.blocker_ids || []).length > 0) {
+        parts.push(`<span class="blocked">blocked by #${c.blocker_ids.join(', #')}</span>`);
+      }
+    }
+
+    let tags = '';
+    if (Array.isArray(c.tags) && c.tags.length) {
+      tags = '<div class="tags">' +
+        c.tags.map(t => `<span class="tag">${esc(t)}</span>`).join('') +
+        '</div>';
+    }
+
+    return `
+      <article class="${cls}" title="${esc(c.body || '')}">
+        ${pip ? '<span class="pip"></span>' : ''}
+        <div class="title">${esc(c.title)}</div>
+        <div class="meta">${parts.join(' ')}</div>
+        ${tags}
+      </article>`;
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/cards?pair_key=' + encodeURIComponent(pairKey),
+                            { cache:'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const cards = data.cards || [];
+      const byId = Object.fromEntries(cards.map(c => [c.id, c]));
+
+      for (const s of STATUSES) {
+        const ids = (data.by_status && data.by_status[s]) || [];
+        const list = ids.map(id => byId[id]).filter(Boolean);
+        const target = document.querySelector(`[data-cards="${s}"]`);
+        if (!target) continue;
+        target.innerHTML = list.length
+          ? list.map(renderCard).join('')
+          : '<div class="empty">(none)</div>';
+        const countEl = document.querySelector(`[data-count="${s}"]`);
+        if (countEl) countEl.textContent = list.length;
+      }
+      statusEl.textContent = cards.length + ' cards · updated ' +
+        new Date().toLocaleTimeString();
+    } catch (e) {
+      statusEl.textContent = 'refresh failed: ' + e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>

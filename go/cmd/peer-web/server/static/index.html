@@ -63,6 +63,10 @@
   .activity-dot.terminated { background:var(--terminated) }
   .activity-dot.unknown { background:#4b5563 }
   .members { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+  .cards-link { margin-left:auto; color:var(--accent);
+    text-decoration:none; font-size:11px; padding:1px 7px;
+    border:1px solid rgba(88,65,216,0.35); border-radius:3px; }
+  .cards-link:hover { background:rgba(88,65,216,0.12); }
   .pill { color:#FFFFFF; padding:2px 8px; border-radius:4px;
     font-weight:600; font-size:10px; }
   .empty { text-align:center; padding:64px 20px; color:var(--muted); }
@@ -166,6 +170,14 @@
           meta.appendChild(el('span', '',
             'ended by ' + r.terminated_by + ' at ' + r.terminated_at));
         }
+        // v3.9 kanban companion link. Click bubbles to the <a>; stopping
+        // the bubble opens the board in place of the chat view.
+        const boardLink = document.createElement('a');
+        boardLink.href = '/cards?pair_key=' + encodeURIComponent(r.pair_key);
+        boardLink.textContent = 'cards';
+        boardLink.className = 'cards-link';
+        boardLink.addEventListener('click', (e) => e.stopPropagation());
+        meta.appendChild(boardLink);
         card.appendChild(meta);
 
         if (r.members && r.members.length) {

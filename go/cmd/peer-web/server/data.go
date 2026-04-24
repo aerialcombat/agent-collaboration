@@ -34,6 +34,7 @@ type webStore interface {
 	RegisterOwner(ctx context.Context, params sqlitestore.RegisterOwnerParams) error
 	ForwardLocalPush(ctx context.Context, label, pairKey string, payload map[string]any) (int, string, error)
 	SweepStaleActive(ctx context.Context, cutoff time.Duration, now time.Time) (int64, error)
+	ListCards(ctx context.Context, filter sqlitestore.CardListFilter) ([]*sqlitestore.Card, error)
 	Close() error
 }
 

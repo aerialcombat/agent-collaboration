@@ -42,6 +42,22 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	s.serveStatic(w, r, "view.html", titleVars(title, banner))
 }
 
+// handleCardsView serves the kanban-board SPA at /cards. Expects
+// ?pair_key=K. Like /view, it's a pure client-side SPA that fetches
+// /api/cards, so the server only stamps the title banner.
+func (s *Server) handleCardsView(w http.ResponseWriter, r *http.Request) {
+	pairKey := r.URL.Query().Get("pair_key")
+	var title, banner string
+	if pairKey != "" {
+		title = "peer-inbox — cards " + pairKey
+		banner = title
+	} else {
+		title = "peer-inbox — cards (no pair_key)"
+		banner = "pass ?pair_key=K"
+	}
+	s.serveStatic(w, r, "cards.html", titleVars(title, banner))
+}
+
 // serveStatic reads a file from the embedded FS and writes it with
 // optional __PLACEHOLDER__ substitution. vars is pre-escaped HTML.
 func (s *Server) serveStatic(w http.ResponseWriter, r *http.Request, name string, substitutions string) {
