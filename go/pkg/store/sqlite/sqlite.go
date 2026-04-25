@@ -85,10 +85,14 @@ func Open(ctx context.Context) (*SQLiteLocal, error) {
 		return nil, store.ErrSchemaTooOld
 	}
 
-	// `_pragma=busy_timeout(5000)` ensures we don't hang forever fighting
-	// Python over the write lock. `_pragma=journal_mode(WAL)` is set by
-	// Python on every open; repeating it here is cheap and idempotent.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", path)
+	// busy_timeout 15s gives concurrent writers room to queue without
+	// failing — 10 parallel "Run" dispatches each do a small write tx;
+	// even at 50ms each they fit under the timeout 30x over.
+	// _txlock=immediate makes BeginTx start with BEGIN IMMEDIATE so
+	// reads inside a write tx can't deadlock with another writer
+	// promoting from snapshot to write (SQLITE_BUSY_SNAPSHOT).
+	// journal_mode=WAL lets readers run while a writer holds the lock.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)

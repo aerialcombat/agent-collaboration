@@ -111,8 +111,13 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 
 	// Optimistically claim → in_progress before forking. If the user
 	// double-clicks Run, the second call will see ClaimedBy != "" and
-	// 409 out, which is the desired behavior.
-	if _, err := st.ClaimCard(ctx, id, label, false); err != nil {
+	// 409 out, which is the desired behavior. Retry on transient
+	// SQLITE_BUSY (10 parallel Run clicks against the same SQLite db
+	// can race even with busy_timeout=15s).
+	if err := retryOnBusy(func() error {
+		_, e := st.ClaimCard(ctx, id, label, false)
+		return e
+	}); err != nil {
 		if errors.Is(err, sqlitestore.ErrCardAlreadyClaimed) {
 			writeJSONError(w, http.StatusConflict, "card was claimed mid-flight")
 			return
@@ -120,7 +125,10 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 		writeJSONError(w, http.StatusInternalServerError, "claim: "+err.Error())
 		return
 	}
-	if _, err := st.UpdateCardStatus(ctx, id, sqlitestore.CardStatusInProgress, label); err != nil {
+	if err := retryOnBusy(func() error {
+		_, e := st.UpdateCardStatus(ctx, id, sqlitestore.CardStatusInProgress, label)
+		return e
+	}); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "status: "+err.Error())
 		return
 	}
@@ -294,6 +302,35 @@ func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string
 	fmt.Fprintf(&b, "- Don't `git commit` or push. The human reviews artifacts before merging.\n")
 
 	return b.String()
+}
+
+// retryOnBusy retries fn up to 4 times with exponential backoff
+// (50ms → 200ms → 800ms → 1500ms) on SQLITE_BUSY-shaped errors. The
+// driver returns these as plain errors with "database is locked" or
+// "BUSY" substrings; we string-match because errors.Is on driver-
+// internal codes is fragile across driver versions.
+func retryOnBusy(fn func() error) error {
+	delays := []time.Duration{
+		50 * time.Millisecond,
+		200 * time.Millisecond,
+		800 * time.Millisecond,
+		1500 * time.Millisecond,
+	}
+	var lastErr error
+	for i := 0; i <= len(delays); i++ {
+		lastErr = fn()
+		if lastErr == nil {
+			return nil
+		}
+		msg := lastErr.Error()
+		if !strings.Contains(msg, "database is locked") && !strings.Contains(msg, "BUSY") {
+			return lastErr
+		}
+		if i < len(delays) {
+			time.Sleep(delays[i])
+		}
+	}
+	return lastErr
 }
 
 func randHex(n int) (string, error) {
