@@ -676,3 +676,107 @@ func (s *SQLiteLocal) loadCardEdges(ctx context.Context, c *Card) error {
 	c.Ready = open == 0
 	return nil
 }
+
+// CardBoardSummary is one row in the boards-index roll-up: per pair_key,
+// total + per-status counts, ready-todo count, distinct claimers, and
+// the most recent updated_at across all cards in the board. Used by
+// peer-web's /api/boards endpoint to render the boards index without
+// fetching every card.
+type CardBoardSummary struct {
+	PairKey       string
+	Total         int
+	Todo          int
+	InProgress    int
+	InReview      int
+	Done          int
+	Cancelled     int
+	ReadyTodo     int
+	DistinctRoles int
+	Claimers      []string // distinct claimed_by labels (excl. nulls/empty)
+	LastUpdatedAt string   // ISO; max(updated_at) across the board's cards
+}
+
+// CardBoardSummaries returns one summary row per pair_key that has at
+// least one card. Aggregation is one round trip (per-status counts +
+// last-updated) plus a second pass for distinct claimers, which keeps
+// the query simple and avoids GROUP_CONCAT portability concerns.
+//
+// Pair keys with zero cards are excluded — a "board" exists only once a
+// card has been created in that pair_key.
+func (s *SQLiteLocal) CardBoardSummaries(ctx context.Context) ([]*CardBoardSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			c.pair_key,
+			COUNT(*),
+			SUM(CASE WHEN c.status = 'todo'        THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.status = 'in_progress' THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.status = 'in_review'   THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.status = 'done'        THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.status = 'cancelled'   THEN 1 ELSE 0 END),
+			SUM(CASE WHEN c.status = 'todo' AND NOT EXISTS (
+				SELECT 1 FROM card_dependencies d
+				JOIN cards b ON b.id = d.blocker_id
+				WHERE d.blockee_id = c.id
+				  AND b.status NOT IN ('done','cancelled')
+			) THEN 1 ELSE 0 END),
+			COUNT(DISTINCT NULLIF(c.needs_role, '')),
+			MAX(c.updated_at)
+		FROM cards c
+		GROUP BY c.pair_key
+		ORDER BY MAX(c.updated_at) DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("CardBoardSummaries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*CardBoardSummary
+	for rows.Next() {
+		b := &CardBoardSummary{}
+		if err := rows.Scan(&b.PairKey, &b.Total,
+			&b.Todo, &b.InProgress, &b.InReview, &b.Done, &b.Cancelled,
+			&b.ReadyTodo, &b.DistinctRoles, &b.LastUpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("CardBoardSummaries scan: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("CardBoardSummaries rows: %w", err)
+	}
+
+	// Distinct claimers per board, in a single pass.
+	if len(out) > 0 {
+		claimerRows, err := s.db.QueryContext(ctx, `
+			SELECT pair_key, claimed_by
+			FROM cards
+			WHERE claimed_by IS NOT NULL AND claimed_by <> ''
+			GROUP BY pair_key, claimed_by
+			ORDER BY pair_key, claimed_by
+		`)
+		if err != nil {
+			return nil, fmt.Errorf("CardBoardSummaries claimers: %w", err)
+		}
+		defer claimerRows.Close()
+
+		byKey := make(map[string]*CardBoardSummary, len(out))
+		for _, b := range out {
+			byKey[b.PairKey] = b
+		}
+		for claimerRows.Next() {
+			var pk, who string
+			if err := claimerRows.Scan(&pk, &who); err != nil {
+				return nil, fmt.Errorf("CardBoardSummaries claimer scan: %w", err)
+			}
+			if b, ok := byKey[pk]; ok {
+				b.Claimers = append(b.Claimers, who)
+			}
+		}
+		if err := claimerRows.Err(); err != nil {
+			return nil, fmt.Errorf("CardBoardSummaries claimer rows: %w", err)
+		}
+	}
+
+	return out, nil
+}
+

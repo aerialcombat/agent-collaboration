@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>__TITLE__</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<style>
+  /* Linear-derivative — shares palette/type with cards.html */
+  :root {
+    --bg-marketing: #08090a;
+    --bg-panel: #0f1011;
+    --bg-elevated: #191a1b;
+    --bg-card: rgba(255,255,255,0.02);
+    --bg-card-hover: rgba(255,255,255,0.05);
+
+    --fg-primary: #f7f8f8;
+    --fg-secondary: #d0d6e0;
+    --fg-tertiary: #8a8f98;
+    --fg-quaternary: #62666d;
+
+    --border-subtle: rgba(255,255,255,0.05);
+    --border-standard: rgba(255,255,255,0.08);
+    --border-emphasis: rgba(255,255,255,0.12);
+
+    --accent: #7170ff;
+
+    --status-todo: #8a8f98;
+    --status-in-progress: #f2c94c;
+    --status-in-review: #5e6ad2;
+    --status-done: #4cb782;
+    --status-cancelled: #62666d;
+  }
+
+  * { box-sizing: border-box }
+
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg-marketing);
+    color: var(--fg-secondary);
+    font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont,
+      'SF Pro Display', system-ui, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    font-feature-settings: "cv01", "ss03";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky; top: 0;
+    background: var(--bg-panel);
+    z-index: 10;
+    backdrop-filter: blur(8px);
+  }
+  header .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(113,112,255,0.6);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .4 } }
+  header h1 {
+    margin: 0;
+    font-size: 13px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+  }
+  header .sub {
+    color: var(--fg-quaternary);
+    font-size: 12px; font-weight: 510;
+    margin-left: auto;
+    letter-spacing: -0.13px;
+  }
+  header a {
+    color: var(--fg-secondary);
+    font-size: 12px; font-weight: 510;
+    text-decoration: none;
+    padding: 5px 11px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  header a:hover {
+    color: var(--fg-primary);
+    background: rgba(255,255,255,0.05);
+    border-color: var(--border-emphasis);
+  }
+
+  main {
+    padding: 32px 24px;
+    max-width: 1080px;
+    margin: 0 auto;
+  }
+
+  .page-title {
+    font-size: 24px; font-weight: 590;
+    color: var(--fg-primary);
+    letter-spacing: -0.288px;
+    line-height: 1.33;
+    margin: 0 0 6px;
+  }
+  .page-sub {
+    font-size: 14px; font-weight: 400;
+    color: var(--fg-tertiary);
+    letter-spacing: -0.182px;
+    margin: 0 0 28px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+
+  .board {
+    background: var(--bg-card);
+    border: 1px solid var(--border-standard);
+    border-radius: 8px;
+    padding: 14px 16px;
+    text-decoration: none;
+    color: inherit;
+    display: flex; flex-direction: column;
+    gap: 10px;
+    transition: background .12s, border-color .12s, transform .12s;
+    position: relative;
+  }
+  .board:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-emphasis);
+    transform: translateY(-1px);
+  }
+
+  .board .name {
+    font-size: 14px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+    word-break: break-all;
+  }
+
+  .board .row {
+    display: flex; align-items: center;
+    gap: 10px;
+    font-size: 12px; font-weight: 510;
+    color: var(--fg-tertiary);
+    letter-spacing: -0.06px;
+  }
+  .board .row .label { color: var(--fg-quaternary); font-weight: 400; }
+
+  /* Mini status stripe — proportional bar across statuses */
+  .stripe {
+    display: flex;
+    height: 4px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.04);
+  }
+  .stripe span { display: block; }
+  .stripe .todo        { background: var(--status-todo); }
+  .stripe .in_progress { background: var(--status-in-progress); }
+  .stripe .in_review   { background: var(--status-in-review); }
+  .stripe .done        { background: var(--status-done); }
+  .stripe .cancelled   { background: var(--status-cancelled); opacity: .5; }
+
+  /* Pills under the stripe — counts per status */
+  .counts {
+    display: flex; flex-wrap: wrap;
+    gap: 4px 6px;
+  }
+  .count-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 510;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    border: 1px solid var(--border-standard);
+    color: var(--fg-secondary);
+    letter-spacing: -0.06px;
+  }
+  .count-pill::before {
+    content: '';
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+  .count-pill.todo        { color: var(--status-todo); }
+  .count-pill.in_progress { color: var(--status-in-progress); }
+  .count-pill.in_review   { color: var(--status-in-review); }
+  .count-pill.done        { color: var(--status-done); }
+  .count-pill.cancelled   { color: var(--status-cancelled); opacity: .7; }
+  .count-pill.zero        { opacity: .35; }
+
+  .ready-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    margin-left: auto;
+    font-size: 11px; font-weight: 510;
+    padding: 2px 9px;
+    border-radius: 9999px;
+    color: var(--status-done);
+    background: rgba(76,183,130,0.10);
+    border: 1px solid rgba(76,183,130,0.25);
+    letter-spacing: -0.06px;
+  }
+  .ready-badge::before {
+    content: '';
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 6px rgba(76,183,130,0.55);
+  }
+
+  .claimers {
+    display: flex; flex-wrap: wrap; gap: 4px;
+    font-size: 11px; color: var(--fg-tertiary);
+  }
+  .claimer-chip {
+    padding: 1px 7px;
+    border-radius: 9999px;
+    border: 1px solid var(--border-standard);
+    color: var(--fg-secondary);
+    font-weight: 510;
+    letter-spacing: -0.06px;
+  }
+
+  .footer-row {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--fg-quaternary);
+    letter-spacing: -0.06px;
+  }
+  .footer-row .total { color: var(--fg-secondary); font-weight: 510; }
+  .footer-row .ts {
+    margin-left: auto;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-weight: 400;
+  }
+
+  .empty-state {
+    color: var(--fg-tertiary);
+    font-size: 14px;
+    padding: 48px 24px;
+    text-align: center;
+    border: 1px dashed var(--border-standard);
+    border-radius: 8px;
+  }
+  .empty-state code {
+    color: var(--accent);
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+  }
+
+  @media (max-width: 600px) {
+    main { padding: 20px 16px; }
+    header { padding: 10px 16px; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+
+<header>
+  <span class=dot></span>
+  <h1>__CWD__</h1>
+  <span class=sub id=status>loading…</span>
+  <a href=/ title="back to rooms">rooms</a>
+</header>
+
+<main>
+  <h1 class=page-title>Kanban boards</h1>
+  <p class=page-sub>One board per pair_key. Click in to claim, transition, and drag cards.</p>
+  <div class=grid id=grid></div>
+</main>
+
+<script>
+(() => {
+  const grid = document.getElementById('grid');
+  const statusEl = document.getElementById('status');
+
+  const STATUSES = ['todo','in_progress','in_review','done','cancelled'];
+  const LABELS = {
+    todo: 'Todo', in_progress: 'In Progress', in_review: 'In Review',
+    done: 'Done', cancelled: 'Cancelled'
+  };
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function fmtTs(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d)) return s;
+    const now = Date.now();
+    const diff = (now - d.getTime()) / 1000;
+    if (diff < 60)        return 'just now';
+    if (diff < 3600)      return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400)     return Math.floor(diff / 3600) + 'h ago';
+    if (diff < 86400 * 7) return Math.floor(diff / 86400) + 'd ago';
+    return d.toLocaleDateString();
+  }
+
+  function renderStripe(by) {
+    const total = STATUSES.reduce((sum, s) => sum + (by[s] || 0), 0);
+    if (total === 0) return '';
+    return '<div class="stripe">' +
+      STATUSES.map(s => {
+        const n = by[s] || 0;
+        if (!n) return '';
+        const pct = (n / total * 100).toFixed(2);
+        return `<span class="${s}" style="width:${pct}%"></span>`;
+      }).join('') +
+      '</div>';
+  }
+
+  function renderCounts(by) {
+    return '<div class="counts">' +
+      STATUSES.map(s => {
+        const n = by[s] || 0;
+        const cls = 'count-pill ' + s + (n === 0 ? ' zero' : '');
+        return `<span class="${cls}">${LABELS[s]} ${n}</span>`;
+      }).join('') +
+      '</div>';
+  }
+
+  function renderBoard(b) {
+    const url = '/cards?pair_key=' + encodeURIComponent(b.pair_key);
+    const ready = b.ready_todo > 0
+      ? `<span class="ready-badge">${b.ready_todo} ready</span>`
+      : '';
+    const claimers = (b.claimers || []).slice(0, 5);
+    const moreClaimers = (b.claimers || []).length - claimers.length;
+    const claimerEls = claimers.length
+      ? '<div class="claimers">' +
+        claimers.map(c => `<span class="claimer-chip">${esc(c)}</span>`).join('') +
+        (moreClaimers > 0 ? `<span class="claimer-chip">+${moreClaimers}</span>` : '') +
+        '</div>'
+      : '';
+
+    return `
+      <a class="board" href="${url}">
+        <div class="row">
+          <span class="name">${esc(b.pair_key)}</span>
+          ${ready}
+        </div>
+        ${renderStripe(b.by_status)}
+        ${renderCounts(b.by_status)}
+        ${claimerEls}
+        <div class="footer-row">
+          <span class="total">${b.total} card${b.total === 1 ? '' : 's'}</span>
+          ${b.distinct_roles ? `<span>· ${b.distinct_roles} role${b.distinct_roles === 1 ? '' : 's'}</span>` : ''}
+          <span class="ts">updated ${fmtTs(b.last_updated_at)}</span>
+        </div>
+      </a>`;
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/boards', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const boards = data.boards || [];
+      if (boards.length === 0) {
+        grid.innerHTML = `<div class="empty-state">
+          No kanban boards yet. Create a card with
+          <code>peer-inbox card-create --pair-key K --title T --created-by you</code>
+          to bring up its first board.
+        </div>`;
+      } else {
+        grid.innerHTML = boards.map(renderBoard).join('');
+      }
+      statusEl.textContent = boards.length + ' board' + (boards.length === 1 ? '' : 's') +
+        ' · updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      statusEl.textContent = 'refresh failed: ' + e.message;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>
+</content>
+</invoke>

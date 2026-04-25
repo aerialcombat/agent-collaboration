@@ -108,6 +108,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/rooms/terminate-inactive", s.handleTerminateInactive)
 	s.mux.HandleFunc("/api/cards", s.handleCards)
 	s.mux.HandleFunc("/api/cards/", s.handleCardStatus)
+	s.mux.HandleFunc("/api/boards", s.handleBoards)
 	s.mux.HandleFunc("/view", s.handleView)
 	s.mux.HandleFunc("/cards", s.handleCardsView)
 	// Root serves the multi-room index. Anything else falls through to

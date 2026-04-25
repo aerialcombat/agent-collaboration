@@ -36,6 +36,7 @@ type webStore interface {
 	SweepStaleActive(ctx context.Context, cutoff time.Duration, now time.Time) (int64, error)
 	ListCards(ctx context.Context, filter sqlitestore.CardListFilter) ([]*sqlitestore.Card, error)
 	UpdateCardStatus(ctx context.Context, id int64, status string) (*sqlitestore.Card, error)
+	CardBoardSummaries(ctx context.Context) ([]*sqlitestore.CardBoardSummary, error)
 	Close() error
 }
 

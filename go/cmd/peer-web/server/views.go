@@ -42,20 +42,23 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	s.serveStatic(w, r, "view.html", titleVars(title, banner))
 }
 
-// handleCardsView serves the kanban-board SPA at /cards. Expects
-// ?pair_key=K. Like /view, it's a pure client-side SPA that fetches
-// /api/cards, so the server only stamps the title banner.
+// handleCardsView serves the kanban surface at /cards.
+//
+//   - With ?pair_key=K → kanban board SPA (cards.html), fetches /api/cards.
+//   - Without pair_key  → boards index (cards-index.html), fetches /api/boards
+//     and renders one card per pair_key linking to /cards?pair_key=K.
+//
+// Both pages are pure client-side SPAs; the server only stamps the
+// title banner via __TITLE__ / __CWD__ substitution.
 func (s *Server) handleCardsView(w http.ResponseWriter, r *http.Request) {
 	pairKey := r.URL.Query().Get("pair_key")
-	var title, banner string
 	if pairKey != "" {
-		title = "peer-inbox — cards " + pairKey
-		banner = title
-	} else {
-		title = "peer-inbox — cards (no pair_key)"
-		banner = "pass ?pair_key=K"
+		title := "peer-inbox — cards " + pairKey
+		s.serveStatic(w, r, "cards.html", titleVars(title, title))
+		return
 	}
-	s.serveStatic(w, r, "cards.html", titleVars(title, banner))
+	title := "peer-inbox — kanban boards"
+	s.serveStatic(w, r, "cards-index.html", titleVars(title, "Kanban boards"))
 }
 
 // serveStatic reads a file from the embedded FS and writes it with

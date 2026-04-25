@@ -148,6 +148,67 @@ func cardToJSON(c *sqlitestore.Card) map[string]any {
 	return m
 }
 
+// handleBoards — GET /api/boards
+//
+// Returns one summary row per pair_key that has at least one card.
+// Backs the boards-index view at /cards (no pair_key).
+//
+// Response shape:
+//
+//	{
+//	  "boards": [
+//	    { "pair_key": "fleet-quartz-842c", "total": 6,
+//	      "by_status": {"todo":1,"in_progress":0,"in_review":2,"done":2,"cancelled":1},
+//	      "ready_todo": 1, "claimers": ["claude-session", "reviewer-claude"],
+//	      "last_updated_at": "2026-04-25T..." },
+//	    ...
+//	  ]
+//	}
+func (s *Server) handleBoards(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	boards, err := st.CardBoardSummaries(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	out := make([]map[string]any, 0, len(boards))
+	for _, b := range boards {
+		claimers := b.Claimers
+		if claimers == nil {
+			claimers = []string{}
+		}
+		out = append(out, map[string]any{
+			"pair_key": b.PairKey,
+			"total":    b.Total,
+			"by_status": map[string]int{
+				"todo":        b.Todo,
+				"in_progress": b.InProgress,
+				"in_review":   b.InReview,
+				"done":        b.Done,
+				"cancelled":   b.Cancelled,
+			},
+			"ready_todo":      b.ReadyTodo,
+			"distinct_roles":  b.DistinctRoles,
+			"claimers":        claimers,
+			"last_updated_at": b.LastUpdatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"boards": out})
+}
+
 // handleCardStatus — POST /api/cards/{id}/status
 //
 // Body: {"status": "todo|in_progress|in_review|done|cancelled"}
