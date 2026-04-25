@@ -1228,6 +1228,13 @@
   }
 
   function renderDrawer(c, byId) {
+    // Preserve per-render-volatile state so a forced re-render
+    // (status change, body update from worker, etc.) doesn't yank
+    // the user out of what they were doing.
+    const dbScroll = (drawer.querySelector('.db') || {}).scrollTop || 0;
+    const composerVal = (drawer.querySelector('#comment-input') || {}).value;
+    const composerAuthor = (drawer.querySelector('#comment-author') || {}).value;
+
     const blockers = (c.blocker_ids || []);
     const blockees = (c.blockee_ids || []);
     const tags = Array.isArray(c.tags) ? c.tags : [];
@@ -1239,6 +1246,17 @@
           ? '<span class="state-pill ready">Ready</span>'
           : `<span class="state-pill blocked">Blocked by ${blockers.length} card${blockers.length === 1 ? '' : 's'}</span>`)
       : '';
+
+    // Restore preserved state after innerHTML rewrite (deferred to
+    // end of function via setTimeout 0 / requestAnimationFrame).
+    setTimeout(() => {
+      const db = drawer.querySelector('.db');
+      if (db) db.scrollTop = dbScroll;
+      const ci = drawer.querySelector('#comment-input');
+      if (ci && composerVal) ci.value = composerVal;
+      const ca = drawer.querySelector('#comment-author');
+      if (ca && composerAuthor) ca.value = composerAuthor;
+    }, 0);
 
     const canRun = isTodo && c.ready && !c.claimed_by;
     const runBtn = canRun
@@ -1388,6 +1406,9 @@
     const c = byId[id];
     if (!c) return;
     openCardId = id;
+    // Reset dedup so the first paint always renders.
+    lastDrawerSig = drawerSig(c);
+    lastActivitySig = null;
     renderDrawer(c, byId);
     drawer.classList.add('open');
     drawer.setAttribute('aria-hidden', 'false');
@@ -1397,6 +1418,8 @@
 
   function closeDrawer() {
     openCardId = null;
+    lastDrawerSig = null;
+    lastActivitySig = null;
     drawer.classList.remove('open');
     drawer.setAttribute('aria-hidden', 'true');
     backdrop.classList.remove('open');
@@ -1535,11 +1558,19 @@
       const cards = data.cards || [];
       const byId = Object.fromEntries(cards.map(c => [c.id, c]));
 
-      // If the drawer is open, refresh its content with the latest snapshot.
+      // If the drawer is open, refresh ONLY when the card's mutable
+      // fields have actually changed. A blind re-render on every 3s
+      // poll resets scroll position, wipes the composer textarea, and
+      // collapses any open ctx-panel sections. Same for activity —
+      // refreshActivity has its own dedup that no-ops on identical
+      // event lists.
       if (openCardId !== null && byId[openCardId]) {
-        renderDrawer(byId[openCardId], byId);
-        // Re-fetch the activity feed so worker comments appear within the
-        // 3s polling window without a manual refresh.
+        const c = byId[openCardId];
+        const sig = drawerSig(c);
+        if (sig !== lastDrawerSig) {
+          lastDrawerSig = sig;
+          renderDrawer(c, byId);
+        }
         refreshActivity(openCardId);
       }
 
@@ -1644,6 +1675,22 @@
     }
   });
 
+  // --- Drawer dedup state ------------------------------------------------
+  // Track the last-rendered drawer signature so polling skips renders
+  // that wouldn't change anything visible. Reset on drawer open so the
+  // first render after open always paints.
+  let lastDrawerSig = null;
+  let lastActivitySig = null;
+  function drawerSig(c) {
+    // Mutable fields the drawer actually displays. Order matters in JSON.
+    return JSON.stringify([
+      c.status, c.claimed_by || '', c.body || '', c.title,
+      c.priority, c.needs_role || '', c.ready,
+      (c.blocker_ids || []).join(','),
+      (c.blockee_ids || []).join(','),
+    ]);
+  }
+
   // --- Drawer activity panel (timeline + composer) -----------------------
   const ACTIVITY_GLYPH = {
     comment:       '💬',
@@ -1678,15 +1725,22 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
       const events = data.events || [];
+      // Dedup: if the event-id sequence hasn't changed, skip the
+      // innerHTML rewrite to preserve scroll position.
+      const sig = events.map(e => e.id).join(',');
+      if (sig === lastActivitySig) return;
+      lastActivitySig = sig;
       count.textContent = events.length;
       if (events.length === 0) {
         list.innerHTML = '<div class="activity-empty">No activity yet. Be the first to comment.</div>';
       } else {
-        // Newest at the bottom (chronological feed). Auto-scroll to bottom on
-        // first render only — don't yank the user away if they've scrolled up.
+        // Newest at the bottom (chronological feed). Preserve scroll
+        // position; auto-scroll to bottom only if the user was already
+        // pinned there (within 12px slop for sub-pixel rounding).
+        const prevTop = list.scrollTop;
         const wasAtBottom = (list.scrollHeight - list.scrollTop - list.clientHeight) < 12;
         list.innerHTML = events.map(renderActivityRow).join('');
-        if (wasAtBottom) list.scrollTop = list.scrollHeight;
+        list.scrollTop = wasAtBottom ? list.scrollHeight : prevTop;
       }
     } catch (err) {
       list.innerHTML = `<div class="activity-empty">activity load failed: ${esc(err.message)}</div>`;
