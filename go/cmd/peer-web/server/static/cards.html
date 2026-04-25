@@ -50,7 +50,7 @@
   .cards { display:flex; flex-direction:column; gap:8px; }
 
   .card { background:var(--bg); border:1px solid var(--border);
-    border-radius:5px; padding:9px 10px; cursor:default;
+    border-radius:5px; padding:9px 10px; cursor:pointer;
     transition:border-color .15s, background .15s; position:relative; }
   .card:hover { border-color:var(--accent); background:var(--hover); }
   .card .title { font-size:13px; line-height:1.35; color:var(--fg);
@@ -83,6 +83,47 @@
   @media (max-width: 560px) {
     main.board { grid-template-columns:1fr; }
   }
+
+  /* Detail drawer */
+  .backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.55);
+    display:none; z-index:50; }
+  .backdrop.open { display:block; }
+  .drawer { position:fixed; top:0; right:0; bottom:0; width:min(560px, 100vw);
+    background:var(--panel); border-left:1px solid var(--border);
+    display:none; flex-direction:column; z-index:60;
+    box-shadow:-8px 0 24px rgba(0,0,0,0.45); }
+  .drawer.open { display:flex; }
+  .drawer .dh { display:flex; align-items:center; gap:10px;
+    padding:14px 18px; border-bottom:1px solid var(--border); }
+  .drawer .dh .id { color:var(--muted); font:11px SF Mono,Menlo,monospace; }
+  .drawer .dh .status-pill { font-size:10px; padding:2px 8px; border-radius:10px;
+    text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+  .drawer .dh .status-pill.todo { background:rgba(138,138,138,.18); color:var(--todo); }
+  .drawer .dh .status-pill.in_progress { background:rgba(88,65,216,.18); color:var(--in-progress); }
+  .drawer .dh .status-pill.in_review { background:rgba(245,158,11,.16); color:var(--in-review); }
+  .drawer .dh .status-pill.done { background:rgba(34,197,94,.16); color:var(--done); }
+  .drawer .dh .status-pill.cancelled { background:rgba(239,68,68,.16); color:var(--cancelled); }
+  .drawer .dh .close { margin-left:auto; background:none; border:1px solid var(--border);
+    color:var(--muted); font-size:18px; line-height:1; padding:2px 9px;
+    border-radius:4px; cursor:pointer; }
+  .drawer .dh .close:hover { color:var(--fg); border-color:var(--accent); }
+  .drawer .db { padding:16px 18px; overflow-y:auto; flex:1; }
+  .drawer h2 { margin:0 0 10px; font-size:15px; line-height:1.35; font-weight:600; }
+  .drawer .field { margin:14px 0 0; }
+  .drawer .label { font-size:10px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--muted); margin-bottom:4px; }
+  .drawer .value { font-size:12px; color:var(--fg); word-wrap:break-word; }
+  .drawer .value.mono { font-family:SF Mono,Menlo,monospace; font-size:11px; }
+  .drawer .body-md { white-space:pre-wrap; background:var(--bg);
+    border:1px solid var(--border); border-radius:4px; padding:10px 12px;
+    font-size:12px; line-height:1.5; }
+  .drawer .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px 16px; }
+  .drawer .chip { display:inline-block; font-size:10px; padding:2px 7px;
+    border-radius:8px; background:rgba(88,65,216,.14); color:var(--accent);
+    margin:2px 4px 0 0; }
+  .drawer .chip.dep { background:rgba(245,158,11,.14); color:var(--in-review); }
+  .drawer .chip.dep.done { background:rgba(34,197,94,.14); color:var(--done); }
+  .drawer .empty { color:var(--muted); font-style:italic; font-size:11px; }
 </style>
 
 <header>
@@ -93,6 +134,9 @@
 </header>
 
 <main class=board id=board></main>
+
+<div class="backdrop" id=backdrop></div>
+<aside class="drawer" id=drawer aria-hidden=true></aside>
 
 <script>
 (() => {
@@ -162,7 +206,7 @@
     }
 
     return `
-      <article class="${cls}" title="${esc(c.body || '')}">
+      <article class="${cls}" data-card-id="${c.id}" tabindex="0">
         ${pip ? '<span class="pip"></span>' : ''}
         <div class="title">${esc(c.title)}</div>
         <div class="meta">${parts.join(' ')}</div>
@@ -170,14 +214,194 @@
       </article>`;
   }
 
+  // --- Detail drawer ---------------------------------------------------------
+  const drawer = document.getElementById('drawer');
+  const backdrop = document.getElementById('backdrop');
+  let openCardId = null;
+  let lastData = null;  // last /api/cards response, used by drawer re-render
+
+  function fmtTs(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d)) return s;
+    return d.toLocaleString();
+  }
+
+  function depChip(id, byId) {
+    const c = byId[id];
+    if (!c) return `<span class="chip dep">#${id}</span>`;
+    const cls = c.status === 'done' ? 'chip dep done' : 'chip dep';
+    return `<span class="${cls}" data-jump="${id}" title="${esc(c.title)} — ${c.status}">#${id} ${esc(c.title)}</span>`;
+  }
+
+  function renderDrawer(c, byId) {
+    const blockers = (c.blocker_ids || []);
+    const blockees = (c.blockee_ids || []);
+    const tags = Array.isArray(c.tags) ? c.tags : [];
+    const ctxRefs = c.context_refs || null;
+
+    const isTodo = c.status === 'todo';
+    const readiness = isTodo
+      ? (c.ready ? '<span class="value" style="color:var(--ready)">● ready</span>'
+                 : `<span class="value" style="color:var(--blocked)">● blocked by ${blockers.length} card(s)</span>`)
+      : '';
+
+    drawer.innerHTML = `
+      <div class="dh">
+        <span class="id">#${c.id}</span>
+        <span class="status-pill ${c.status}">${LABELS[c.status] || c.status}</span>
+        <button class="close" id=drawer-close aria-label="close">×</button>
+      </div>
+      <div class="db">
+        <h2>${esc(c.title)}</h2>
+        ${readiness ? `<div class="field">${readiness}</div>` : ''}
+
+        <div class="field">
+          <div class="label">spec / body</div>
+          ${c.body ? `<div class="body-md">${esc(c.body)}</div>`
+                   : '<div class="empty">(no body)</div>'}
+        </div>
+
+        <div class="field grid2">
+          <div>
+            <div class="label">created by</div>
+            <div class="value">${esc(c.created_by || '—')}</div>
+          </div>
+          <div>
+            <div class="label">claimed by</div>
+            <div class="value">${esc(c.claimed_by || '—')}</div>
+          </div>
+          <div>
+            <div class="label">needs role</div>
+            <div class="value">${esc(c.needs_role || '—')}</div>
+          </div>
+          <div>
+            <div class="label">priority</div>
+            <div class="value">${
+              c.priority === 1 ? '⚑ high' :
+              c.priority === -1 ? 'low' : 'normal'
+            }</div>
+          </div>
+        </div>
+
+        <div class="field grid2">
+          <div>
+            <div class="label">created</div>
+            <div class="value mono">${esc(fmtTs(c.created_at))}</div>
+          </div>
+          <div>
+            <div class="label">updated</div>
+            <div class="value mono">${esc(fmtTs(c.updated_at))}</div>
+          </div>
+          ${c.claimed_at ? `<div>
+            <div class="label">claimed</div>
+            <div class="value mono">${esc(fmtTs(c.claimed_at))}</div>
+          </div>` : ''}
+          ${c.completed_at ? `<div>
+            <div class="label">completed</div>
+            <div class="value mono">${esc(fmtTs(c.completed_at))}</div>
+          </div>` : ''}
+        </div>
+
+        <div class="field">
+          <div class="label">blocked by (${blockers.length})</div>
+          <div class="value">${
+            blockers.length ? blockers.map(id => depChip(id, byId)).join('')
+                            : '<span class="empty">(none)</span>'
+          }</div>
+        </div>
+
+        <div class="field">
+          <div class="label">blocks (${blockees.length})</div>
+          <div class="value">${
+            blockees.length ? blockees.map(id => depChip(id, byId)).join('')
+                            : '<span class="empty">(none)</span>'
+          }</div>
+        </div>
+
+        <div class="field">
+          <div class="label">tags</div>
+          <div class="value">${
+            tags.length ? tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')
+                        : '<span class="empty">(none)</span>'
+          }</div>
+        </div>
+
+        ${ctxRefs ? `<div class="field">
+          <div class="label">context refs</div>
+          <div class="value mono"><pre style="margin:0;white-space:pre-wrap">${esc(JSON.stringify(ctxRefs, null, 2))}</pre></div>
+        </div>` : ''}
+
+        <div class="field">
+          <div class="label">scope</div>
+          <div class="value mono">${esc(c.pair_key)} · home_host=${esc(c.home_host || '—')}</div>
+        </div>
+      </div>`;
+
+    drawer.querySelector('#drawer-close')
+      .addEventListener('click', closeDrawer);
+    drawer.querySelectorAll('[data-jump]').forEach(el => {
+      el.addEventListener('click', () => {
+        const jumpId = parseInt(el.dataset.jump, 10);
+        if (jumpId) openDrawer(jumpId);
+      });
+    });
+  }
+
+  function openDrawer(id) {
+    if (!lastData) return;
+    const byId = Object.fromEntries((lastData.cards || []).map(c => [c.id, c]));
+    const c = byId[id];
+    if (!c) return;
+    openCardId = id;
+    renderDrawer(c, byId);
+    drawer.classList.add('open');
+    drawer.setAttribute('aria-hidden', 'false');
+    backdrop.classList.add('open');
+  }
+
+  function closeDrawer() {
+    openCardId = null;
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    backdrop.classList.remove('open');
+  }
+
+  backdrop.addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && openCardId !== null) closeDrawer();
+  });
+
+  // Click delegation on the board (cards re-render every 3s, so listen on parent)
+  board.addEventListener('click', e => {
+    const card = e.target.closest('[data-card-id]');
+    if (!card) return;
+    const id = parseInt(card.dataset.cardId, 10);
+    if (id) openDrawer(id);
+  });
+  board.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const card = e.target.closest('[data-card-id]');
+    if (!card) return;
+    e.preventDefault();
+    const id = parseInt(card.dataset.cardId, 10);
+    if (id) openDrawer(id);
+  });
+
   async function refresh() {
     try {
       const r = await fetch('/api/cards?pair_key=' + encodeURIComponent(pairKey),
                             { cache:'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       const data = await r.json();
+      lastData = data;
       const cards = data.cards || [];
       const byId = Object.fromEntries(cards.map(c => [c.id, c]));
+
+      // If the drawer is open, refresh its content with the latest snapshot.
+      if (openCardId !== null && byId[openCardId]) {
+        renderDrawer(byId[openCardId], byId);
+      }
 
       for (const s of STATUSES) {
         const ids = (data.by_status && data.by_status[s]) || [];
