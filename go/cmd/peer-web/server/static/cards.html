@@ -534,6 +534,61 @@
   .btn-primary:hover { background: var(--accent-hover); }
   .btn-primary .plus { font-size: 14px; line-height: 1; opacity: .85; }
 
+  /* Header Start/Stop board buttons */
+  .btn-board {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 5px 11px;
+    border-radius: 6px;
+    cursor: pointer;
+    letter-spacing: -0.13px;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .btn-board.start {
+    background: rgba(76,183,130,0.10);
+    border: 1px solid rgba(76,183,130,0.35);
+    color: var(--status-done);
+  }
+  .btn-board.start:hover {
+    background: rgba(76,183,130,0.18);
+    border-color: rgba(76,183,130,0.55);
+  }
+  .btn-board.stop {
+    background: rgba(239,111,111,0.10);
+    border: 1px solid rgba(239,111,111,0.35);
+    color: #ef6f6f;
+  }
+  .btn-board.stop:hover {
+    background: rgba(239,111,111,0.18);
+    border-color: rgba(239,111,111,0.55);
+  }
+  .btn-board:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-board .glyph { font-size: 11px; line-height: 1; }
+  .drain-status {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 510;
+    padding: 3px 9px;
+    border-radius: 9999px;
+    background: rgba(76,183,130,0.10);
+    border: 1px solid rgba(76,183,130,0.30);
+    color: var(--status-done);
+    letter-spacing: -0.06px;
+  }
+  .drain-status::before {
+    content: '';
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    animation: pulse 1.4s infinite;
+  }
+  .drain-promote-toggle {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11px; color: var(--fg-tertiary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .drain-promote-toggle input { margin: 0; }
+
   /* Modal (shared with cards-index.html) */
   .modal-backdrop {
     position: fixed; inset: 0;
@@ -1075,6 +1130,13 @@
   <span class=dot></span>
   <h1>__CWD__</h1>
   <span class=sub id=status>loading…</span>
+  <span id=drain-badge style="display:none"></span>
+  <label class=drain-promote-toggle title="Auto-promote in_review → done so chained cards can unblock">
+    <input type=checkbox id=drain-auto-promote>
+    auto-promote
+  </label>
+  <button class="btn-board start" id=btn-board-start><span class=glyph>▶</span> Start board</button>
+  <button class="btn-board stop" id=btn-board-stop style="display:none"><span class=glyph>◼</span> Stop</button>
   <button class=btn-primary id=btn-new-card><span class=plus>+</span>New card</button>
   <a href=/cards title="all kanban boards">boards</a>
   <a href=/ title="back to rooms">rooms</a>
@@ -1599,6 +1661,77 @@
 
   refresh();
   setInterval(refresh, 3000);
+
+  // --- Global Start/Stop board (Shape B drainer) -------------------------
+  const startBtn = document.getElementById('btn-board-start');
+  const stopBtn = document.getElementById('btn-board-stop');
+  const drainBadge = document.getElementById('drain-badge');
+  const autoPromoteToggle = document.getElementById('drain-auto-promote');
+
+  async function refreshBoardStatus() {
+    try {
+      const r = await fetch(`/api/boards/${encodeURIComponent(pairKey)}/status`,
+        { cache: 'no-store' });
+      if (!r.ok) return;
+      const d = await r.json();
+      if (d.running) {
+        startBtn.style.display = 'none';
+        stopBtn.style.display = '';
+        drainBadge.style.display = '';
+        const ap = d.auto_promote ? ' · auto-promote' : '';
+        drainBadge.className = 'drain-status';
+        drainBadge.textContent = `draining: ${d.dispatched} dispatched`
+          + (d.promoted ? `, ${d.promoted} promoted` : '')
+          + (d.failures ? `, ${d.failures} failed` : '')
+          + ap;
+      } else {
+        startBtn.style.display = '';
+        stopBtn.style.display = 'none';
+        drainBadge.style.display = 'none';
+      }
+    } catch {}
+  }
+  refreshBoardStatus();
+  setInterval(refreshBoardStatus, 3000);
+
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    try {
+      const auto = autoPromoteToggle.checked ? '1' : '0';
+      const r = await fetch(
+        `/api/boards/${encodeURIComponent(pairKey)}/start?auto_promote=${auto}`,
+        { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      const d = await r.json();
+      showToast(`Drainer started${d.auto_promote ? ' (auto-promote)' : ''}`, 'ok');
+      refreshBoardStatus();
+    } catch (err) {
+      showToast(`Start failed: ${err.message}`, 'error');
+    } finally {
+      startBtn.disabled = false;
+    }
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    stopBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/boards/${encodeURIComponent(pairKey)}/stop`,
+        { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      showToast('Drainer stopped', 'ok');
+      refreshBoardStatus();
+    } catch (err) {
+      showToast(`Stop failed: ${err.message}`, 'error');
+    } finally {
+      stopBtn.disabled = false;
+    }
+  });
 
   // --- New-card modal ----------------------------------------------------
   const createModal = document.getElementById('create-modal');

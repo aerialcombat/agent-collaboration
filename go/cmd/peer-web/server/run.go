@@ -90,72 +90,84 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 		return
 	}
 
-	// Resolve refs once, server-side, so the worker doesn't need to fetch.
-	refs := contextRefsShape{}
-	if card.ContextRefs != "" {
-		if err := json.Unmarshal([]byte(card.ContextRefs), &refs); err != nil {
-			writeJSONError(w, http.StatusInternalServerError,
-				"context_refs is not valid JSON: "+err.Error())
-			return
-		}
-	}
-	resolved := resolveContext(ctx, st, refs)
-
-	// Generate a runner label. Collision-resistant enough at typical scale.
-	suffix, err := randHex(4)
+	disp, err := runWorkerForCard(ctx, st, card)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "random: "+err.Error())
-		return
-	}
-	label := fmt.Sprintf("runner-%d-%s", id, suffix)
-
-	// Optimistically claim → in_progress before forking. If the user
-	// double-clicks Run, the second call will see ClaimedBy != "" and
-	// 409 out, which is the desired behavior. Retry on transient
-	// SQLITE_BUSY (10 parallel Run clicks against the same SQLite db
-	// can race even with busy_timeout=15s).
-	if err := retryOnBusy(func() error {
-		_, e := st.ClaimCard(ctx, id, label, false)
-		return e
-	}); err != nil {
 		if errors.Is(err, sqlitestore.ErrCardAlreadyClaimed) {
 			writeJSONError(w, http.StatusConflict, "card was claimed mid-flight")
 			return
 		}
-		writeJSONError(w, http.StatusInternalServerError, "claim: "+err.Error())
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writeJSON(w, http.StatusAccepted, disp)
+}
+
+// dispatchResult mirrors the JSON body /api/cards/{id}/run returns.
+// Drainer goroutines accumulate these to report what they did.
+type dispatchResult struct {
+	CardID      int64  `json:"card_id"`
+	WorkerLabel string `json:"worker_label"`
+	PID         int    `json:"pid"`
+	LogPath     string `json:"log_path"`
+	PromptBytes int    `json:"prompt_bytes"`
+}
+
+// runWorkerForCard does the actual dispatch — claim, status flip,
+// resolve context, build prompt, spawn claude -p, log run_dispatch
+// event. Returns the dispatch payload or an error. Caller owns
+// eligibility checks (status==todo, ready, no claimer) — this function
+// doesn't re-validate so the global Start drainer can race against the
+// per-card Run button without double-checking.
+func runWorkerForCard(
+	ctx context.Context,
+	st webStore,
+	card *sqlitestore.Card,
+) (map[string]any, error) {
+	refs := contextRefsShape{}
+	if card.ContextRefs != "" {
+		if err := json.Unmarshal([]byte(card.ContextRefs), &refs); err != nil {
+			return nil, fmt.Errorf("context_refs is not valid JSON: %w", err)
+		}
+	}
+	resolved := resolveContext(ctx, st, refs)
+
+	suffix, err := randHex(4)
+	if err != nil {
+		return nil, fmt.Errorf("random: %w", err)
+	}
+	label := fmt.Sprintf("runner-%d-%s", card.ID, suffix)
+
 	if err := retryOnBusy(func() error {
-		_, e := st.UpdateCardStatus(ctx, id, sqlitestore.CardStatusInProgress, label)
+		_, e := st.ClaimCard(ctx, card.ID, label, false)
 		return e
 	}); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "status: "+err.Error())
-		return
+		return nil, fmt.Errorf("claim: %w", err)
+	}
+	if err := retryOnBusy(func() error {
+		_, e := st.UpdateCardStatus(ctx, card.ID, sqlitestore.CardStatusInProgress, label)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("status: %w", err)
 	}
 
 	prompt := buildWorkerPrompt(card, label, resolved)
 
 	if err := os.MkdirAll(runnerLogDir, 0o755); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "log dir: "+err.Error())
-		return
+		return nil, fmt.Errorf("log dir: %w", err)
 	}
 	logPath := filepath.Join(runnerLogDir,
-		fmt.Sprintf("run-%d-%s.log", id, time.Now().UTC().Format("20060102-150405")))
+		fmt.Sprintf("run-%d-%s.log", card.ID, time.Now().UTC().Format("20060102-150405")))
 	logFile, err := os.Create(logPath)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "log file: "+err.Error())
-		return
+		return nil, fmt.Errorf("log file: %w", err)
 	}
 
 	pid, err := spawnWorker(prompt, logFile)
 	if err != nil {
 		_ = logFile.Close()
-		writeJSONError(w, http.StatusInternalServerError, "spawn: "+err.Error())
-		return
+		return nil, fmt.Errorf("spawn: %w", err)
 	}
 
-	// Record the dispatch as a timeline event so the drawer Activity
-	// panel surfaces it next to the auto-emitted claim + status_change.
 	dispatchMeta, _ := json.Marshal(map[string]any{
 		"worker_label": label,
 		"pid":          pid,
@@ -163,7 +175,7 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 		"prompt_bytes": len(prompt),
 	})
 	if _, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
-		CardID: id, Kind: sqlitestore.CardEventRunDispatch,
+		CardID: card.ID, Kind: sqlitestore.CardEventRunDispatch,
 		Author: "system",
 		Body:   fmt.Sprintf("worker %s dispatched (pid %d)", label, pid),
 		Meta:   string(dispatchMeta),
@@ -172,13 +184,13 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 		fmt.Fprintf(os.Stderr, "card_events: run_dispatch record failed: %v\n", err)
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"card_id":      id,
+	return map[string]any{
+		"card_id":      card.ID,
 		"worker_label": label,
 		"pid":          pid,
 		"log_path":     logPath,
 		"prompt_bytes": len(prompt),
-	})
+	}, nil
 }
 
 // spawnWorker launches `claude -p <prompt>` non-blocking, redirecting

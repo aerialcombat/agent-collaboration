@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -33,6 +34,12 @@ type Server struct {
 	mux    *http.ServeMux
 	http   *http.Server
 	static fs.FS
+
+	// Per-pair_key drainer goroutines spawned by the global Start
+	// button. drainersMu guards drainers; the drainer struct itself
+	// has its own mutex for snapshot-vs-mutation.
+	drainersMu sync.Mutex
+	drainers   map[string]*drainer
 }
 
 //go:embed static/*
@@ -109,6 +116,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/cards", s.handleCardsRoot)
 	s.mux.HandleFunc("/api/cards/", s.handleCardSubpath)
 	s.mux.HandleFunc("/api/boards", s.handleBoards)
+	s.mux.HandleFunc("/api/boards/", s.handleBoardSubpath)
 	s.mux.HandleFunc("/view", s.handleView)
 	s.mux.HandleFunc("/cards", s.handleCardsView)
 	// Root serves the multi-room index. Anything else falls through to
