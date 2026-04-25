@@ -309,6 +309,7 @@ func (s *Server) handleUpdateCard(w http.ResponseWriter, r *http.Request, id int
 		Priority    *int             `json:"priority"`
 		Tags        *json.RawMessage `json:"tags"`
 		ContextRefs *json.RawMessage `json:"context_refs"`
+		Author      string           `json:"author"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
@@ -337,7 +338,11 @@ func (s *Server) handleUpdateCard(w http.ResponseWriter, r *http.Request, id int
 	}
 	defer st.Close()
 
-	card, err := st.UpdateCardFields(ctx, id, params)
+	author := body.Author
+	if author == "" {
+		author = "owner"
+	}
+	card, err := st.UpdateCardFields(ctx, id, params, author)
 	if errors.Is(err, sqlitestore.ErrCardNotFound) {
 		writeJSONError(w, http.StatusNotFound, "card not found")
 		return
@@ -372,9 +377,116 @@ func (s *Server) handleCardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleUpdateCard(w, r, id)
 	case "context":
 		s.handleCardContext(w, r, id)
+	case "run":
+		s.handleCardRun(w, r, id)
+	case "events":
+		s.handleCardEvents(w, r, id)
+	case "comment":
+		s.handleCardComment(w, r, id)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown card verb")
 	}
+}
+
+// handleCardEvents — GET /api/cards/{id}/events
+//
+// Returns the card's timeline (comments + auto-recorded events),
+// oldest-first. ?limit=N caps the response.
+func (s *Server) handleCardEvents(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeJSONError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	events, err := st.ListCardEvents(ctx, id, limit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]map[string]any, 0, len(events))
+	for _, e := range events {
+		row := map[string]any{
+			"id": e.ID, "card_id": e.CardID, "kind": e.Kind,
+			"author": e.Author, "body": e.Body,
+			"created_at": e.CreatedAt,
+		}
+		if e.Meta != "" && e.Meta != "{}" {
+			row["meta"] = json.RawMessage(e.Meta)
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"card_id": id, "events": out,
+	})
+}
+
+// handleCardComment — POST /api/cards/{id}/comment
+//
+// Body: {"body": "...", "author": "..."}
+//
+// Posts a free-form comment to the card timeline. Author defaults to
+// "owner" so a human can post from the drawer composer without an
+// explicit identity (mirrors /api/cards create).
+func (s *Server) handleCardComment(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Body   string `json:"body"`
+		Author string `json:"author"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(body.Body) == "" {
+		writeJSONError(w, http.StatusBadRequest, "body is required")
+		return
+	}
+	if body.Author == "" {
+		body.Author = "owner"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	ev, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+		CardID: id, Kind: sqlitestore.CardEventComment,
+		Author: body.Author, Body: body.Body,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id": ev.ID, "card_id": ev.CardID, "kind": ev.Kind,
+		"author": ev.Author, "body": ev.Body,
+		"created_at": ev.CreatedAt,
+	})
 }
 
 // handleCardStatus — POST /api/cards/{id}/status
@@ -391,6 +503,7 @@ func (s *Server) handleCardStatus(w http.ResponseWriter, r *http.Request, id int
 
 	var body struct {
 		Status string `json:"status"`
+		Author string `json:"author"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
@@ -410,7 +523,11 @@ func (s *Server) handleCardStatus(w http.ResponseWriter, r *http.Request, id int
 	}
 	defer st.Close()
 
-	card, err := st.UpdateCardStatus(ctx, id, body.Status)
+	author := body.Author
+	if author == "" {
+		author = "owner"
+	}
+	card, err := st.UpdateCardStatus(ctx, id, body.Status, author)
 	if errors.Is(err, sqlitestore.ErrCardNotFound) {
 		writeJSONError(w, http.StatusNotFound, "card not found")
 		return

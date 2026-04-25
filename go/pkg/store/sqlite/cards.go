@@ -3,8 +3,10 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -302,28 +304,62 @@ func (s *SQLiteLocal) ClaimCard(ctx context.Context, id int64, label string, for
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("ClaimCard commit: %w", err)
 	}
+
+	priorClaim := ""
+	if currentClaim.Valid {
+		priorClaim = currentClaim.String
+	}
+	meta, _ := jsonObject(map[string]any{
+		"prior_claim":   priorClaim,
+		"prior_status":  currentStatus,
+		"new_status":    newStatus,
+		"force":         force,
+	})
+	body := "claimed by " + label
+	if priorClaim != "" && priorClaim != label {
+		body = fmt.Sprintf("re-claimed from %s to %s", priorClaim, label)
+	}
+	s.recordEvent(ctx, AppendCardEventParams{
+		CardID: id, Kind: CardEventClaim,
+		Author: label,
+		Body:   body,
+		Meta:   meta,
+	})
+
 	return s.GetCard(ctx, id)
 }
 
 // UpdateCardStatus validates the new status against the enum and
 // writes it. Sets completed_at on the first transition to a terminal
 // state (done/cancelled). Leaves claimed_by alone — call ClaimCard
-// or a future UnclaimCard for that.
-func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status string) (*Card, error) {
+// or a future UnclaimCard for that. `author` is the label that gets
+// recorded against the auto-emitted status_change event; pass "" to
+// fall back to "system".
+func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status, author string) (*Card, error) {
 	if !validCardStatus(status) {
 		return nil, fmt.Errorf("%w: %q (expected one of %v)",
 			ErrCardInvalidStatus, status, ValidCardStatuses)
 	}
+	// Snapshot prior status so the event can record the transition.
+	prior, err := s.GetCard(ctx, id)
+	if errors.Is(err, ErrCardNotFound) {
+		return nil, ErrCardNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if prior.Status == status {
+		// No-op transition; don't record an event for status N → N.
+		return prior, nil
+	}
+
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	var completedSet string
 	if status == CardStatusDone || status == CardStatusCancelled {
 		completedSet = ", completed_at = COALESCE(completed_at, ?)"
 	}
 
-	var (
-		res sql.Result
-		err error
-	)
+	var res sql.Result
 	if completedSet != "" {
 		res, err = s.db.ExecContext(ctx,
 			`UPDATE cards SET status = ?, updated_at = ?`+completedSet+` WHERE id = ?`,
@@ -345,7 +381,146 @@ func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status str
 	if n == 0 {
 		return nil, ErrCardNotFound
 	}
+
+	// Auto-record the transition. Failures don't bubble (recordEvent logs to stderr).
+	meta, _ := jsonObject(map[string]any{
+		"old_status": prior.Status,
+		"new_status": status,
+	})
+	s.recordEvent(ctx, AppendCardEventParams{
+		CardID: id, Kind: CardEventStatusChange,
+		Author: author,
+		Body:   fmt.Sprintf("%s → %s", prior.Status, status),
+		Meta:   meta,
+	})
+
 	return s.GetCard(ctx, id)
+}
+
+// jsonObject is a tiny convenience wrapper around json.Marshal so the
+// auto-record callsites read cleanly (the err is discardable — meta is
+// always a flat map of primitives).
+func jsonObject(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "{}", err
+	}
+	return string(b), nil
+}
+
+// Card event kinds — Linear/GitHub-style timeline. Comments are
+// human/worker-authored; the rest are system-generated on state
+// transitions and recorded automatically by the corresponding mutator.
+const (
+	CardEventComment      = "comment"
+	CardEventStatusChange = "status_change"
+	CardEventClaim        = "claim"
+	CardEventBodyUpdate   = "body_update"
+	CardEventRunDispatch  = "run_dispatch"
+	CardEventRunComplete  = "run_complete"
+)
+
+// CardEvent — one row in the per-card timeline.
+type CardEvent struct {
+	ID        int64
+	CardID    int64
+	Kind      string
+	Author    string
+	Body      string
+	Meta      string // raw JSON; renderer parses per-kind
+	CreatedAt string
+}
+
+// AppendCardEventParams collects insert fields. Meta is raw JSON so
+// callers can stash kind-specific data without growing the schema.
+type AppendCardEventParams struct {
+	CardID int64
+	Kind   string
+	Author string
+	Body   string
+	Meta   string // optional; defaults to "{}" if empty
+}
+
+// AppendCardEvent inserts one event row. Used both by external callers
+// (CLI card-comment / MCP / HTTP) and internally by the auto-record
+// hooks in ClaimCard/UpdateCardStatus/UpdateCardFields.
+func (s *SQLiteLocal) AppendCardEvent(ctx context.Context, p AppendCardEventParams) (*CardEvent, error) {
+	if p.CardID == 0 || p.Kind == "" || p.Author == "" {
+		return nil, fmt.Errorf("AppendCardEvent: card_id, kind, author required")
+	}
+	meta := p.Meta
+	if meta == "" {
+		meta = "{}"
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO card_events (card_id, kind, author, body, meta) VALUES (?, ?, ?, ?, ?)`,
+		p.CardID, p.Kind, p.Author, p.Body, meta,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("AppendCardEvent: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("AppendCardEvent: %w", err)
+	}
+	return s.GetCardEvent(ctx, id)
+}
+
+// GetCardEvent fetches one row by id.
+func (s *SQLiteLocal) GetCardEvent(ctx context.Context, id int64) (*CardEvent, error) {
+	e := &CardEvent{}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, card_id, kind, author, body, meta, created_at FROM card_events WHERE id = ?`,
+		id,
+	).Scan(&e.ID, &e.CardID, &e.Kind, &e.Author, &e.Body, &e.Meta, &e.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, ErrCardNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetCardEvent: %w", err)
+	}
+	return e, nil
+}
+
+// ListCardEvents returns the timeline for a card, oldest-first. Pass
+// limit=0 for all rows.
+func (s *SQLiteLocal) ListCardEvents(ctx context.Context, cardID int64, limit int) ([]*CardEvent, error) {
+	q := `SELECT id, card_id, kind, author, body, meta, created_at
+	      FROM card_events
+	      WHERE card_id = ?
+	      ORDER BY created_at ASC, id ASC`
+	args := []any{cardID}
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ListCardEvents: %w", err)
+	}
+	defer rows.Close()
+	var out []*CardEvent
+	for rows.Next() {
+		e := &CardEvent{}
+		if err := rows.Scan(&e.ID, &e.CardID, &e.Kind, &e.Author, &e.Body, &e.Meta, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("ListCardEvents scan: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// recordEvent is a fire-and-forget event insertion used by the
+// auto-record hooks in mutators. Errors are logged via fmt to stderr
+// but never bubble up — recording an event must NEVER fail a mutation.
+// (You'd rather have a successful claim with no event than no claim.)
+func (s *SQLiteLocal) recordEvent(ctx context.Context, p AppendCardEventParams) {
+	if p.Author == "" {
+		p.Author = "system"
+	}
+	if _, err := s.AppendCardEvent(ctx, p); err != nil {
+		fmt.Fprintf(os.Stderr, "card_events: record failed: %v\n", err)
+	}
 }
 
 // MessagesByIDs fetches inbox rows by id in arbitrary order. Missing
@@ -399,32 +574,41 @@ type UpdateCardFieldsParams struct {
 // UpdateCardFields mutates non-status fields on a card and stamps
 // updated_at. Status, claim ownership, and dependency edges go through
 // their own dedicated verbs. Returns ErrCardNotFound when no row matches.
-func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCardFieldsParams) (*Card, error) {
+// `author` is recorded against the auto-emitted body_update event;
+// pass "" to fall back to "system".
+func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCardFieldsParams, author string) (*Card, error) {
 	sets := []string{}
 	args := []any{}
+	changed := []string{} // for the event meta — which fields touched
 	if p.Title != nil {
 		sets = append(sets, "title = ?")
 		args = append(args, *p.Title)
+		changed = append(changed, "title")
 	}
 	if p.Body != nil {
 		sets = append(sets, "body = ?")
 		args = append(args, *p.Body)
+		changed = append(changed, "body")
 	}
 	if p.NeedsRole != nil {
 		sets = append(sets, "needs_role = ?")
 		args = append(args, *p.NeedsRole)
+		changed = append(changed, "needs_role")
 	}
 	if p.Priority != nil {
 		sets = append(sets, "priority = ?")
 		args = append(args, *p.Priority)
+		changed = append(changed, "priority")
 	}
 	if p.Tags != nil {
 		sets = append(sets, "tags = ?")
 		args = append(args, *p.Tags)
+		changed = append(changed, "tags")
 	}
 	if p.ContextRefs != nil {
 		sets = append(sets, "context_refs = ?")
 		args = append(args, *p.ContextRefs)
+		changed = append(changed, "context_refs")
 	}
 	if len(sets) == 0 {
 		return s.GetCard(ctx, id)
@@ -445,6 +629,15 @@ func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCa
 	if n == 0 {
 		return nil, ErrCardNotFound
 	}
+
+	meta, _ := jsonObject(map[string]any{"changed": changed})
+	s.recordEvent(ctx, AppendCardEventParams{
+		CardID: id, Kind: CardEventBodyUpdate,
+		Author: author,
+		Body:   "updated " + strings.Join(changed, ", "),
+		Meta:   meta,
+	})
+
 	return s.GetCard(ctx, id)
 }
 

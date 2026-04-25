@@ -222,7 +222,7 @@ func runCardUpdateStatus(args []string) int {
 	cardID := fs.Int64("card", 0, "card id (required)")
 	status := fs.String("status", "", "new status (required): "+
 		"todo|in_progress|in_review|done|cancelled")
-	_ = fs.String("as", "", "optional audit label (accepted, currently unused)")
+	as := fs.String("as", "", "optional author label for the auto-recorded status_change event")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -243,7 +243,7 @@ func runCardUpdateStatus(args []string) int {
 	}
 	defer st.Close()
 
-	card, err := st.UpdateCardStatus(ctx, *id, *status)
+	card, err := st.UpdateCardStatus(ctx, *id, *status, *as)
 	if errors.Is(err, sqlitestore.ErrCardNotFound) {
 		fmt.Fprintf(os.Stderr, "card-update-status: not found: %d\n", *id)
 		return exitNotFound
@@ -276,7 +276,7 @@ func runCardUpdate(args []string) int {
 	fs.SetOutput(os.Stderr)
 	id := fs.Int64("id", 0, "card id (alias of --card)")
 	cardID := fs.Int64("card", 0, "card id (required)")
-	_ = fs.String("as", "", "optional audit label (accepted, currently unused)")
+	as := fs.String("as", "", "optional author label for the auto-recorded body_update event")
 	format := fs.String("format", "plain", "plain|json")
 
 	// Wrap each mutable field with a "set?" boolean so empty-string can
@@ -344,7 +344,7 @@ func runCardUpdate(args []string) int {
 	}
 	defer st.Close()
 
-	card, err := st.UpdateCardFields(ctx, *id, params)
+	card, err := st.UpdateCardFields(ctx, *id, params, *as)
 	if errors.Is(err, sqlitestore.ErrCardNotFound) {
 		fmt.Fprintf(os.Stderr, "card-update: not found: %d\n", *id)
 		return exitNotFound
@@ -354,6 +354,62 @@ func runCardUpdate(args []string) int {
 		return exitInternal
 	}
 	return emitCard(card, *format)
+}
+
+// runCardComment — card-comment --card N --body T --as LABEL [--format]
+//
+// Posts a free-form markdown comment to a card's timeline. Workers use
+// this mid-run to narrate progress; humans use it via the drawer
+// composer. Auto-recorded events (status_change, claim, body_update,
+// run_dispatch, run_complete) live in the same table but are inserted
+// by the corresponding mutators — comments are the only kind that
+// callers create directly.
+func runCardComment(args []string) int {
+	fs := flag.NewFlagSet("card-comment", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.Int64("id", 0, "card id (alias of --card)")
+	cardID := fs.Int64("card", 0, "card id (required)")
+	body := fs.String("body", "", "comment body (required)")
+	as := fs.String("as", "", "author label (required)")
+	format := fs.String("format", "plain", "plain|json")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *cardID != 0 {
+		*id = *cardID
+	}
+	if *id == 0 || *body == "" || *as == "" {
+		fmt.Fprintln(os.Stderr, "card-comment: --card, --body, --as required")
+		return exitUsage
+	}
+
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-comment: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	ev, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+		CardID: *id, Kind: sqlitestore.CardEventComment,
+		Author: *as, Body: *body,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-comment: %v\n", err)
+		return exitInternal
+	}
+
+	if *format == "json" {
+		return emitJSON(map[string]any{
+			"id": ev.ID, "card_id": ev.CardID, "kind": ev.Kind,
+			"author": ev.Author, "body": ev.Body,
+			"created_at": ev.CreatedAt,
+		})
+	}
+	fmt.Printf("event #%d on card #%d by %s: %s\n", ev.ID, ev.CardID, ev.Author, ev.Body)
+	return exitOK
 }
 
 // runCardAddDep — card-add-dep --blocker N --blockee M --as LABEL [--format]

@@ -35,12 +35,15 @@ type webStore interface {
 	ForwardLocalPush(ctx context.Context, label, pairKey string, payload map[string]any) (int, string, error)
 	SweepStaleActive(ctx context.Context, cutoff time.Duration, now time.Time) (int64, error)
 	ListCards(ctx context.Context, filter sqlitestore.CardListFilter) ([]*sqlitestore.Card, error)
-	UpdateCardStatus(ctx context.Context, id int64, status string) (*sqlitestore.Card, error)
-	UpdateCardFields(ctx context.Context, id int64, params sqlitestore.UpdateCardFieldsParams) (*sqlitestore.Card, error)
+	UpdateCardStatus(ctx context.Context, id int64, status, author string) (*sqlitestore.Card, error)
+	UpdateCardFields(ctx context.Context, id int64, params sqlitestore.UpdateCardFieldsParams, author string) (*sqlitestore.Card, error)
+	AppendCardEvent(ctx context.Context, params sqlitestore.AppendCardEventParams) (*sqlitestore.CardEvent, error)
+	ListCardEvents(ctx context.Context, cardID int64, limit int) ([]*sqlitestore.CardEvent, error)
 	CreateCard(ctx context.Context, params sqlitestore.CreateCardParams) (*sqlitestore.Card, error)
 	CardBoardSummaries(ctx context.Context) ([]*sqlitestore.CardBoardSummary, error)
 	GetCard(ctx context.Context, id int64) (*sqlitestore.Card, error)
 	MessagesByIDs(ctx context.Context, ids []int64) ([]sqlitestore.WebMessage, error)
+	ClaimCard(ctx context.Context, id int64, label string, force bool) (*sqlitestore.Card, error)
 	Close() error
 }
 

@@ -121,6 +121,8 @@ func run(args []string) int {
 		return runCardUpdateStatus(rest)
 	case "card-update":
 		return runCardUpdate(rest)
+	case "card-comment":
+		return runCardComment(rest)
 	case "card-add-dep":
 		return runCardAddDep(rest)
 	case "card-remove-dep":

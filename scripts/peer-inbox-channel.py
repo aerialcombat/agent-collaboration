@@ -283,6 +283,26 @@ CARD_TOOLS = [
         },
     },
     {
+        "name": "card_comment",
+        "description": (
+            "Post a free-form markdown comment to a card's timeline. "
+            "Workers should use this mid-run to narrate progress (e.g. "
+            "'started, exploring src/foo.go', 'tests passing, opening "
+            "PR'). Humans see comments interleaved with auto-recorded "
+            "events (status_change, claim, body_update, run_dispatch) "
+            "in the drawer Activity panel."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "body": {"type": "string", "minLength": 1},
+            },
+            "required": ["id", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "card_add_dependency",
         "description": (
             "Add a blocker → blockee edge. Blockee can't become ready "
@@ -868,6 +888,28 @@ def _card_update(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_comment(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    body = arguments.get("body")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required (positive integer)")
+        return
+    if not isinstance(body, str) or not body.strip():
+        _tool_error(req_id, "error: `body` required (non-empty string)")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if not label:
+        label = "agent"
+    ok, msg, parsed = _shell_card_verb(
+        "card-comment",
+        ["--card", str(cid), "--body", body, "--as", label, "--format", "json"],
+    )
+    if not ok:
+        _tool_error(req_id, f"card_comment: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 def _card_add_dependency(req_id, arguments: dict) -> None:
     blocker = arguments.get("blocker_id")
     blockee = arguments.get("blockee_id")
@@ -908,6 +950,7 @@ CARD_TOOL_HANDLERS = {
     "card_claim": _card_claim,
     "card_update_status": _card_update_status,
     "card_update": _card_update,
+    "card_comment": _card_comment,
     "card_add_dependency": _card_add_dependency,
     "card_remove_dependency": _card_remove_dependency,
 }

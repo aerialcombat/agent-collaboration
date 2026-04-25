@@ -839,6 +839,215 @@
     font-size: 12px;
   }
 
+  /* Run button — drawer header, shown only on ready todos */
+  .drawer .run-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 510;
+    padding: 5px 11px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.12);
+    cursor: pointer;
+    letter-spacing: -0.13px;
+    transition: background .12s;
+  }
+  .drawer .run-btn:hover { background: var(--accent-hover); }
+  .drawer .run-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .drawer .run-btn .glyph { font-size: 11px; line-height: 1; }
+
+  /* Run-status banner shown after dispatch */
+  .drawer .run-banner {
+    margin: 14px 0 0;
+    padding: 10px 14px;
+    background: rgba(113,112,255,0.08);
+    border: 1px solid rgba(113,112,255,0.30);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--fg-secondary);
+    letter-spacing: -0.06px;
+    line-height: 1.5;
+  }
+  .drawer .run-banner .label-pill {
+    display: inline-block;
+    padding: 1px 8px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border-standard);
+    border-radius: 9999px;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--fg-primary);
+    margin: 0 4px;
+  }
+  .drawer .run-banner .log-cmd {
+    display: block;
+    margin-top: 6px;
+    padding: 6px 10px;
+    background: rgba(0,0,0,0.45);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    color: var(--fg-secondary);
+    user-select: all;
+  }
+
+  /* Activity panel — Linear/GitHub-style timeline */
+  .activity-panel {
+    margin-top: 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.20);
+    overflow: hidden;
+  }
+  .activity-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: rgba(255,255,255,0.02);
+  }
+  .activity-head .label {
+    font-size: 11px; font-weight: 510;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-secondary);
+  }
+  .activity-head .count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--fg-quaternary);
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .activity-list {
+    padding: 4px 0;
+    max-height: 360px;
+    overflow-y: auto;
+  }
+  .activity-empty {
+    padding: 14px;
+    color: var(--fg-quaternary);
+    font-size: 12px;
+    text-align: center;
+  }
+  .activity-row {
+    display: flex; gap: 10px;
+    padding: 8px 14px;
+    border-top: 1px solid rgba(255,255,255,0.03);
+    font-size: 12px;
+  }
+  .activity-row:first-child { border-top: none; }
+  .activity-row .glyph {
+    width: 18px; flex-shrink: 0;
+    text-align: center;
+    color: var(--fg-quaternary);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .activity-row.comment .glyph { color: var(--accent); }
+  .activity-row.status_change .glyph { color: var(--status-in-progress); }
+  .activity-row.claim .glyph { color: var(--accent); }
+  .activity-row.body_update .glyph { color: var(--fg-tertiary); }
+  .activity-row.run_dispatch .glyph { color: var(--status-in-review); }
+  .activity-row.run_complete .glyph { color: var(--status-done); }
+  .activity-row .who {
+    color: var(--fg-secondary); font-weight: 510;
+    letter-spacing: -0.06px;
+    flex-shrink: 0;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    align-self: center;
+  }
+  .activity-row .body {
+    color: var(--fg-secondary);
+    flex: 1;
+    word-wrap: break-word;
+    letter-spacing: -0.13px;
+    line-height: 1.5;
+  }
+  .activity-row.comment .body {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: var(--fg-primary);
+    white-space: pre-wrap;
+  }
+  .activity-row .ts {
+    color: var(--fg-quaternary);
+    font-size: 11px;
+    flex-shrink: 0;
+    align-self: flex-start;
+    padding-top: 1px;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+  .activity-row .meta-link {
+    display: inline-block;
+    color: var(--accent);
+    font-size: 11px;
+    margin-left: 6px;
+    user-select: all;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  }
+
+  .activity-composer {
+    border-top: 1px solid var(--border-subtle);
+    padding: 10px 14px;
+    background: rgba(0,0,0,0.30);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .activity-composer textarea {
+    width: 100%;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.5;
+    font-feature-settings: "cv01", "ss03";
+    letter-spacing: -0.13px;
+    resize: vertical;
+    min-height: 56px;
+    max-height: 200px;
+  }
+  .activity-composer textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .activity-composer .row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .activity-composer .row input.author {
+    flex: 0 0 140px;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+  }
+  .activity-composer .row .submit {
+    margin-left: auto;
+    background: var(--accent);
+    color: #fff;
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.12);
+    cursor: pointer;
+    letter-spacing: -0.13px;
+  }
+  .activity-composer .row .submit:hover { background: var(--accent-hover); }
+  .activity-composer .row .submit:disabled { opacity: .5; cursor: not-allowed; }
+
   /* Status state pill (drawer top "● ready / ● blocked" line) */
   .drawer .state-pill {
     display: inline-flex;
@@ -1031,11 +1240,19 @@
           : `<span class="state-pill blocked">Blocked by ${blockers.length} card${blockers.length === 1 ? '' : 's'}</span>`)
       : '';
 
+    const canRun = isTodo && c.ready && !c.claimed_by;
+    const runBtn = canRun
+      ? `<button class="run-btn" id=drawer-run title="Spawn a headless claude -p worker for this card">
+           <span class=glyph>▶</span> Run
+         </button>`
+      : '';
+
     drawer.innerHTML = `
       <div class="dh">
         <span class="id">#${c.id}</span>
         <span class="status-pill ${c.status}">${LABELS[c.status] || c.status}</span>
-        <button class="close" id=drawer-close aria-label="close">×</button>
+        ${runBtn}
+        <button class="close" id=drawer-close aria-label="close" style="margin-left:auto">×</button>
       </div>
       <div class="db">
         <h2>${esc(c.title)}</h2>
@@ -1119,6 +1336,23 @@
           <div class="value mono"><pre style="margin:0;white-space:pre-wrap;background:rgba(0,0,0,0.30);border:1px solid var(--border-subtle);border-radius:4px;padding:8px 10px;font-size:11px">${esc(JSON.stringify(ctxRefs, null, 2))}</pre></div>
         </div>` : ''}
 
+        <div class="activity-panel" id="activity-panel" data-card-id="${c.id}">
+          <div class="activity-head">
+            <span class="label">Activity</span>
+            <span class="count" id="activity-count">…</span>
+          </div>
+          <div class="activity-list" id="activity-list">
+            <div class="activity-empty">Loading…</div>
+          </div>
+          <div class="activity-composer">
+            <textarea id="comment-input" placeholder="Comment on this card (markdown supported, ⌘/Ctrl+Enter to post)"></textarea>
+            <div class="row">
+              <input type="text" class="author" id="comment-author" placeholder="owner" value="owner">
+              <button type="button" class="submit" id="comment-submit">Post comment</button>
+            </div>
+          </div>
+        </div>
+
         <div class="ctx-panel" id="ctx-panel" data-card-id="${c.id}">
           <div class="ctx-head">
             <span class="ctx-title">Context</span>
@@ -1158,6 +1392,7 @@
     drawer.classList.add('open');
     drawer.setAttribute('aria-hidden', 'false');
     backdrop.classList.add('open');
+    refreshActivity(id);
   }
 
   function closeDrawer() {
@@ -1303,6 +1538,9 @@
       // If the drawer is open, refresh its content with the latest snapshot.
       if (openCardId !== null && byId[openCardId]) {
         renderDrawer(byId[openCardId], byId);
+        // Re-fetch the activity feed so worker comments appear within the
+        // 3s polling window without a manual refresh.
+        refreshActivity(openCardId);
       }
 
       // Skip the rebuild when a drag is in flight — the optimistic DOM move
@@ -1403,6 +1641,97 @@
       createErr.classList.add('show');
     } finally {
       createSubmit.disabled = false;
+    }
+  });
+
+  // --- Drawer activity panel (timeline + composer) -----------------------
+  const ACTIVITY_GLYPH = {
+    comment:       '💬',
+    status_change: '▸',
+    claim:         '◉',
+    body_update:   '✎',
+    run_dispatch:  '▶',
+    run_complete:  '✓',
+  };
+
+  function renderActivityRow(e) {
+    const glyph = ACTIVITY_GLYPH[e.kind] || '·';
+    let body = esc(e.body || '');
+    // Run dispatch carries the log path in meta — surface it as a copyable hint.
+    if (e.kind === 'run_dispatch' && e.meta && e.meta.log_path) {
+      body += ` <span class="meta-link">tail -f ${esc(e.meta.log_path)}</span>`;
+    }
+    return `<div class="activity-row ${e.kind}">
+      <span class="glyph">${glyph}</span>
+      <span class="who">${esc(e.author)}</span>
+      <span class="body">${body}</span>
+      <span class="ts">${esc(fmtTs(e.created_at))}</span>
+    </div>`;
+  }
+
+  async function refreshActivity(cardId) {
+    const list = document.getElementById('activity-list');
+    const count = document.getElementById('activity-count');
+    if (!list || !count) return;
+    try {
+      const r = await fetch(`/api/cards/${cardId}/events`, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const events = data.events || [];
+      count.textContent = events.length;
+      if (events.length === 0) {
+        list.innerHTML = '<div class="activity-empty">No activity yet. Be the first to comment.</div>';
+      } else {
+        // Newest at the bottom (chronological feed). Auto-scroll to bottom on
+        // first render only — don't yank the user away if they've scrolled up.
+        const wasAtBottom = (list.scrollHeight - list.scrollTop - list.clientHeight) < 12;
+        list.innerHTML = events.map(renderActivityRow).join('');
+        if (wasAtBottom) list.scrollTop = list.scrollHeight;
+      }
+    } catch (err) {
+      list.innerHTML = `<div class="activity-empty">activity load failed: ${esc(err.message)}</div>`;
+    }
+  }
+
+  async function postComment(cardId) {
+    const ta = document.getElementById('comment-input');
+    const authorEl = document.getElementById('comment-author');
+    const btn = document.getElementById('comment-submit');
+    if (!ta || !authorEl || !btn) return;
+    const body = ta.value.trim();
+    if (!body) return;
+    btn.disabled = true;
+    try {
+      const resp = await fetch(`/api/cards/${cardId}/comment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body, author: authorEl.value.trim() || 'owner' }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + resp.status));
+      }
+      ta.value = '';
+      await refreshActivity(cardId);
+      const list = document.getElementById('activity-list');
+      if (list) list.scrollTop = list.scrollHeight;
+    } catch (err) {
+      showToast(`Comment failed: ${err.message}`, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  drawer.addEventListener('click', e => {
+    if (e.target.closest('#comment-submit') && openCardId !== null) {
+      postComment(openCardId);
+    }
+  });
+  drawer.addEventListener('keydown', e => {
+    const ta = e.target.closest('#comment-input');
+    if (ta && (e.metaKey || e.ctrlKey) && e.key === 'Enter' && openCardId !== null) {
+      e.preventDefault();
+      postComment(openCardId);
     }
   });
 
@@ -1513,7 +1842,7 @@
     }
   }
 
-  drawer.addEventListener('click', e => {
+  drawer.addEventListener('click', async e => {
     if (e.target.closest('#ctx-resolve') && openCardId !== null) {
       resolveContext(openCardId);
       return;
@@ -1521,6 +1850,42 @@
     const head = e.target.closest('.ctx-section-head');
     if (head) {
       head.parentElement.classList.toggle('open');
+      return;
+    }
+    const runBtn = e.target.closest('#drawer-run');
+    if (runBtn && openCardId !== null) {
+      runBtn.disabled = true;
+      runBtn.textContent = 'Spawning…';
+      try {
+        const r = await fetch(`/api/cards/${openCardId}/run`, { method: 'POST' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.error || ('HTTP ' + r.status));
+        }
+        const data = await r.json();
+        showToast(`Worker ${data.worker_label} (pid ${data.pid}) dispatched`, 'ok');
+        // Inject a banner into the drawer body so the user has the log path
+        // even after the next 3s refresh re-renders the drawer.
+        const body = drawer.querySelector('.db');
+        if (body) {
+          const banner = document.createElement('div');
+          banner.className = 'run-banner';
+          banner.innerHTML = `
+            <strong>Worker dispatched</strong> as <span class="label-pill">${esc(data.worker_label)}</span>
+            (pid ${data.pid}). Watch progress:
+            <span class="log-cmd">tail -f ${esc(data.log_path)}</span>
+            Card status will flip to <strong>in_review</strong> on success or
+            back to <strong>todo</strong> with a BLOCKED annotation if the spec
+            is too thin. Refresh in 30–90 seconds.`;
+          body.insertBefore(banner, body.firstChild);
+        }
+        // Trigger a refresh so the optimistic in_progress + claimed_by show.
+        refresh();
+      } catch (err) {
+        showToast(`Run failed: ${err.message}`, 'error');
+        runBtn.disabled = false;
+        runBtn.innerHTML = '<span class=glyph>▶</span> Run';
+      }
     }
   });
 
