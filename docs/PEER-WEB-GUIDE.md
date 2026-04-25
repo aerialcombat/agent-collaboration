@@ -47,9 +47,13 @@ cd go && go build -o bin/peer-web ./cmd/peer-web/
 
 **Pages:**
 
-- `GET /` — multi-room index.
+- `GET /` — multi-room index. Each room row also links to its `cards` board.
 - `GET /view?scope=pair_key&key=K` — pair-key room detail SPA.
 - `GET /view?scope=cwd&path=/abs/path` — cwd-mode detail SPA.
+- `GET /cards?pair_key=K` — 5-column kanban-board SPA (`todo`,
+  `in_progress`, `in_review`, `done`, `cancelled`). Read-only;
+  claim/transition require CLI or MCP. Refresh is 3-second polling (no
+  SSE).
 
 **API (JSON):**
 
@@ -58,6 +62,10 @@ cd go && go build -o bin/peer-web ./cmd/peer-web/
 - `GET /api/pairs?pair_key=K` or `?cwd=P` — parity with Python `/pairs.json`.
 - `GET /api/rooms?pair_key=K` — parity with Python `/rooms.json`.
 - `GET /api/messages?pair_key=K[&after=N|&before=N][&limit=M]` or `?cwd=P&a=L&b=M&...` — paginated. Three modes: no cursor = newest `limit` messages (default 100); `after=N` = forward poll (id > N); `before=N` = backward page (id < N). Response adds `has_more` bool and `oldest_id` cursor for scroll-up pagination.
+- `GET /api/cards?pair_key=K[&ready_only=1]` — kanban bundle. Returns
+  `{cards: [...], by_status: {todo: [...], in_progress: [...], ...}}`.
+  Each card includes derived `ready`, `blocker_ids`, `blockee_ids`.
+  `&ready_only=1` filters to `status=todo` cards with no open blockers.
 - `POST /api/send` + `?pair_key=K` — composer. Body: `{from, to, body}`. Shells to `peer-inbox-db.py peer-send` / `peer-broadcast`; auto-registers `owner` on first send in pair-key mode.
 - `POST /api/rooms/terminate-inactive` — marks every stale room (activity=stale) as `peer_rooms.terminated_at`. Rejected under `--only-pair-key` lock.
 
@@ -66,7 +74,15 @@ cd go && go build -o bin/peer-web ./cmd/peer-web/
 **Multi-room navigation.** `/` lists every pair-key + activity dot +
 unread badge + member pills; click to enter room. The detail page's
 left sidebar also lists all rooms so you can jump between them without
-returning to the index.
+returning to the index. Each room row also includes a `cards` link to
+the kanban view for that pair_key.
+
+**Kanban board view.** `GET /cards?pair_key=K` renders a 5-column
+(`todo`, `in_progress`, `in_review`, `done`, `cancelled`) board backed
+by the `cards` table. Cards show title, claimer, derived `ready`, and
+blocker ids. 3-second polling refresh. Read-only — claim and status
+transitions go through the CLI (`peer-inbox card-claim`,
+`peer-inbox card-update-status`) or MCP tools.
 
 **Composer.** Bottom of each detail page. From/To dropdowns auto-fill
 from members; `@room` broadcasts. `owner` (the human) is always

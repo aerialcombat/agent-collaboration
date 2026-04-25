@@ -32,6 +32,7 @@ context so fidelity stays high and there's no manual copy-paste.
    - [Messaging](#messaging-send-receive-list)
    - [Observability](#observability-watch-web-replay)
    - [Flow control](#flow-control-reset)
+   - [Kanban (cards)](#kanban-card-create--card-list--card-claim-)
 5. [Delivery modes](#delivery-modes)
    - [Hook (default)](#hook-default)
    - [Channels (real-time push, opt-in)](#channels-real-time-push-opt-in)
@@ -125,12 +126,26 @@ Two tables matter to users:
 *recipient's live context* depends on delivery mode. See
 [Delivery modes](#delivery-modes).
 
+**Two mediums: chat + kanban.** Alongside the chat inbox, v3.9 added a
+**kanban** medium — durable, addressed work cards that live in the
+`cards` + `card_dependencies` tables and scope by `pair_key` like rooms.
+Chat is volatile and broadcast-friendly ("let's spitball"); kanban is
+durable and addressed ("this is for you, do it, mark done"). Cards have
+a 5-state lifecycle (`todo → in_progress → in_review → done`, plus
+`cancelled`) and can declare blocker edges that form a DAG; `ready` is
+derived per-query rather than stored. Cards are surfaced to an agent on
+`UserPromptSubmit` via the hook's `<kanban>` block (claimed cards +
+`needs_role`-matched ready cards). See
+[Subcommand reference → Kanban](#kanban-card-create--card-list--card-claim-).
+
 ---
 
 ## Subcommand reference
 
-All commands are `agent-collab <group> <verb> [options]`. Groups:
-`session`, `peer`. Run `agent-collab help` for the full summary.
+All `agent-collab <group> <verb>` commands are in groups `session` and
+`peer`. Run `agent-collab help` for the full summary. **Kanban / card**
+verbs live on the underlying `peer-inbox` binary directly — there is no
+`agent-collab card` wrapper yet; invoke `peer-inbox card-*` (see below).
 
 ### Sessions: register / close / list
 
@@ -303,6 +318,96 @@ after a conversation was intentionally ended.
 |---|---|
 | `agent-collab session adopt --label <l> --session-id <uuid>` | Re-key an existing registration to a specific Claude session_id. Use when the hook can't resolve self-identity because register happened before the hook logged the real session_id. |
 | `agent-collab hook log-session --cwd <c> --session-id <id>` | Internal: called by the `UserPromptSubmit` hook on every turn to record the seen Claude session_id. Don't invoke manually. |
+
+### Kanban: card-create / card-list / card-claim …
+
+Kanban verbs live on the `peer-inbox` binary directly (no `agent-collab
+card` wrapper yet). All seven accept `--format json|plain`. Cards are
+scoped by `pair_key` (same scope as chat rooms).
+
+#### `peer-inbox card-create`
+
+```
+--pair-key <k>       required; room / board scope
+--title <t>          required
+--created-by <l>     required; label of the creator
+--body <md>          optional; markdown spec / description
+--needs-role <r>     optional; role this card pulls to (e.g. ios, qa, review)
+--priority <n>       -1 low, 0 normal, 1 high (default 0)
+--tags <json>        optional; JSON array, e.g. '["feed-card-epic"]'
+--context-refs <json> optional; {msg_ids:[], files:[], urls:[], cards:[]}
+```
+
+Creates a card in `todo`. If unreferenced by any `card-add-dep`, it is
+immediately `ready`.
+
+#### `peer-inbox card-list`
+
+```
+--pair-key <k>        scope to one room (omit for cross-pair)
+--status <s>          filter: todo|in_progress|in_review|done|cancelled
+--needs-role <r>      filter by needs_role
+--claimed-by <l>      filter by claimer label
+--ready-only          only todo cards with no open blockers
+--blocked-only        only todo cards with >=1 open blocker
+--limit <n>           max rows (0 = all)
+```
+
+`ready` is recomputed per query from live blocker statuses — never stored.
+
+#### `peer-inbox card-get`
+
+```
+--card <n>           required; card id  (alias: --id)
+```
+
+Returns the full card row including body, tags, context_refs, blocker /
+blockee id arrays, and the derived `ready` flag.
+
+#### `peer-inbox card-claim`
+
+```
+--card <n>           required; card id  (alias: --id)
+--as <l>             required; claimer label
+--force              override prior claim by a different label
+```
+
+Marks the card `in_progress` and stamps `claimed_by` + `claimed_at`.
+
+#### `peer-inbox card-update-status`
+
+```
+--card <n>           required; card id  (alias: --id)
+--status <s>         required; todo|in_progress|in_review|done|cancelled
+--as <l>             optional audit label (accepted, currently unused)
+```
+
+Transitions through the lifecycle. Terminal states (`done`,
+`cancelled`) stamp `completed_at`.
+
+#### `peer-inbox card-add-dep`, `peer-inbox card-remove-dep`
+
+```
+--blocker <n>        required; blocker card id
+--blockee <n>        required; blockee card id
+--as <l>             required on add-dep (audit); optional on remove-dep
+```
+
+Add / remove a DAG edge. `add-dep` rejects self-loops and cycles
+(recursive CTE check) with exit code 65.
+
+#### Surfacing: the hook `<kanban>` block
+
+On every `UserPromptSubmit`, the Go `peer-inbox-hook` binary appends a
+`<kanban>…</kanban>` block after the peer-inbox output, listing:
+
+- cards **claimed by this session's label** (regardless of status,
+  excluding terminal), and
+- cards with no claim that match the session's role and are **ready**
+  (no open blockers).
+
+Silent when the session has no queue. The Python fallback hook does
+not inject kanban — the Go hot path is authoritative.
 
 ---
 
@@ -506,7 +611,7 @@ Stand up a background pi session backed by a non-Claude model (codex,
 gemini, zai-glm, …) and talk to it from the current Claude session.
 This is the canonical flow when the user asks to "consult with codex
 and keep the session running so it keeps context" — or any analogous
-model. Verified working 2026-04-19 with `openai-codex / gpt-5.4`.
+model. Verified working 2026-04-19 with `openai-codex / gpt-5.5`.
 
 **Prereqs**
 - Pi extension installed at `~/.pi/agent/extensions/peer-inbox-pi.ts`
@@ -535,7 +640,7 @@ agent-collab session register \
 mkdir -p /tmp/pi-<label>-test
 tail -f /dev/null | \
   PEER_INBOX_LABEL=<label> PEER_INBOX_PAIR_KEY=<pair-key> \
-  pi --provider openai-codex --model gpt-5.4 \
+  pi --provider openai-codex --model gpt-5.5 \
      --mode rpc --no-session \
      > /tmp/pi-<label>-test/stdout.log \
      2> /tmp/pi-<label>-test/stderr.log &
@@ -561,7 +666,7 @@ agent-collab peer send --as claude-lead --to <label> \
 
 | User says | `--provider` | `--model` suggestion |
 |---|---|---|
-| "consult codex" / gpt-5.x | `openai-codex` | `gpt-5.4` (current default), `gpt-5.3-codex`, `gpt-5.4-mini` |
+| "consult codex" / gpt-5.x | `openai-codex` | `gpt-5.5` (current default), `gpt-5.3-codex`, `gpt-5.5-mini` |
 | "consult gemini" | `google` | `gemini-3-pro` / whatever's current |
 | "consult claude via pi" | `anthropic` | `claude-opus-4-7` etc. |
 | "consult glm" | `zai-glm` (plugin) | `glm-4.6` |

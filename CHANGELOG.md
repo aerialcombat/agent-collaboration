@@ -7,9 +7,64 @@ Commit SHAs reference the `agent-collaboration` repo.
 
 ---
 
-## Unreleased — 2026-04-23
+## Unreleased — 2026-04-23 … 2026-04-25
 
 ### Added
+- **v3.9 kanban medium — durable, addressed work artifact.** New
+  `cards` + `card_dependencies` schema (migration `0009_cards.sql`,
+  `GooseVersionRequired` bumped 8 → 9) alongside chat. Cards have a
+  5-state lifecycle (`todo → in_progress → in_review → done`, plus
+  `cancelled`); `ready` is derived per-query from open blockers
+  rather than persisted. Dependencies form a DAG with recursive-CTE
+  cycle detection. Cards are scoped by `pair_key` like rooms and can
+  carry `needs_role`, `priority`, `tags`, and `context_refs` to
+  cross-link chat messages or files. Two mediums, cross-referenced:
+  chat is volatile/broadcast ("let's spitball"); kanban is
+  durable/addressed ("this is for you, do it, mark done"). (`40305b4`)
+- **Card CLI verbs on the `peer-inbox` binary.** Seven verbs, each
+  accepting `--format json|plain`: `card-create`, `card-list`,
+  `card-get`, `card-claim`, `card-update-status`, `card-add-dep`,
+  `card-remove-dep`. See `Subcommand reference → Kanban` in
+  [PEER-INBOX-GUIDE.md](docs/PEER-INBOX-GUIDE.md). No `agent-collab`
+  wrapper yet — invoke `peer-inbox card-*` directly.
+- **Card MCP tools.** Seven matching tools in
+  `scripts/peer-inbox-channel.py`: `card_create`, `card_list`,
+  `card_get`, `card_claim`, `card_update_status`,
+  `card_add_dependency`, `card_remove_dependency`.
+- **Kanban hook injection on `UserPromptSubmit`.** The Go
+  `peer-inbox-hook` binary now appends a `<kanban>…</kanban>` block
+  after peer-inbox output, listing cards the current session can
+  pull (claimed or `needs_role`-matched + ready). Silent when the
+  session has no queue. Python fallback path does not inject kanban
+  — the Go hot path is authoritative. (`bc0d194`)
+- **Peer-web kanban view.**
+  - `GET /api/cards?pair_key=K[&ready_only=1]` — JSON bundle with
+    `by_status` buckets and a ready-only filter.
+  - `GET /cards?pair_key=K` — 5-column kanban-board SPA, 3s polling
+    refresh (no SSE).
+  - `/` index now shows a `cards` link on each room row. (`0f21c19`)
+
+### Changed
+- **Card flag naming normalized.** `--card` is the preferred flag on
+  `card-claim`, `card-get`, and `card-update-status`; `--id` is
+  accepted as back-compat alias. MCP wrapper still passes `--id` —
+  no breaking change for existing tool callers.
+- **`card-update-status` accepts `--as LABEL`** as an optional audit
+  label (currently recorded as no-op; parallel to `--as` on
+  `card-claim` and `card-add-dep`).
+
+### Fixed
+- **`session-register` skips collision guard when prior channel
+  socket is dead.** After `claude --resume`, the previous session's
+  channel socket is torn down but the `sessions` row remains for up
+  to ~5 min until sweep. The re-register now probes the stored
+  `channel_socket` with a 200 ms connect: dead socket (ENOENT /
+  ECONNREFUSED / timeout) → allow re-register in place; live socket
+  → keep the conservative collision error. Rows without a channel
+  socket (daemon peers, no liveness signal) preserve existing
+  behavior. (`63bb986`)
+
+### Added (pre-2026-04-25)
 - **Native iOS companion app** (`ios/`). SwiftUI, iOS 18+, no
   third-party dependencies. Three-view surface — Settings, RoomsList,
   Room — hitting peer-web's REST API with bearer-token auth. Feature
