@@ -119,6 +119,8 @@ func run(args []string) int {
 		return runCardClaim(rest)
 	case "card-update-status":
 		return runCardUpdateStatus(rest)
+	case "card-update":
+		return runCardUpdate(rest)
 	case "card-add-dep":
 		return runCardAddDep(rest)
 	case "card-remove-dep":

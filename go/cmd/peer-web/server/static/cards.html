@@ -518,6 +518,327 @@
   .toast.error { border-color: rgba(239,111,111,0.4); color: #ef6f6f; }
   .toast.ok { border-color: rgba(76,183,130,0.4); }
 
+  /* Header New-card button */
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px; font-weight: 510;
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.10);
+    cursor: pointer;
+    transition: background .12s;
+    letter-spacing: -0.13px;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary .plus { font-size: 14px; line-height: 1; opacity: .85; }
+
+  /* Modal (shared with cards-index.html) */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: none;
+    z-index: 70;
+    backdrop-filter: blur(2px);
+  }
+  .modal-backdrop.open { display: block; }
+  .modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(540px, 92vw);
+    max-height: 86vh;
+    overflow: hidden;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-standard);
+    border-radius: 12px;
+    box-shadow: var(--shadow-dialog);
+    display: none;
+    flex-direction: column;
+    z-index: 80;
+  }
+  .modal.open { display: flex; }
+  .modal .mh {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .modal .mh .title {
+    font-size: 14px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+  }
+  .modal .mh .close {
+    margin-left: auto;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-tertiary);
+    font-size: 18px; line-height: 1;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .modal .mh .close:hover { color: var(--fg-primary); }
+  .modal .mb {
+    padding: 16px 18px 18px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .modal label {
+    display: block;
+    font-size: 11px; font-weight: 510;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-quaternary);
+    margin-bottom: 4px;
+  }
+  .modal input, .modal textarea, .modal select {
+    width: 100%;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+    font-feature-settings: "cv01", "ss03";
+    letter-spacing: -0.13px;
+    transition: border-color .12s, background .12s;
+  }
+  .modal input:focus, .modal textarea:focus, .modal select:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: rgba(0,0,0,0.45);
+  }
+  .modal textarea { resize: vertical; min-height: 90px; max-height: 360px; }
+  .modal .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal .actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border-subtle);
+    background: rgba(0,0,0,0.20);
+  }
+  .modal .btn {
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    letter-spacing: -0.13px;
+  }
+  .modal .btn.ghost {
+    background: rgba(255,255,255,0.02);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-standard);
+  }
+  .modal .btn.ghost:hover {
+    color: var(--fg-primary);
+    background: rgba(255,255,255,0.05);
+  }
+  .modal .btn.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .modal .btn.primary:hover { background: var(--accent-hover); }
+  .modal .btn.primary:disabled { opacity: .5; cursor: not-allowed; }
+  .modal .err {
+    color: #ef6f6f;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(239,111,111,0.08);
+    border: 1px solid rgba(239,111,111,0.30);
+    display: none;
+  }
+  .modal .err.show { display: block; }
+
+  /* Inline body edit affordance in the drawer */
+  .drawer .body-edit-wrap {
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .drawer .body-edit-wrap textarea {
+    width: 100%;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.6;
+    font-feature-settings: "cv01", "ss03";
+    letter-spacing: -0.13px;
+    resize: vertical;
+    min-height: 120px;
+    max-height: 50vh;
+  }
+  .drawer .body-edit-wrap textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .drawer .edit-actions {
+    display: flex; gap: 8px;
+    justify-content: flex-end;
+  }
+  .drawer .edit-link {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 11px; font-weight: 510;
+    cursor: pointer;
+    padding: 0;
+    margin-left: 8px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .drawer .edit-link:hover { color: var(--accent-hover); }
+
+  /* Context panel — resolved context_refs */
+  .ctx-panel {
+    margin-top: 18px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.20);
+    overflow: hidden;
+  }
+  .ctx-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: rgba(255,255,255,0.02);
+  }
+  .ctx-head .ctx-title {
+    font-size: 11px; font-weight: 510;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-secondary);
+  }
+  .ctx-head .ctx-stats {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--fg-quaternary);
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-weight: 400;
+  }
+  .ctx-head .ctx-resolve {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-secondary);
+    font-family: inherit;
+    font-size: 11px; font-weight: 510;
+    padding: 3px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    letter-spacing: -0.06px;
+  }
+  .ctx-head .ctx-resolve:hover {
+    color: var(--fg-primary);
+    border-color: var(--border-emphasis);
+  }
+  .ctx-body {
+    padding: 0;
+  }
+  .ctx-section {
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .ctx-section:last-child { border-bottom: none; }
+  .ctx-section-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .ctx-section-head:hover { background: rgba(255,255,255,0.02); }
+  .ctx-section-head .label {
+    font-size: 11px; font-weight: 510;
+    color: var(--fg-secondary);
+    letter-spacing: -0.06px;
+  }
+  .ctx-section-head .count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--fg-quaternary);
+  }
+  .ctx-section-head .chevron {
+    font-size: 10px;
+    color: var(--fg-quaternary);
+    transition: transform .12s;
+    width: 8px;
+    display: inline-block;
+  }
+  .ctx-section.open .chevron { transform: rotate(90deg); }
+  .ctx-section-body {
+    display: none;
+    padding: 4px 14px 12px 22px;
+  }
+  .ctx-section.open .ctx-section-body { display: block; }
+  .ctx-item {
+    margin: 6px 0;
+    font-size: 12px;
+    color: var(--fg-secondary);
+    word-break: break-all;
+  }
+  .ctx-item .ctx-key {
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    color: var(--fg-tertiary);
+    font-size: 11px;
+    font-weight: 400;
+  }
+  .ctx-item .ctx-meta {
+    font-size: 10px;
+    color: var(--fg-quaternary);
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    margin-left: 6px;
+  }
+  .ctx-item .ctx-err {
+    color: #ef6f6f;
+    font-size: 11px;
+    margin-left: 4px;
+  }
+  .ctx-item details {
+    margin-top: 4px;
+  }
+  .ctx-item details summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 510;
+    letter-spacing: -0.06px;
+    list-style: none;
+    padding: 2px 0;
+  }
+  .ctx-item details summary::-webkit-details-marker { display: none; }
+  .ctx-item details summary::before {
+    content: '▸ ';
+    color: var(--fg-quaternary);
+  }
+  .ctx-item details[open] summary::before { content: '▾ '; }
+  .ctx-item pre {
+    background: rgba(0,0,0,0.45);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-family: 'Berkeley Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--fg-secondary);
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre;
+    margin: 6px 0 0;
+  }
+  .ctx-item pre.wrap { white-space: pre-wrap; }
+  .ctx-empty {
+    padding: 14px;
+    text-align: center;
+    color: var(--fg-quaternary);
+    font-size: 12px;
+  }
+
   /* Status state pill (drawer top "● ready / ● blocked" line) */
   .drawer .state-pill {
     display: inline-flex;
@@ -545,6 +866,7 @@
   <span class=dot></span>
   <h1>__CWD__</h1>
   <span class=sub id=status>loading…</span>
+  <button class=btn-primary id=btn-new-card><span class=plus>+</span>New card</button>
   <a href=/cards title="all kanban boards">boards</a>
   <a href=/ title="back to rooms">rooms</a>
 </header>
@@ -554,6 +876,50 @@
 <div class="backdrop" id=backdrop></div>
 <aside class="drawer" id=drawer aria-hidden=true></aside>
 <div class="toast" id=toast role=status aria-live=polite></div>
+
+<div class="modal-backdrop" id=modal-backdrop></div>
+<aside class="modal" id=create-modal aria-hidden=true role=dialog aria-labelledby=create-modal-title>
+  <div class=mh>
+    <span class=title id=create-modal-title>New card on <code style="color:var(--accent);font-family:ui-monospace,SF Mono,Menlo,monospace" id=cf-pair-key-display></code></span>
+    <button class=close id=create-modal-close aria-label="close">×</button>
+  </div>
+  <form class=mb id=create-form>
+    <input type=hidden id=cf-pair-key>
+    <div>
+      <label for=cf-title>Title</label>
+      <input type=text id=cf-title required maxlength=200
+        placeholder="Short, action-oriented (an agent can refine the body)">
+    </div>
+    <div>
+      <label for=cf-body>Body / spec (markdown, optional)</label>
+      <textarea id=cf-body rows=5
+        placeholder="Rough notes are fine — claim it to an agent and ask them to flesh out the spec."></textarea>
+    </div>
+    <div class=row2>
+      <div>
+        <label for=cf-needs-role>Needs role (optional)</label>
+        <input type=text id=cf-needs-role placeholder="e.g. ios, qa, refine">
+      </div>
+      <div>
+        <label for=cf-priority>Priority</label>
+        <select id=cf-priority>
+          <option value=0 selected>Normal</option>
+          <option value=1>High ⚑</option>
+          <option value=-1>Low</option>
+        </select>
+      </div>
+    </div>
+    <div>
+      <label for=cf-created-by>Created by (optional, defaults to "owner")</label>
+      <input type=text id=cf-created-by placeholder="owner">
+    </div>
+    <div class=err id=cf-err></div>
+  </form>
+  <div class=actions>
+    <button type=button class="btn ghost" id=cf-cancel>Cancel</button>
+    <button type=submit class="btn primary" id=cf-submit form=create-form>Create card</button>
+  </div>
+</aside>
 
 <script>
 (() => {
@@ -675,10 +1041,12 @@
         <h2>${esc(c.title)}</h2>
         ${readiness ? `<div class="field">${readiness}</div>` : ''}
 
-        <div class="field">
-          <div class="label">spec / body</div>
+        <div class="field body-edit-target">
+          <div class="label">spec / body
+            <button class="edit-link" data-action="edit-body" type="button">edit</button>
+          </div>
           ${c.body ? `<div class="body-md">${esc(c.body)}</div>`
-                   : '<div class="empty">(no body)</div>'}
+                   : '<div class="empty">(no body — click edit to add)</div>'}
         </div>
 
         <div class="field grid2">
@@ -747,9 +1115,22 @@
         </div>
 
         ${ctxRefs ? `<div class="field">
-          <div class="label">context refs</div>
-          <div class="value mono"><pre style="margin:0;white-space:pre-wrap">${esc(JSON.stringify(ctxRefs, null, 2))}</pre></div>
+          <div class="label">context refs (raw)</div>
+          <div class="value mono"><pre style="margin:0;white-space:pre-wrap;background:rgba(0,0,0,0.30);border:1px solid var(--border-subtle);border-radius:4px;padding:8px 10px;font-size:11px">${esc(JSON.stringify(ctxRefs, null, 2))}</pre></div>
         </div>` : ''}
+
+        <div class="ctx-panel" id="ctx-panel" data-card-id="${c.id}">
+          <div class="ctx-head">
+            <span class="ctx-title">Context</span>
+            <span class="ctx-stats" id="ctx-stats">${ctxRefs ? 'click resolve' : 'no refs'}</span>
+            ${ctxRefs ? '<button class="ctx-resolve" id="ctx-resolve">Resolve</button>' : ''}
+          </div>
+          <div class="ctx-body" id="ctx-body">
+            ${ctxRefs
+              ? '<div class="ctx-empty">Click <strong>Resolve</strong> to fetch files, urls, msgs, cards.</div>'
+              : '<div class="ctx-empty">No context_refs on this card. Add files/urls/msg_ids/cards refs to give workers the context they need.</div>'}
+          </div>
+        </div>
 
         <div class="field">
           <div class="label">scope</div>
@@ -949,5 +1330,256 @@
 
   refresh();
   setInterval(refresh, 3000);
+
+  // --- New-card modal ----------------------------------------------------
+  const createModal = document.getElementById('create-modal');
+  const createBackdrop = document.getElementById('modal-backdrop');
+  const createForm = document.getElementById('create-form');
+  const createErr = document.getElementById('cf-err');
+  const createSubmit = document.getElementById('cf-submit');
+  const cfPairKeyDisplay = document.getElementById('cf-pair-key-display');
+
+  function openCreateModal() {
+    createErr.classList.remove('show');
+    createErr.textContent = '';
+    createForm.reset();
+    document.getElementById('cf-pair-key').value = pairKey;
+    cfPairKeyDisplay.textContent = pairKey;
+    createModal.classList.add('open');
+    createModal.setAttribute('aria-hidden', 'false');
+    createBackdrop.classList.add('open');
+    setTimeout(() => document.getElementById('cf-title').focus(), 30);
+  }
+  function closeCreateModal() {
+    createModal.classList.remove('open');
+    createModal.setAttribute('aria-hidden', 'true');
+    createBackdrop.classList.remove('open');
+  }
+
+  document.getElementById('btn-new-card').addEventListener('click', openCreateModal);
+  document.getElementById('create-modal-close').addEventListener('click', closeCreateModal);
+  document.getElementById('cf-cancel').addEventListener('click', closeCreateModal);
+  createBackdrop.addEventListener('click', closeCreateModal);
+
+  // Extend the existing Escape handler — close create modal first if open,
+  // otherwise drawer.
+  const escHandlerEl = document;
+  escHandlerEl.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (createModal.classList.contains('open')) {
+      closeCreateModal();
+      e.stopImmediatePropagation();
+    }
+  }, true /* capture, so we run before the drawer's handler */);
+
+  createForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    createErr.classList.remove('show');
+    createSubmit.disabled = true;
+    const payload = {
+      pair_key:   pairKey,
+      title:      document.getElementById('cf-title').value.trim(),
+      body:       document.getElementById('cf-body').value,
+      needs_role: document.getElementById('cf-needs-role').value.trim(),
+      priority:   parseInt(document.getElementById('cf-priority').value, 10) || 0,
+      created_by: document.getElementById('cf-created-by').value.trim() || 'owner',
+    };
+    try {
+      const resp = await fetch('/api/cards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + resp.status));
+      }
+      const card = await resp.json();
+      closeCreateModal();
+      showToast(`Created #${card.id} — ${card.title}`, 'ok');
+      refresh();
+    } catch (err) {
+      createErr.textContent = err.message;
+      createErr.classList.add('show');
+    } finally {
+      createSubmit.disabled = false;
+    }
+  });
+
+  // --- Drawer context resolver -------------------------------------------
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(2) + ' MB';
+  }
+
+  function renderCtxFile(f) {
+    const meta = `${fmtBytes(f.bytes || 0)}` + (f.truncated ? ' (truncated)' : '');
+    const err = f.error
+      ? `<span class="ctx-err">${esc(f.error)}</span>`
+      : '';
+    const content = f.content
+      ? `<details><summary>show content</summary><pre>${esc(f.content)}</pre></details>`
+      : '';
+    return `<div class="ctx-item">
+      <span class="ctx-key">${esc(f.path)}</span>
+      <span class="ctx-meta">${meta}</span>${err}${content}
+    </div>`;
+  }
+  function renderCtxURL(u) {
+    const meta = `${fmtBytes(u.bytes || 0)}${u.content_type ? ' · ' + esc(u.content_type.split(';')[0]) : ''}`
+      + (u.truncated ? ' (truncated)' : '');
+    const err = u.error
+      ? `<span class="ctx-err">${esc(u.error)}</span>`
+      : '';
+    const content = u.content
+      ? `<details><summary>show content</summary><pre class="wrap">${esc(u.content)}</pre></details>`
+      : '';
+    return `<div class="ctx-item">
+      <span class="ctx-key">${esc(u.url)}</span>
+      <span class="ctx-meta">${meta}</span>${err}${content}
+    </div>`;
+  }
+  function renderCtxMsg(m) {
+    if (m.error) {
+      return `<div class="ctx-item">
+        <span class="ctx-key">#${m.id}</span>
+        <span class="ctx-err">${esc(m.error)}</span>
+      </div>`;
+    }
+    return `<div class="ctx-item">
+      <span class="ctx-key">#${m.id}</span>
+      <span class="ctx-meta">${esc(m.from)} → ${esc(m.to)} · ${esc(fmtTs(m.created_at))}</span>
+      <details><summary>show body</summary><pre class="wrap">${esc(m.body)}</pre></details>
+    </div>`;
+  }
+  function renderCtxCard(c) {
+    if (c.error) {
+      return `<div class="ctx-item">
+        <span class="ctx-key">#${c.id}</span>
+        <span class="ctx-err">${esc(c.error)}</span>
+      </div>`;
+    }
+    return `<div class="ctx-item">
+      <span class="ctx-key">#${c.id}</span>
+      <span class="ctx-meta">${esc(c.status)}${c.needs_role ? ' · needs ' + esc(c.needs_role) : ''}</span>
+      ${c.title ? `<div style="margin-top:3px;color:var(--fg-primary);font-weight:510">${esc(c.title)}</div>` : ''}
+      ${c.body ? `<details><summary>show body</summary><pre class="wrap">${esc(c.body)}</pre></details>` : ''}
+    </div>`;
+  }
+
+  function renderCtxBundle(data) {
+    const sections = [
+      ['files',   'Files',         data.files   || [], renderCtxFile],
+      ['urls',    'URLs',          data.urls    || [], renderCtxURL],
+      ['msg_ids', 'Inbox messages', data.msg_ids || [], renderCtxMsg],
+      ['cards',   'Predecessor cards', data.cards || [], renderCtxCard],
+    ];
+    const total = sections.reduce((a, [, , arr]) => a + arr.length, 0);
+    if (total === 0) {
+      return '<div class="ctx-empty">No refs to resolve.</div>';
+    }
+    return sections.map(([key, label, items, fn]) => {
+      if (items.length === 0) return '';
+      return `<div class="ctx-section open" data-section="${key}">
+        <div class="ctx-section-head">
+          <span class="chevron">▸</span>
+          <span class="label">${label}</span>
+          <span class="count">${items.length}</span>
+        </div>
+        <div class="ctx-section-body">${items.map(fn).join('')}</div>
+      </div>`;
+    }).join('');
+  }
+
+  async function resolveContext(cardId) {
+    const stats = document.getElementById('ctx-stats');
+    const body = document.getElementById('ctx-body');
+    if (!stats || !body) return;
+    stats.textContent = 'resolving…';
+    body.innerHTML = '<div class="ctx-empty">Loading…</div>';
+    try {
+      const r = await fetch(`/api/cards/${cardId}/context`, { cache: 'no-store' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      const data = await r.json();
+      body.innerHTML = renderCtxBundle(data);
+      stats.textContent = fmtBytes(data.total_bytes || 0) + ' resolved';
+    } catch (err) {
+      stats.textContent = 'error';
+      body.innerHTML = `<div class="ctx-empty"><span class="ctx-err">${esc(err.message)}</span></div>`;
+    }
+  }
+
+  drawer.addEventListener('click', e => {
+    if (e.target.closest('#ctx-resolve') && openCardId !== null) {
+      resolveContext(openCardId);
+      return;
+    }
+    const head = e.target.closest('.ctx-section-head');
+    if (head) {
+      head.parentElement.classList.toggle('open');
+    }
+  });
+
+  // --- Drawer body inline edit -------------------------------------------
+  // Click the "edit" link next to the body label → swap in a textarea +
+  // Save / Cancel. Save POSTs to /api/cards/{id}/update with {body}.
+  drawer.addEventListener('click', async e => {
+    const editBtn = e.target.closest('.edit-link');
+    if (editBtn && editBtn.dataset.action === 'edit-body' && openCardId !== null) {
+      const cur = (lastData.cards || []).find(c => c.id === openCardId);
+      if (!cur) return;
+      const wrap = drawer.querySelector('.body-edit-target');
+      if (!wrap) return;
+      wrap.innerHTML = `
+        <div class="body-edit-wrap">
+          <textarea id="drawer-body-edit">${esc(cur.body || '')}</textarea>
+          <div class="edit-actions">
+            <button type="button" class="btn ghost" data-action="cancel-body" style="font-family:inherit;font-size:12px;font-weight:510;padding:6px 14px;border-radius:6px;cursor:pointer;background:rgba(255,255,255,0.02);color:var(--fg-secondary);border:1px solid var(--border-standard)">Cancel</button>
+            <button type="button" class="btn primary" data-action="save-body" style="font-family:inherit;font-size:12px;font-weight:510;padding:6px 14px;border-radius:6px;cursor:pointer;background:var(--accent);color:#fff;border:1px solid rgba(255,255,255,0.12)">Save</button>
+          </div>
+        </div>`;
+      const ta = wrap.querySelector('#drawer-body-edit');
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+      return;
+    }
+    const cancel = e.target.closest('[data-action="cancel-body"]');
+    if (cancel && openCardId !== null) {
+      const cur = (lastData.cards || []).find(c => c.id === openCardId);
+      if (cur) {
+        const byId = Object.fromEntries((lastData.cards || []).map(c => [c.id, c]));
+        renderDrawer(cur, byId);
+      }
+      return;
+    }
+    const save = e.target.closest('[data-action="save-body"]');
+    if (save && openCardId !== null) {
+      const ta = drawer.querySelector('#drawer-body-edit');
+      if (!ta) return;
+      const newBody = ta.value;
+      save.disabled = true;
+      try {
+        const resp = await fetch(`/api/cards/${openCardId}/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: newBody }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || ('HTTP ' + resp.status));
+        }
+        showToast(`#${openCardId} body updated`, 'ok');
+        await refresh();
+      } catch (err) {
+        showToast(`Save failed: ${err.message}`, 'error');
+      } finally {
+        save.disabled = false;
+      }
+    }
+  });
 })();
 </script>

@@ -348,6 +348,106 @@ func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status str
 	return s.GetCard(ctx, id)
 }
 
+// MessagesByIDs fetches inbox rows by id in arbitrary order. Missing
+// ids are silently skipped (the caller can compare lengths to detect).
+// Used by context resolution: a card may reference msg_ids in
+// context_refs that should be replayed back to a worker as conversation
+// history.
+func (s *SQLiteLocal) MessagesByIDs(ctx context.Context, ids []int64) ([]WebMessage, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders := strings.Repeat("?,", len(ids))
+	placeholders = placeholders[:len(placeholders)-1]
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	q := `SELECT server_seq, from_label, to_label, body, created_at
+	      FROM inbox
+	      WHERE server_seq IN (` + placeholders + `)
+	      ORDER BY server_seq`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("MessagesByIDs: %w", err)
+	}
+	defer rows.Close()
+	var out []WebMessage
+	for rows.Next() {
+		var m WebMessage
+		if err := rows.Scan(&m.ID, &m.From, &m.To, &m.Body, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("MessagesByIDs scan: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// UpdateCardFieldsParams collects the partial mutation set. Pointer
+// fields distinguish "leave alone" (nil) from "set to zero value"
+// (non-nil pointer to empty string / 0). All fields are optional;
+// callers must set at least one or the call is a no-op.
+type UpdateCardFieldsParams struct {
+	Title       *string
+	Body        *string
+	NeedsRole   *string
+	Priority    *int
+	Tags        *string // raw JSON
+	ContextRefs *string // raw JSON
+}
+
+// UpdateCardFields mutates non-status fields on a card and stamps
+// updated_at. Status, claim ownership, and dependency edges go through
+// their own dedicated verbs. Returns ErrCardNotFound when no row matches.
+func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCardFieldsParams) (*Card, error) {
+	sets := []string{}
+	args := []any{}
+	if p.Title != nil {
+		sets = append(sets, "title = ?")
+		args = append(args, *p.Title)
+	}
+	if p.Body != nil {
+		sets = append(sets, "body = ?")
+		args = append(args, *p.Body)
+	}
+	if p.NeedsRole != nil {
+		sets = append(sets, "needs_role = ?")
+		args = append(args, *p.NeedsRole)
+	}
+	if p.Priority != nil {
+		sets = append(sets, "priority = ?")
+		args = append(args, *p.Priority)
+	}
+	if p.Tags != nil {
+		sets = append(sets, "tags = ?")
+		args = append(args, *p.Tags)
+	}
+	if p.ContextRefs != nil {
+		sets = append(sets, "context_refs = ?")
+		args = append(args, *p.ContextRefs)
+	}
+	if len(sets) == 0 {
+		return s.GetCard(ctx, id)
+	}
+	sets = append(sets, "updated_at = ?")
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	args = append(args, now, id)
+
+	q := "UPDATE cards SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("UpdateCardFields: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("UpdateCardFields rows: %w", err)
+	}
+	if n == 0 {
+		return nil, ErrCardNotFound
+	}
+	return s.GetCard(ctx, id)
+}
+
 // AddCardDependency adds an edge blocker -> blockee after validating
 // (a) neither endpoint equals the other, (b) both cards exist,
 // (c) the new edge doesn't create a cycle. The cycle check walks the

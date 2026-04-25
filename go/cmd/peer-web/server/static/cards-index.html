@@ -247,6 +247,152 @@
     font-size: 12px;
   }
 
+  /* New-card button */
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px; font-weight: 510;
+    padding: 5px 12px;
+    border-radius: 6px;
+    text-decoration: none;
+    border: 1px solid rgba(255,255,255,0.10);
+    cursor: pointer;
+    transition: background .12s;
+    letter-spacing: -0.13px;
+  }
+  .btn-primary:hover { background: var(--accent-hover, #828fff); }
+  .btn-primary .plus { font-size: 14px; line-height: 1; opacity: .85; }
+
+  /* Modal (shared shell) */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: none;
+    z-index: 70;
+    backdrop-filter: blur(2px);
+  }
+  .modal-backdrop.open { display: block; }
+  .modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(540px, 92vw);
+    max-height: 86vh;
+    overflow: hidden;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-standard);
+    border-radius: 12px;
+    box-shadow:
+      rgba(0,0,0,0.00) 0px 8px 2px,
+      rgba(0,0,0,0.01) 0px 5px 2px,
+      rgba(0,0,0,0.04) 0px 3px 2px,
+      rgba(0,0,0,0.07) 0px 1px 1px,
+      rgba(0,0,0,0.50) 0px 16px 32px -8px;
+    display: none;
+    flex-direction: column;
+    z-index: 80;
+  }
+  .modal.open { display: flex; }
+  .modal .mh {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .modal .mh .title {
+    font-size: 14px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+  }
+  .modal .mh .close {
+    margin-left: auto;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-tertiary);
+    font-size: 18px; line-height: 1;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .modal .mh .close:hover { color: var(--fg-primary); }
+  .modal .mb {
+    padding: 16px 18px 18px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .modal label {
+    display: block;
+    font-size: 11px; font-weight: 510;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-quaternary);
+    margin-bottom: 4px;
+  }
+  .modal input, .modal textarea, .modal select {
+    width: 100%;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+    font-feature-settings: "cv01", "ss03";
+    letter-spacing: -0.13px;
+    transition: border-color .12s, background .12s;
+  }
+  .modal input:focus, .modal textarea:focus, .modal select:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: rgba(0,0,0,0.45);
+  }
+  .modal textarea { resize: vertical; min-height: 90px; max-height: 320px; }
+  .modal .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal .actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border-subtle);
+    background: rgba(0,0,0,0.20);
+  }
+  .modal .btn {
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    letter-spacing: -0.13px;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .modal .btn.ghost {
+    background: rgba(255,255,255,0.02);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-standard);
+  }
+  .modal .btn.ghost:hover {
+    color: var(--fg-primary);
+    background: rgba(255,255,255,0.05);
+  }
+  .modal .btn.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .modal .btn.primary:hover { background: #828fff; }
+  .modal .btn.primary:disabled {
+    opacity: .5; cursor: not-allowed;
+  }
+  .modal .err {
+    color: #ef6f6f;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(239,111,111,0.08);
+    border: 1px solid rgba(239,111,111,0.30);
+    display: none;
+  }
+  .modal .err.show { display: block; }
+
   @media (max-width: 600px) {
     main { padding: 20px 16px; }
     header { padding: 10px 16px; }
@@ -258,6 +404,7 @@
   <span class=dot></span>
   <h1>__CWD__</h1>
   <span class=sub id=status>loading…</span>
+  <button class=btn-primary id=btn-new-card><span class=plus>+</span>New card</button>
   <a href=/ title="back to rooms">rooms</a>
 </header>
 
@@ -266,6 +413,55 @@
   <p class=page-sub>One board per pair_key. Click in to claim, transition, and drag cards.</p>
   <div class=grid id=grid></div>
 </main>
+
+<div class="modal-backdrop" id=modal-backdrop></div>
+<aside class="modal" id=create-modal aria-hidden=true role=dialog aria-labelledby=create-modal-title>
+  <div class=mh>
+    <span class=title id=create-modal-title>New card</span>
+    <button class=close id=create-modal-close aria-label="close">×</button>
+  </div>
+  <form class=mb id=create-form>
+    <div>
+      <label for=cf-pair-key>Board (pair_key)</label>
+      <input type=text id=cf-pair-key required autocomplete=off
+        placeholder="e.g. fleet-quartz-842c" list=pair-keys-list>
+      <datalist id=pair-keys-list></datalist>
+    </div>
+    <div>
+      <label for=cf-title>Title</label>
+      <input type=text id=cf-title required maxlength=200
+        placeholder="Short, action-oriented (an agent will refine the body)">
+    </div>
+    <div>
+      <label for=cf-body>Body / spec (markdown, optional)</label>
+      <textarea id=cf-body rows=4
+        placeholder="Rough notes are fine — claim it to an agent and ask them to flesh out the spec."></textarea>
+    </div>
+    <div class=row2>
+      <div>
+        <label for=cf-needs-role>Needs role (optional)</label>
+        <input type=text id=cf-needs-role placeholder="e.g. ios, qa, refine">
+      </div>
+      <div>
+        <label for=cf-priority>Priority</label>
+        <select id=cf-priority>
+          <option value=0 selected>Normal</option>
+          <option value=1>High ⚑</option>
+          <option value=-1>Low</option>
+        </select>
+      </div>
+    </div>
+    <div>
+      <label for=cf-created-by>Created by (optional, defaults to "owner")</label>
+      <input type=text id=cf-created-by placeholder="owner">
+    </div>
+    <div class=err id=cf-err></div>
+  </form>
+  <div class=actions>
+    <button type=button class="btn ghost" id=cf-cancel>Cancel</button>
+    <button type=submit class="btn primary" id=cf-submit form=create-form>Create card</button>
+  </div>
+</aside>
 
 <script>
 (() => {
@@ -374,6 +570,88 @@
 
   refresh();
   setInterval(refresh, 5000);
+
+  // --- New-card modal ----------------------------------------------------
+  const modal = document.getElementById('create-modal');
+  const modalBackdrop = document.getElementById('modal-backdrop');
+  const form = document.getElementById('create-form');
+  const errEl = document.getElementById('cf-err');
+  const submitBtn = document.getElementById('cf-submit');
+  const pairList = document.getElementById('pair-keys-list');
+  let knownPairKeys = [];
+
+  async function openModal(prefillPairKey) {
+    errEl.classList.remove('show');
+    errEl.textContent = '';
+    form.reset();
+    if (prefillPairKey) {
+      document.getElementById('cf-pair-key').value = prefillPairKey;
+    }
+    // Re-pull pair_keys for autocomplete on every open so the list is fresh
+    // even if the page has been sitting open for a while.
+    try {
+      const r = await fetch('/api/boards', { cache: 'no-store' });
+      const d = await r.json();
+      knownPairKeys = (d.boards || []).map(b => b.pair_key);
+    } catch {}
+    pairList.innerHTML = knownPairKeys
+      .map(k => `<option value="${k}"></option>`).join('');
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    modalBackdrop.classList.add('open');
+    setTimeout(() => {
+      const el = prefillPairKey
+        ? document.getElementById('cf-title')
+        : document.getElementById('cf-pair-key');
+      el && el.focus();
+    }, 30);
+  }
+  function closeModal() {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+    modalBackdrop.classList.remove('open');
+  }
+  document.getElementById('btn-new-card').addEventListener('click', () => openModal());
+  document.getElementById('create-modal-close').addEventListener('click', closeModal);
+  document.getElementById('cf-cancel').addEventListener('click', closeModal);
+  modalBackdrop.addEventListener('click', closeModal);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    errEl.classList.remove('show');
+    submitBtn.disabled = true;
+    const payload = {
+      pair_key:   document.getElementById('cf-pair-key').value.trim(),
+      title:      document.getElementById('cf-title').value.trim(),
+      body:       document.getElementById('cf-body').value,
+      needs_role: document.getElementById('cf-needs-role').value.trim(),
+      priority:   parseInt(document.getElementById('cf-priority').value, 10) || 0,
+      created_by: document.getElementById('cf-created-by').value.trim() || 'owner',
+    };
+    try {
+      const resp = await fetch('/api/cards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + resp.status));
+      }
+      closeModal();
+      // Jump to the new board so the human can see the card immediately.
+      location.href = '/cards?pair_key=' + encodeURIComponent(payload.pair_key);
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.classList.add('show');
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
 })();
 </script>
 </content>

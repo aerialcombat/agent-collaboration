@@ -259,6 +259,103 @@ func runCardUpdateStatus(args []string) int {
 	return emitCard(card, *format)
 }
 
+// runCardUpdate — card-update --card N [--title T] [--body B]
+// [--needs-role R] [--priority P] [--tags JSON] [--context-refs JSON]
+// [--as LABEL] [--format json|plain]
+//
+// Mutates non-status fields. Status, claim ownership, and dependency
+// edges have their own dedicated verbs. At least one mutable flag must
+// be set or the call is a no-op (returns the card unchanged).
+//
+// Sentinel values for explicit clear:
+//   --body=""             clears the body
+//   --needs-role=""       removes role gating
+//   --tags="[]"           empties the tags array
+func runCardUpdate(args []string) int {
+	fs := flag.NewFlagSet("card-update", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	id := fs.Int64("id", 0, "card id (alias of --card)")
+	cardID := fs.Int64("card", 0, "card id (required)")
+	_ = fs.String("as", "", "optional audit label (accepted, currently unused)")
+	format := fs.String("format", "plain", "plain|json")
+
+	// Wrap each mutable field with a "set?" boolean so empty-string can
+	// be distinguished from absent. flag's standard String() doesn't
+	// expose visited; we use fs.Visit after parse instead.
+	title := fs.String("title", "", "new title")
+	body := fs.String("body", "", "new body / spec (markdown)")
+	needsRole := fs.String("needs-role", "", "new needs_role (use \"\" to clear)")
+	priority := fs.Int("priority", 0, "new priority (-1 low, 0 normal, 1 high)")
+	tags := fs.String("tags", "", "new tags JSON array")
+	ctxRefs := fs.String("context-refs", "", "new context_refs JSON object")
+
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if *cardID != 0 {
+		*id = *cardID
+	}
+	if *id == 0 {
+		fmt.Fprintln(os.Stderr, "card-update: --card required")
+		return exitUsage
+	}
+	if *format != "plain" && *format != "json" {
+		fmt.Fprintln(os.Stderr, "card-update: --format must be plain or json")
+		return exitUsage
+	}
+	if *tags != "" && !isValidJSON(*tags) {
+		fmt.Fprintln(os.Stderr, "card-update: --tags must be valid JSON")
+		return exitUsage
+	}
+	if *ctxRefs != "" && !isValidJSON(*ctxRefs) {
+		fmt.Fprintln(os.Stderr, "card-update: --context-refs must be valid JSON")
+		return exitUsage
+	}
+
+	visited := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+
+	params := sqlitestore.UpdateCardFieldsParams{}
+	if visited["title"] {
+		params.Title = title
+	}
+	if visited["body"] {
+		params.Body = body
+	}
+	if visited["needs-role"] {
+		params.NeedsRole = needsRole
+	}
+	if visited["priority"] {
+		params.Priority = priority
+	}
+	if visited["tags"] {
+		params.Tags = tags
+	}
+	if visited["context-refs"] {
+		params.ContextRefs = ctxRefs
+	}
+
+	ctx, cancel := cardCtx()
+	defer cancel()
+	st, err := sqlitestore.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-update: open: %v\n", err)
+		return exitInternal
+	}
+	defer st.Close()
+
+	card, err := st.UpdateCardFields(ctx, *id, params)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		fmt.Fprintf(os.Stderr, "card-update: not found: %d\n", *id)
+		return exitNotFound
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "card-update: %v\n", err)
+		return exitInternal
+	}
+	return emitCard(card, *format)
+}
+
 // runCardAddDep — card-add-dep --blocker N --blockee M --as LABEL [--format]
 func runCardAddDep(args []string) int {
 	fs := flag.NewFlagSet("card-add-dep", flag.ContinueOnError)

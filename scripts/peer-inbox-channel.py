@@ -259,6 +259,30 @@ CARD_TOOLS = [
         },
     },
     {
+        "name": "card_update",
+        "description": (
+            "Mutate non-status fields on a card: title, body (markdown), "
+            "needs_role, priority, tags, context_refs. Status, claim "
+            "ownership, and dependencies have their own dedicated tools. "
+            "Pass only the fields you want to change. To clear a string "
+            "field, pass an empty string."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "needs_role": {"type": "string"},
+                "priority": {"type": "integer", "minimum": -1, "maximum": 1},
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "context_refs": {"type": "object"},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "card_add_dependency",
         "description": (
             "Add a blocker → blockee edge. Blockee can't become ready "
@@ -800,6 +824,50 @@ def _card_update_status(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_update(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required (positive integer)")
+        return
+    flags = ["--card", str(cid)]
+    if "title" in arguments:
+        flags += ["--title", str(arguments["title"])]
+    if "body" in arguments:
+        flags += ["--body", str(arguments["body"])]
+    if "needs_role" in arguments:
+        flags += ["--needs-role", str(arguments["needs_role"])]
+    if "priority" in arguments:
+        pr = arguments["priority"]
+        if not isinstance(pr, int) or pr < -1 or pr > 1:
+            _tool_error(req_id, "error: `priority` must be an integer in [-1, 1]")
+            return
+        flags += ["--priority", str(pr)]
+    if "tags" in arguments:
+        tags = arguments["tags"]
+        if not isinstance(tags, list):
+            _tool_error(req_id, "error: `tags` must be an array of strings")
+            return
+        flags += ["--tags", json.dumps(tags)]
+    if "context_refs" in arguments:
+        refs = arguments["context_refs"]
+        if not isinstance(refs, dict):
+            _tool_error(req_id, "error: `context_refs` must be an object")
+            return
+        flags += ["--context-refs", json.dumps(refs)]
+    if len(flags) == 2:
+        _tool_error(req_id, "error: pass at least one mutable field "
+            "(title, body, needs_role, priority, tags, context_refs)")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if label:
+        flags += ["--as", label]
+    ok, msg, parsed = _shell_card_verb("card-update", flags)
+    if not ok:
+        _tool_error(req_id, f"card_update: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 def _card_add_dependency(req_id, arguments: dict) -> None:
     blocker = arguments.get("blocker_id")
     blockee = arguments.get("blockee_id")
@@ -839,6 +907,7 @@ CARD_TOOL_HANDLERS = {
     "card_get": _card_get,
     "card_claim": _card_claim,
     "card_update_status": _card_update_status,
+    "card_update": _card_update,
     "card_add_dependency": _card_add_dependency,
     "card_remove_dependency": _card_remove_dependency,
 }

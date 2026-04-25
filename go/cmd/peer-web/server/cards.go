@@ -12,6 +12,20 @@ import (
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
 )
 
+// handleCardsRoot dispatches /api/cards by method:
+//   GET  → handleCards (list/filter for one board)
+//   POST → handleCreateCard (create a new card)
+func (s *Server) handleCardsRoot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.handleCards(w, r)
+	case http.MethodPost:
+		s.handleCreateCard(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // handleCards — GET /api/cards?pair_key=K
 //
 // Query params (all optional except pair_key):
@@ -209,28 +223,169 @@ func (s *Server) handleBoards(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"boards": out})
 }
 
-// handleCardStatus — POST /api/cards/{id}/status
+// handleCreateCard — POST /api/cards
 //
-// Body: {"status": "todo|in_progress|in_review|done|cancelled"}
+// Body: {"pair_key": "...", "title": "...", "body": "...",
+//        "needs_role": "...", "priority": 0, "created_by": "...",
+//        "tags": ["..."], "context_refs": {...}}
 //
-// Used by the kanban SPA when a card is dragged between columns.
-// Returns the updated card on success, mirroring /api/cards row shape.
-func (s *Server) handleCardStatus(w http.ResponseWriter, r *http.Request) {
+// pair_key + title are required. created_by defaults to "owner" so a
+// human can create from the web UI without an explicit identity (mirrors
+// the auto-register-owner pattern in /api/send).
+//
+// Returns the new card row on 201.
+func (s *Server) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var body struct {
+		PairKey     string          `json:"pair_key"`
+		Title       string          `json:"title"`
+		Body        string          `json:"body"`
+		NeedsRole   string          `json:"needs_role"`
+		CreatedBy   string          `json:"created_by"`
+		Priority    int             `json:"priority"`
+		Tags        json.RawMessage `json:"tags"`
+		ContextRefs json.RawMessage `json:"context_refs"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.PairKey == "" || body.Title == "" {
+		writeJSONError(w, http.StatusBadRequest, "pair_key and title are required")
+		return
+	}
+	if body.CreatedBy == "" {
+		body.CreatedBy = "owner"
+	}
 
-	// Path: /api/cards/{id}/status
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	card, err := st.CreateCard(ctx, sqlitestore.CreateCardParams{
+		PairKey:     body.PairKey,
+		HomeHost:    sqlitestore.SelfHost(),
+		Title:       body.Title,
+		Body:        body.Body,
+		NeedsRole:   body.NeedsRole,
+		CreatedBy:   body.CreatedBy,
+		Priority:    body.Priority,
+		Tags:        string(body.Tags),
+		ContextRefs: string(body.ContextRefs),
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, cardToJSON(card))
+}
+
+// handleUpdateCard — POST /api/cards/{id}/update
+//
+// Body: {"title"?, "body"?, "needs_role"?, "priority"?,
+//        "tags"?, "context_refs"?}
+//
+// Partial update — only fields present in the body are mutated. Status,
+// claim ownership, and dependency edges have dedicated endpoints.
+//
+// Returns the updated card row.
+func (s *Server) handleUpdateCard(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Title       *string          `json:"title"`
+		Body        *string          `json:"body"`
+		NeedsRole   *string          `json:"needs_role"`
+		Priority    *int             `json:"priority"`
+		Tags        *json.RawMessage `json:"tags"`
+		ContextRefs *json.RawMessage `json:"context_refs"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	params := sqlitestore.UpdateCardFieldsParams{
+		Title: body.Title, Body: body.Body,
+		NeedsRole: body.NeedsRole, Priority: body.Priority,
+	}
+	if body.Tags != nil {
+		s := string(*body.Tags)
+		params.Tags = &s
+	}
+	if body.ContextRefs != nil {
+		s := string(*body.ContextRefs)
+		params.ContextRefs = &s
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	card, err := st.UpdateCardFields(ctx, id, params)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		writeJSONError(w, http.StatusNotFound, "card not found")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cardToJSON(card))
+}
+
+// handleCardSubpath demultiplexes /api/cards/{id}/{verb} requests.
+// Currently routes:
+//   - /api/cards/{id}/status → handleCardStatus
+//   - /api/cards/{id}/update → handleUpdateCard
+func (s *Server) handleCardSubpath(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/cards/")
 	parts := strings.Split(path, "/")
-	if len(parts) != 2 || parts[1] != "status" {
+	if len(parts) != 2 {
 		writeJSONError(w, http.StatusNotFound, "not found")
 		return
 	}
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || id <= 0 {
 		writeJSONError(w, http.StatusBadRequest, "card id must be a positive integer")
+		return
+	}
+	switch parts[1] {
+	case "status":
+		s.handleCardStatus(w, r, id)
+	case "update":
+		s.handleUpdateCard(w, r, id)
+	case "context":
+		s.handleCardContext(w, r, id)
+	default:
+		writeJSONError(w, http.StatusNotFound, "unknown card verb")
+	}
+}
+
+// handleCardStatus — POST /api/cards/{id}/status
+//
+// Body: {"status": "todo|in_progress|in_review|done|cancelled"}
+//
+// Used by the kanban SPA when a card is dragged between columns.
+// Returns the updated card on success, mirroring /api/cards row shape.
+func (s *Server) handleCardStatus(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
