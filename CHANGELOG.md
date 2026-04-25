@@ -43,6 +43,17 @@ Commit SHAs reference the `agent-collaboration` repo.
   - `GET /cards?pair_key=K` — 5-column kanban-board SPA, 3s polling
     refresh (no SSE).
   - `/` index now shows a `cards` link on each room row. (`0f21c19`)
+- **Card context resolver + `GET /api/cards/{id}/context` endpoint.**
+  New `go/cmd/peer-web/server/context.go` turns a card's
+  `context_refs` (files, urls, msg_ids, cards) into a single resolved
+  bundle so a worker can read the spec without spelunking the repo.
+  Per-resource caps (200 KB per file, 200 KB per URL, 2 MB total) and
+  an 8s URL fetch timeout keep bundles bounded; soft-fails per ref
+  (each row carries its own `error` field) so the bundle never
+  silently drops a missing file. File reads require absolute paths
+  and reject `/etc/`, `/proc/`, `/sys/`, `/dev/`. Same resolver
+  feeds the drawer Context panel today and the Shape B spawn-worker
+  orchestrator later — one code path, two surfaces.
 
 ### Changed
 - **Card flag naming normalized.** `--card` is the preferred flag on
