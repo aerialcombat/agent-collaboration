@@ -132,17 +132,21 @@ func runCardList(args []string) int {
 	return emitCards(cards, *format)
 }
 
-// runCardGet — card-get --id N [--format]
+// runCardGet — card-get --card N (alias: --id) [--format]
 func runCardGet(args []string) int {
 	fs := flag.NewFlagSet("card-get", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	id := fs.Int64("id", 0, "card id (required)")
+	id := fs.Int64("id", 0, "card id (alias of --card)")
+	cardID := fs.Int64("card", 0, "card id (required)")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	if *cardID != 0 {
+		*id = *cardID
+	}
 	if *id == 0 {
-		fmt.Fprintln(os.Stderr, "card-get: --id required")
+		fmt.Fprintln(os.Stderr, "card-get: --card required")
 		return exitUsage
 	}
 	ctx, cancel := cardCtx()
@@ -166,19 +170,23 @@ func runCardGet(args []string) int {
 	return emitCard(card, *format)
 }
 
-// runCardClaim — card-claim --id N --as LABEL [--force] [--format]
+// runCardClaim — card-claim --card N (alias: --id) --as LABEL [--force] [--format]
 func runCardClaim(args []string) int {
 	fs := flag.NewFlagSet("card-claim", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	id := fs.Int64("id", 0, "card id (required)")
+	id := fs.Int64("id", 0, "card id (alias of --card)")
+	cardID := fs.Int64("card", 0, "card id (required)")
 	label := fs.String("as", "", "claimer label (required)")
 	force := fs.Bool("force", false, "override prior claim by a different label")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	if *cardID != 0 {
+		*id = *cardID
+	}
 	if *id == 0 || *label == "" {
-		fmt.Fprintln(os.Stderr, "card-claim: --id and --as required")
+		fmt.Fprintln(os.Stderr, "card-claim: --card and --as required")
 		return exitUsage
 	}
 	ctx, cancel := cardCtx()
@@ -206,19 +214,24 @@ func runCardClaim(args []string) int {
 	return emitCard(card, *format)
 }
 
-// runCardUpdateStatus — card-update-status --id N --status S [--format]
+// runCardUpdateStatus — card-update-status --card N (alias: --id) --status S [--as LABEL] [--format]
 func runCardUpdateStatus(args []string) int {
 	fs := flag.NewFlagSet("card-update-status", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	id := fs.Int64("id", 0, "card id (required)")
+	id := fs.Int64("id", 0, "card id (alias of --card)")
+	cardID := fs.Int64("card", 0, "card id (required)")
 	status := fs.String("status", "", "new status (required): "+
 		"todo|in_progress|in_review|done|cancelled")
+	_ = fs.String("as", "", "optional audit label (accepted, currently unused)")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	if *cardID != 0 {
+		*id = *cardID
+	}
 	if *id == 0 || *status == "" {
-		fmt.Fprintln(os.Stderr, "card-update-status: --id and --status required")
+		fmt.Fprintln(os.Stderr, "card-update-status: --card and --status required")
 		return exitUsage
 	}
 	ctx, cancel := cardCtx()
