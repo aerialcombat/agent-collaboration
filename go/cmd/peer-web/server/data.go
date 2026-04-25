@@ -35,6 +35,7 @@ type webStore interface {
 	ForwardLocalPush(ctx context.Context, label, pairKey string, payload map[string]any) (int, string, error)
 	SweepStaleActive(ctx context.Context, cutoff time.Duration, now time.Time) (int64, error)
 	ListCards(ctx context.Context, filter sqlitestore.CardListFilter) ([]*sqlitestore.Card, error)
+	UpdateCardStatus(ctx context.Context, id int64, status string) (*sqlitestore.Card, error)
 	Close() error
 }
 

@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
@@ -144,6 +146,69 @@ func cardToJSON(c *sqlitestore.Card) map[string]any {
 		m["completed_at"] = c.CompletedAt
 	}
 	return m
+}
+
+// handleCardStatus — POST /api/cards/{id}/status
+//
+// Body: {"status": "todo|in_progress|in_review|done|cancelled"}
+//
+// Used by the kanban SPA when a card is dragged between columns.
+// Returns the updated card on success, mirroring /api/cards row shape.
+func (s *Server) handleCardStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Path: /api/cards/{id}/status
+	path := strings.TrimPrefix(r.URL.Path, "/api/cards/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[1] != "status" {
+		writeJSONError(w, http.StatusNotFound, "not found")
+		return
+	}
+	id, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || id <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "card id must be a positive integer")
+		return
+	}
+
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Status == "" {
+		writeJSONError(w, http.StatusBadRequest, "status is required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	card, err := st.UpdateCardStatus(ctx, id, body.Status)
+	if errors.Is(err, sqlitestore.ErrCardNotFound) {
+		writeJSONError(w, http.StatusNotFound, "card not found")
+		return
+	}
+	if errors.Is(err, sqlitestore.ErrCardInvalidStatus) {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cardToJSON(card))
 }
 
 func parseBool(s string) bool {
