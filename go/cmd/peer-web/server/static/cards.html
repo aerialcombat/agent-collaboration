@@ -565,6 +565,16 @@
   }
   .btn-board:disabled { opacity: .5; cursor: not-allowed; }
   .btn-board .glyph { font-size: 11px; line-height: 1; }
+  .btn-board.gear {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-tertiary);
+    padding: 5px 9px;
+  }
+  .btn-board.gear:hover {
+    background: rgba(255,255,255,0.08);
+    color: var(--fg-primary);
+  }
   .drain-status {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 11px; font-weight: 510;
@@ -1131,12 +1141,9 @@
   <h1>__CWD__</h1>
   <span class=sub id=status>loading…</span>
   <span id=drain-badge style="display:none"></span>
-  <label class=drain-promote-toggle title="Auto-promote in_review → done so chained cards can unblock">
-    <input type=checkbox id=drain-auto-promote>
-    auto-promote
-  </label>
   <button class="btn-board start" id=btn-board-start><span class=glyph>▶</span> Start board</button>
   <button class="btn-board stop" id=btn-board-stop style="display:none"><span class=glyph>◼</span> Stop</button>
+  <button class="btn-board gear" id=btn-board-settings title="Board settings (drainer config)" aria-label="Board settings"><span class=glyph>⚙</span></button>
   <button class=btn-primary id=btn-new-card><span class=plus>+</span>New card</button>
   <a href=/cards title="all kanban boards">boards</a>
   <a href=/ title="back to rooms">rooms</a>
@@ -1189,6 +1196,42 @@
   <div class=actions>
     <button type=button class="btn ghost" id=cf-cancel>Cancel</button>
     <button type=submit class="btn primary" id=cf-submit form=create-form>Create card</button>
+  </div>
+</aside>
+
+<aside class="modal" id=settings-modal aria-hidden=true role=dialog aria-labelledby=settings-modal-title>
+  <div class=mh>
+    <span class=title id=settings-modal-title>Board settings — <code style="color:var(--accent);font-family:ui-monospace,SF Mono,Menlo,monospace" id=sf-pair-key-display></code></span>
+    <button class=close id=settings-modal-close aria-label="close">×</button>
+  </div>
+  <form class=mb id=settings-form>
+    <div>
+      <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-weight:400;color:var(--fg-secondary);margin-bottom:0;cursor:pointer">
+        <input type=checkbox id=sf-auto-drain style="width:auto;margin:0">
+        Auto-drain — keep dispatching ready cards until the queue is empty
+      </label>
+    </div>
+    <div>
+      <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-weight:400;color:var(--fg-secondary);margin-bottom:0;cursor:pointer">
+        <input type=checkbox id=sf-auto-promote style="width:auto;margin:0">
+        Auto-promote in_review → done when downstream blockees exist
+      </label>
+    </div>
+    <div class=row2>
+      <div>
+        <label for=sf-max-concurrent>Max concurrent runs</label>
+        <input type=number id=sf-max-concurrent min=1 step=1 required>
+      </div>
+      <div>
+        <label for=sf-poll-interval>Poll interval (sec)</label>
+        <input type=number id=sf-poll-interval min=1 step=1 required>
+      </div>
+    </div>
+    <div class=err id=sf-err></div>
+  </form>
+  <div class=actions>
+    <button type=button class="btn ghost" id=sf-cancel>Cancel</button>
+    <button type=submit class="btn primary" id=sf-submit form=settings-form>Save</button>
   </div>
 </aside>
 
@@ -1666,7 +1709,6 @@
   const startBtn = document.getElementById('btn-board-start');
   const stopBtn = document.getElementById('btn-board-stop');
   const drainBadge = document.getElementById('drain-badge');
-  const autoPromoteToggle = document.getElementById('drain-auto-promote');
 
   async function refreshBoardStatus() {
     try {
@@ -1697,9 +1739,8 @@
   startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     try {
-      const auto = autoPromoteToggle.checked ? '1' : '0';
       const r = await fetch(
-        `/api/boards/${encodeURIComponent(pairKey)}/start?auto_promote=${auto}`,
+        `/api/boards/${encodeURIComponent(pairKey)}/start`,
         { method: 'POST' });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
@@ -1730,6 +1771,83 @@
       showToast(`Stop failed: ${err.message}`, 'error');
     } finally {
       stopBtn.disabled = false;
+    }
+  });
+
+  // --- Board settings modal ---------------------------------------------
+  const settingsBtn = document.getElementById('btn-board-settings');
+  const settingsModal = document.getElementById('settings-modal');
+  const settingsForm = document.getElementById('settings-form');
+  const settingsErr = document.getElementById('sf-err');
+  const settingsSubmit = document.getElementById('sf-submit');
+  const sfAutoDrain = document.getElementById('sf-auto-drain');
+  const sfAutoPromote = document.getElementById('sf-auto-promote');
+  const sfMaxConcurrent = document.getElementById('sf-max-concurrent');
+  const sfPollInterval = document.getElementById('sf-poll-interval');
+  const sfPairKeyDisplay = document.getElementById('sf-pair-key-display');
+
+  function openSettingsModal() {
+    settingsErr.classList.remove('show');
+    settingsErr.textContent = '';
+    sfPairKeyDisplay.textContent = pairKey;
+    sfAutoDrain.checked = false;
+    sfAutoPromote.checked = false;
+    sfMaxConcurrent.value = '';
+    sfPollInterval.value = '';
+    settingsModal.classList.add('open');
+    settingsModal.setAttribute('aria-hidden', 'false');
+    createBackdrop.classList.add('open');
+    fetch(`/api/boards/${encodeURIComponent(pairKey)}/settings`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+      .then(d => {
+        sfAutoDrain.checked = !!d.auto_drain;
+        sfAutoPromote.checked = !!d.auto_promote;
+        sfMaxConcurrent.value = d.max_concurrent;
+        sfPollInterval.value = d.poll_interval_secs;
+      })
+      .catch(err => {
+        settingsErr.textContent = `Load failed: ${err.message}`;
+        settingsErr.classList.add('show');
+      });
+  }
+  function closeSettingsModal() {
+    settingsModal.classList.remove('open');
+    settingsModal.setAttribute('aria-hidden', 'true');
+    createBackdrop.classList.remove('open');
+  }
+
+  settingsBtn.addEventListener('click', openSettingsModal);
+  document.getElementById('settings-modal-close').addEventListener('click', closeSettingsModal);
+  document.getElementById('sf-cancel').addEventListener('click', closeSettingsModal);
+
+  settingsForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    settingsErr.classList.remove('show');
+    settingsSubmit.disabled = true;
+    const payload = {
+      auto_drain:         sfAutoDrain.checked,
+      auto_promote:       sfAutoPromote.checked,
+      max_concurrent:     parseInt(sfMaxConcurrent.value, 10),
+      poll_interval_secs: parseInt(sfPollInterval.value, 10),
+    };
+    try {
+      const r = await fetch(`/api/boards/${encodeURIComponent(pairKey)}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      closeSettingsModal();
+      showToast('Settings saved', 'ok');
+      refreshBoardStatus();
+    } catch (err) {
+      settingsErr.textContent = err.message;
+      settingsErr.classList.add('show');
+    } finally {
+      settingsSubmit.disabled = false;
     }
   });
 
