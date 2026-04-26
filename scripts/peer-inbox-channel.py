@@ -331,6 +331,47 @@ CARD_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "card_runs",
+        "description": (
+            "List dispatch runs for a card, newest first. Each row is "
+            "one worker invocation (manual ▶ Run, drainer dispatch, or "
+            "Phase 4 matchmaker assignment) with pid, started/ended "
+            "timestamps, status, and exit code. Useful for inspecting "
+            "why a card was retried or what a previous run produced."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 0, "default": 0},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "board_set",
+        "description": (
+            "Update per-board drainer settings. Flipping auto_drain "
+            "on causes peer-web to dispatch ready+unclaimed cards "
+            "continuously (capped by max_concurrent). auto_promote "
+            "auto-flips in_review→done when downstream blockees are "
+            "still open. Absent fields stay unchanged."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "minLength": 1},
+                "auto_drain": {"type": "boolean"},
+                "max_concurrent": {"type": "integer", "minimum": 1},
+                "auto_promote": {"type": "boolean"},
+                "poll_interval_secs": {"type": "integer", "minimum": 1},
+            },
+            "required": ["pair_key"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 _stdout_lock = threading.Lock()
@@ -943,6 +984,57 @@ def _card_remove_dependency(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_runs(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    limit = arguments.get("limit", 0)
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required (positive integer)")
+        return
+    if not isinstance(limit, int) or limit < 0:
+        _tool_error(req_id, "error: `limit` must be non-negative integer")
+        return
+    args = ["--card", str(cid), "--format", "json"]
+    if limit > 0:
+        args += ["--limit", str(limit)]
+    ok, msg, parsed = _shell_card_verb("card-runs", args)
+    if not ok:
+        _tool_error(req_id, f"card_runs: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else [])
+
+
+def _board_set(req_id, arguments: dict) -> None:
+    pair_key = arguments.get("pair_key")
+    if not isinstance(pair_key, str) or not pair_key:
+        _tool_error(req_id, "error: `pair_key` required (non-empty string)")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    args = ["--pair-key", pair_key, "--format", "json"]
+    if label:
+        args += ["--as", label]
+    if "auto_drain" in arguments:
+        args += ["--auto-drain", "on" if arguments["auto_drain"] else "off"]
+    if "max_concurrent" in arguments:
+        mc = arguments["max_concurrent"]
+        if not isinstance(mc, int) or mc < 1:
+            _tool_error(req_id, "error: `max_concurrent` must be integer >= 1")
+            return
+        args += ["--max-concurrent", str(mc)]
+    if "auto_promote" in arguments:
+        args += ["--auto-promote", "on" if arguments["auto_promote"] else "off"]
+    if "poll_interval_secs" in arguments:
+        pi = arguments["poll_interval_secs"]
+        if not isinstance(pi, int) or pi < 1:
+            _tool_error(req_id, "error: `poll_interval_secs` must be integer >= 1")
+            return
+        args += ["--poll-interval-secs", str(pi)]
+    ok, msg, parsed = _shell_card_verb("board-set", args)
+    if not ok:
+        _tool_error(req_id, f"board_set: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 CARD_TOOL_HANDLERS = {
     "card_create": _card_create,
     "card_list": _card_list,
@@ -953,6 +1045,8 @@ CARD_TOOL_HANDLERS = {
     "card_comment": _card_comment,
     "card_add_dependency": _card_add_dependency,
     "card_remove_dependency": _card_remove_dependency,
+    "card_runs": _card_runs,
+    "board_set": _board_set,
 }
 
 

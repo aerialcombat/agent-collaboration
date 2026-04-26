@@ -127,6 +127,10 @@ func run(args []string) int {
 		return runCardAddDep(rest)
 	case "card-remove-dep":
 		return runCardRemoveDep(rest)
+	case "card-runs":
+		return runCardRuns(rest)
+	case "board-set":
+		return runBoardSet(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
