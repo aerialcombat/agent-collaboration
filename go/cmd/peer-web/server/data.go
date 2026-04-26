@@ -44,6 +44,18 @@ type webStore interface {
 	GetCard(ctx context.Context, id int64) (*sqlitestore.Card, error)
 	MessagesByIDs(ctx context.Context, ids []int64) ([]sqlitestore.WebMessage, error)
 	ClaimCard(ctx context.Context, id int64, label string, force bool) (*sqlitestore.Card, error)
+	// v3.11 Phase 1 — durable runs + per-board drainer settings.
+	CreateCardRun(ctx context.Context, params sqlitestore.CreateCardRunParams) (*sqlitestore.CardRun, error)
+	UpdateCardRunPID(ctx context.Context, id int64, pid int) error
+	FinishCardRun(ctx context.Context, id int64, status string, exitCode int) error
+	GetCardRun(ctx context.Context, id int64) (*sqlitestore.CardRun, error)
+	ListCardRunsByCard(ctx context.Context, cardID int64, limit int) ([]*sqlitestore.CardRun, error)
+	ListRunningCardRuns(ctx context.Context, host string) ([]*sqlitestore.CardRun, error)
+	CountRunningForBoard(ctx context.Context, pairKey, host string) (int, error)
+	HasRunningRunForCard(ctx context.Context, cardID int64) (bool, error)
+	GetBoardSettings(ctx context.Context, pairKey string) (sqlitestore.BoardSettings, error)
+	ListBoardSettingsAutoDrain(ctx context.Context) ([]sqlitestore.BoardSettings, error)
+	UpsertBoardSettings(ctx context.Context, b sqlitestore.BoardSettings) error
 	Close() error
 }
 
