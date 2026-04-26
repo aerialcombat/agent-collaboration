@@ -35,11 +35,13 @@ type Server struct {
 	http   *http.Server
 	static fs.FS
 
-	// Per-pair_key drainer goroutines spawned by the global Start
-	// button. drainersMu guards drainers; the drainer struct itself
-	// has its own mutex for snapshot-vs-mutation.
+	// Per-pair_key standing drainer goroutines (Phase 1). drainersMu
+	// guards drainers; the drainer struct itself has its own mutex for
+	// snapshot-vs-mutation. serveCtx is the parent context drainers bind
+	// to, set when Serve starts; cancelled on shutdown.
 	drainersMu sync.Mutex
 	drainers   map[string]*drainer
+	serveCtx   context.Context
 }
 
 //go:embed static/*
@@ -81,12 +83,29 @@ func New(cfg Config) (*Server, error) {
 // Serve blocks until ctx is cancelled or ListenAndServe errors. Returns
 // nil on clean shutdown (ctx.Done), or the underlying error otherwise.
 func (s *Server) Serve(ctx context.Context) error {
+	s.serveCtx = ctx
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.http.ListenAndServe() }()
 
 	// v3.8: start the stale-active watchdog. Runs for the server's
 	// lifetime; cancels cleanly when ctx is cancelled.
 	go s.runStaleActiveWatchdog(ctx)
+
+	// v3.11: reap orphaned card_runs from the previous peer-web run,
+	// then reconstruct standing drainers for boards with auto_drain=1.
+	// Best-effort — failures log but don't prevent server start.
+	bootCtx, bootCancel := context.WithTimeout(ctx, 30*time.Second)
+	if n, err := s.reapOrphanedRuns(bootCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "peer-web boot: reap orphaned runs: %v\n", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "peer-web boot: reaped %d orphaned card_runs\n", n)
+	}
+	if n, err := s.reconstructAutoDrainBoards(bootCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "peer-web boot: reconstruct auto-drain boards: %v\n", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "peer-web boot: started %d auto-drain board drainers\n", n)
+	}
+	bootCancel()
 
 	select {
 	case <-ctx.Done():

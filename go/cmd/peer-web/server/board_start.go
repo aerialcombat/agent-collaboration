@@ -2,75 +2,83 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
 )
 
-// Shape B v1 — global "Start board" button. Clicking Start kicks off a
-// background drainer goroutine for that pair_key. The drainer:
+// v3.11 Phase 1 — standing drainer. board_settings.auto_drain is the
+// durable on/off. peer-web boot reads every row with auto_drain=1 and
+// spawns a drainer goroutine per pair_key; settings updates take
+// effect within one tick.
 //
-//   1. Polls every 5s for ready+unclaimed todo cards on the board.
-//   2. Dispatches each via runWorkerForCard (parallel — they're
-//      independent ready cards by definition).
-//   3. Optionally auto-promotes in_review → done so chained cards
-//      unblock without human review (opt-in via auto_promote=1).
-//   4. Exits when no work remains (no ready, no in_progress, no
-//      auto-promote candidates) — or when the user clicks Stop.
+// Per-tick logic:
 //
-// State lives in-memory (Server.drainers). Survives concurrent
-// Start-then-Stop-then-Start cycles via a per-pair_key mutex.
-// peer-web restart loses drainer state — workers already spawned
-// keep running (orphaned but functional); the user just doesn't see
-// the "draining" badge anymore. Acceptable trade-off for v0.
+//	1. Refresh BoardSettings (cheap; one indexed read).
+//	2. deficit = max_concurrent − count(card_runs WHERE running, host=self).
+//	3. If deficit > 0: SELECT ready+unclaimed cards, dispatch up to
+//	   deficit via dispatchWorkerForCard. Each dispatch writes a
+//	   card_runs row + spawns a monitor goroutine.
+//	4. If auto_promote: walk in_review cards with hasOpenBlockee
+//	   downstream, promote to done.
+//
+// Lifecycle: drainer goroutines exit on auto_drain=0 (settings flip
+// observed on next tick) or on Server context cancellation. The
+// drainer itself never decides "we're done" — async assignment means
+// new cards can arrive at any time. Only auto_drain=0 stops it.
 
 const (
-	drainerPollInterval = 5 * time.Second
-	drainerMaxRuntime   = 30 * time.Minute
+	defaultDrainerPollInterval = 5 * time.Second
 )
 
+// drainer holds the per-pair_key drainer goroutine state.
 type drainer struct {
-	pairKey     string
-	autoPromote bool
-	startedAt   time.Time
-	stopCh      chan struct{}
-	doneCh      chan struct{}
+	pairKey  string
+	cancel   context.CancelFunc
+	doneCh   chan struct{}
 
-	mu          sync.Mutex
-	dispatched  int
-	promoted    int
-	failures    int
-	lastErr     string
-	finishedAt  time.Time // zero if still running
+	mu         sync.Mutex
+	settings   sqlitestore.BoardSettings
+	dispatched int
+	failures   int
+	promoted   int
+	lastErr    string
+	lastTickAt time.Time
+	startedAt  time.Time
 }
 
 func (d *drainer) snapshot() map[string]any {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	out := map[string]any{
-		"pair_key":     d.pairKey,
-		"auto_promote": d.autoPromote,
-		"started_at":   d.startedAt.UTC().Format(time.RFC3339),
-		"dispatched":   d.dispatched,
-		"promoted":     d.promoted,
-		"failures":     d.failures,
-		"running":      d.finishedAt.IsZero(),
+		"pair_key":           d.pairKey,
+		"running":            true,
+		"started_at":         d.startedAt.UTC().Format(time.RFC3339),
+		"dispatched":         d.dispatched,
+		"failures":           d.failures,
+		"promoted":           d.promoted,
+		"max_concurrent":     d.settings.MaxConcurrent,
+		"auto_promote":       d.settings.AutoPromote,
+		"poll_interval_secs": d.settings.PollIntervalSecs,
+	}
+	if !d.lastTickAt.IsZero() {
+		out["last_tick_at"] = d.lastTickAt.UTC().Format(time.RFC3339)
 	}
 	if d.lastErr != "" {
 		out["last_error"] = d.lastErr
-	}
-	if !d.finishedAt.IsZero() {
-		out["finished_at"] = d.finishedAt.UTC().Format(time.RFC3339)
 	}
 	return out
 }
 
 // handleBoardSubpath demuxes /api/boards/{pair_key}/{verb}.
-// Supported verbs: start (POST), stop (POST), status (GET).
+// Supported verbs: start, stop, status, settings.
 func (s *Server) handleBoardSubpath(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/boards/")
 	idx := strings.LastIndex(rest, "/")
@@ -86,73 +94,106 @@ func (s *Server) handleBoardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleBoardStop(w, r)
 	case "status":
 		s.handleBoardStatus(w, r)
+	case "settings":
+		s.handleBoardSettings(w, r)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown board verb: "+verb)
 	}
 }
 
-// handleBoardStart — POST /api/boards/{pair_key}/start[?auto_promote=1]
+// handleBoardStart — POST /api/boards/{pair_key}/start
+//
+// Backward-compat shim: flips board_settings.auto_drain=1 (creating the
+// row if absent) and ensures the drainer goroutine is running. The
+// optional ?auto_promote=1 query param continues to work — sets
+// auto_promote in board_settings.
 func (s *Server) handleBoardStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	pairKey := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/boards/"), "/start")
-	if pairKey == "" || strings.Contains(pairKey, "/") {
+	pairKey := pairKeyFromBoardPath(r.URL.Path, "/start")
+	if pairKey == "" {
 		writeJSONError(w, http.StatusBadRequest, "pair_key required in path")
 		return
 	}
 	autoPromote := parseBool(r.URL.Query().Get("auto_promote"))
 
-	s.drainersMu.Lock()
-	if s.drainers == nil {
-		s.drainers = make(map[string]*drainer)
-	}
-	if d, ok := s.drainers[pairKey]; ok && d.finishedAt.IsZero() {
-		s.drainersMu.Unlock()
-		writeJSON(w, http.StatusConflict, d.snapshot())
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	d := &drainer{
-		pairKey:     pairKey,
-		autoPromote: autoPromote,
-		startedAt:   time.Now(),
-		stopCh:      make(chan struct{}),
-		doneCh:      make(chan struct{}),
+	defer st.Close()
+
+	cur, err := st.GetBoardSettings(ctx, pairKey)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	s.drainers[pairKey] = d
-	s.drainersMu.Unlock()
+	cur.AutoDrain = true
+	if autoPromote {
+		cur.AutoPromote = true
+	}
+	if cur.UpdatedBy == "" {
+		cur.UpdatedBy = "board-start"
+	}
+	if err := st.UpsertBoardSettings(ctx, cur); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
-	go s.runDrainer(d)
-
+	d := s.ensureDrainer(pairKey, cur)
 	writeJSON(w, http.StatusAccepted, d.snapshot())
 }
 
 // handleBoardStop — POST /api/boards/{pair_key}/stop
+//
+// Flips board_settings.auto_drain=0 (durable). The drainer goroutine
+// observes the change on its next tick and exits.
 func (s *Server) handleBoardStop(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	pairKey := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/boards/"), "/stop")
-	if pairKey == "" || strings.Contains(pairKey, "/") {
+	pairKey := pairKeyFromBoardPath(r.URL.Path, "/stop")
+	if pairKey == "" {
 		writeJSONError(w, http.StatusBadRequest, "pair_key required in path")
 		return
 	}
-	s.drainersMu.Lock()
-	d, ok := s.drainers[pairKey]
-	s.drainersMu.Unlock()
-	if !ok {
-		writeJSONError(w, http.StatusNotFound, "no drainer running for this pair_key")
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	select {
-	case <-d.stopCh:
-		// already closed
-	default:
-		close(d.stopCh)
+	defer st.Close()
+
+	cur, err := st.GetBoardSettings(ctx, pairKey)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	writeJSON(w, http.StatusOK, d.snapshot())
+	cur.AutoDrain = false
+	if cur.UpdatedBy == "" {
+		cur.UpdatedBy = "board-stop"
+	}
+	if err := st.UpsertBoardSettings(ctx, cur); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Cancel the in-memory goroutine immediately so the snapshot the
+	// caller sees reflects the new state. The goroutine would also
+	// notice on next tick, but that adds up to 5s of dead-air.
+	s.stopDrainer(pairKey)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pair_key":   pairKey,
+		"running":    false,
+		"auto_drain": false,
+	})
 }
 
 // handleBoardStatus — GET /api/boards/{pair_key}/status
@@ -161,8 +202,8 @@ func (s *Server) handleBoardStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	pairKey := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/boards/"), "/status")
-	if pairKey == "" || strings.Contains(pairKey, "/") {
+	pairKey := pairKeyFromBoardPath(r.URL.Path, "/status")
+	if pairKey == "" {
 		writeJSONError(w, http.StatusBadRequest, "pair_key required in path")
 		return
 	}
@@ -170,124 +211,199 @@ func (s *Server) handleBoardStatus(w http.ResponseWriter, r *http.Request) {
 	d, ok := s.drainers[pairKey]
 	s.drainersMu.Unlock()
 	if !ok {
+		// Fall back to the durable settings — the drainer might have
+		// been auto_drain=1 but peer-web hasn't restarted yet.
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		st, err := storeOpen(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		defer st.Close()
+		cur, err := st.GetBoardSettings(ctx, pairKey)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"pair_key": pairKey, "running": false,
+			"pair_key":           pairKey,
+			"running":            false,
+			"auto_drain":         cur.AutoDrain,
+			"max_concurrent":     cur.MaxConcurrent,
+			"auto_promote":       cur.AutoPromote,
+			"poll_interval_secs": cur.PollIntervalSecs,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, d.snapshot())
 }
 
-// runDrainer is the goroutine body. Detached from any HTTP request
-// context — uses context.Background() with the drainer's stopCh as
-// the cancellation signal, plus a hard 30-minute runtime ceiling so
-// a stuck drainer can't live forever.
-func (s *Server) runDrainer(d *drainer) {
-	defer close(d.doneCh)
-	defer func() {
+// ensureDrainer starts a goroutine for pair_key if one isn't already
+// running. settings is the current row (provided so callers don't need
+// a second DB roundtrip).
+func (s *Server) ensureDrainer(pairKey string, settings sqlitestore.BoardSettings) *drainer {
+	s.drainersMu.Lock()
+	defer s.drainersMu.Unlock()
+	if s.drainers == nil {
+		s.drainers = make(map[string]*drainer)
+	}
+	if d, ok := s.drainers[pairKey]; ok {
 		d.mu.Lock()
-		d.finishedAt = time.Now()
+		d.settings = settings
 		d.mu.Unlock()
-	}()
+		return d
+	}
+	ctx, cancel := context.WithCancel(s.drainerCtx())
+	d := &drainer{
+		pairKey:   pairKey,
+		cancel:    cancel,
+		doneCh:    make(chan struct{}),
+		settings:  settings,
+		startedAt: time.Now(),
+	}
+	s.drainers[pairKey] = d
+	go s.runDrainer(ctx, d)
+	return d
+}
 
-	deadline := time.NewTimer(drainerMaxRuntime)
-	defer deadline.Stop()
-
-	tick := time.NewTicker(drainerPollInterval)
-	defer tick.Stop()
-
-	// First tick immediately so the user sees activity within a couple
-	// hundred ms of clicking Start, not after a 5s wait.
-	for first := true; ; {
-		select {
-		case <-d.stopCh:
-			return
-		case <-deadline.C:
-			d.mu.Lock()
-			d.lastErr = "max runtime exceeded"
-			d.mu.Unlock()
-			return
-		default:
-		}
-		if !first {
-			select {
-			case <-d.stopCh:
-				return
-			case <-deadline.C:
-				d.mu.Lock()
-				d.lastErr = "max runtime exceeded"
-				d.mu.Unlock()
-				return
-			case <-tick.C:
-			}
-		}
-		first = false
-
-		more := s.drainerOnePass(d)
-		if !more {
-			return
-		}
+// stopDrainer cancels the goroutine for pair_key (if present) and
+// removes it from the map. Idempotent.
+func (s *Server) stopDrainer(pairKey string) {
+	s.drainersMu.Lock()
+	d, ok := s.drainers[pairKey]
+	if ok {
+		delete(s.drainers, pairKey)
+	}
+	s.drainersMu.Unlock()
+	if !ok {
+		return
+	}
+	d.cancel()
+	select {
+	case <-d.doneCh:
+	case <-time.After(2 * time.Second):
+		// Don't block API responses on a slow drainer exit.
 	}
 }
 
-// drainerOnePass does a single sweep. Returns true if the loop should
-// keep going (something might still be in flight or might unblock),
-// false if the board is fully drained.
-func (s *Server) drainerOnePass(d *drainer) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// drainerCtx returns the parent context for all drainer goroutines.
+// Bound to s.serveCtx so peer-web shutdown cancels every drainer.
+func (s *Server) drainerCtx() context.Context {
+	if s.serveCtx == nil {
+		return context.Background()
+	}
+	return s.serveCtx
+}
+
+// runDrainer is the per-pair_key goroutine body. Long-running until ctx
+// is cancelled or auto_drain flips to 0.
+func (s *Server) runDrainer(ctx context.Context, d *drainer) {
+	defer close(d.doneCh)
+
+	tick := time.NewTimer(0) // fire immediately
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		shouldExit := s.drainerOnePass(ctx, d)
+		if shouldExit {
+			return
+		}
+
+		d.mu.Lock()
+		interval := time.Duration(d.settings.PollIntervalSecs) * time.Second
+		d.mu.Unlock()
+		if interval < time.Second {
+			interval = defaultDrainerPollInterval
+		}
+		tick.Reset(interval)
+	}
+}
+
+// drainerOnePass runs one tick. Returns true when the goroutine should
+// exit (auto_drain flipped to 0).
+func (s *Server) drainerOnePass(parent context.Context, d *drainer) bool {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
 	st, err := storeOpen(ctx)
 	if err != nil {
-		d.mu.Lock()
-		d.lastErr = "open store: " + err.Error()
-		d.mu.Unlock()
-		return true // transient — try again next tick
+		d.recordTickErr("open store: " + err.Error())
+		return false
 	}
 	defer st.Close()
 
-	cards, err := st.ListCards(ctx, sqlitestore.CardListFilter{
-		PairKey: d.pairKey,
-	})
+	// Refresh settings every tick so UI updates take effect within one
+	// poll interval.
+	cur, err := st.GetBoardSettings(ctx, d.pairKey)
 	if err != nil {
-		d.mu.Lock()
-		d.lastErr = "list: " + err.Error()
-		d.mu.Unlock()
+		d.recordTickErr("settings: " + err.Error())
+		return false
+	}
+	d.mu.Lock()
+	d.settings = cur
+	d.mu.Unlock()
+
+	if !cur.AutoDrain {
+		// Owner flipped auto_drain off — exit cleanly.
 		return true
 	}
 
-	// Dispatch every ready+unclaimed todo card.
-	dispatched := 0
-	for _, c := range cards {
-		if c.Status != sqlitestore.CardStatusTodo || !c.Ready || c.ClaimedBy != "" {
-			continue
-		}
-		if _, err := runWorkerForCard(ctx, st, c); err != nil {
-			d.mu.Lock()
-			d.failures++
-			d.lastErr = fmt.Sprintf("dispatch #%d: %v", c.ID, err)
-			d.mu.Unlock()
-			continue
-		}
-		dispatched++
-		// Tiny stagger to reduce SQLITE_BUSY pressure on the next claim
-		// (busy_timeout handles it but no need to invite contention).
-		time.Sleep(50 * time.Millisecond)
+	// Capacity gate. Count running rows for this board on this host.
+	running, err := st.CountRunningForBoard(ctx, d.pairKey, sqlitestore.SelfHost())
+	if err != nil {
+		d.recordTickErr("count running: " + err.Error())
+		return false
+	}
+	deficit := cur.MaxConcurrent - running
+
+	cards, err := st.ListCards(ctx, sqlitestore.CardListFilter{PairKey: d.pairKey})
+	if err != nil {
+		d.recordTickErr("list cards: " + err.Error())
+		return false
 	}
 
-	// Auto-promote in_review → done if opted in. Only promotes cards
-	// that are blockers for some other card (i.e. promoting them
-	// actually unblocks downstream work). Standalone in_review cards
-	// stay there for a real human review.
+	dispatched := 0
+	if deficit > 0 {
+		for _, c := range cards {
+			if deficit <= 0 {
+				break
+			}
+			if c.Status != sqlitestore.CardStatusTodo || !c.Ready || c.ClaimedBy != "" {
+				continue
+			}
+			// Skip cards already mid-flight (defensive — claimed_by check
+			// above usually catches it, but a stale row could slip).
+			busy, err := st.HasRunningRunForCard(ctx, c.ID)
+			if err == nil && busy {
+				continue
+			}
+			if _, err := dispatchWorkerForCard(ctx, st, c, sqlitestore.CardRunTriggerDrainer); err != nil {
+				d.mu.Lock()
+				d.failures++
+				d.lastErr = fmt.Sprintf("dispatch #%d: %v", c.ID, err)
+				d.mu.Unlock()
+				continue
+			}
+			dispatched++
+			deficit--
+			// Tiny stagger reduces SQLite contention on burst dispatch.
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
 	promoted := 0
-	if d.autoPromote {
+	if cur.AutoPromote {
 		for _, c := range cards {
 			if c.Status != sqlitestore.CardStatusInReview {
 				continue
 			}
-			// Only promote if this card has at least one downstream
-			// blockee that is still todo (otherwise the promote is
-			// meaningless and clobbers a legitimate review queue).
 			if !hasOpenBlockee(c, cards) {
 				continue
 			}
@@ -305,38 +421,25 @@ func (s *Server) drainerOnePass(d *drainer) bool {
 	d.mu.Lock()
 	d.dispatched += dispatched
 	d.promoted += promoted
+	d.lastTickAt = time.Now()
+	if dispatched > 0 || promoted > 0 {
+		d.lastErr = ""
+	}
 	d.mu.Unlock()
-
-	// Decide whether to keep running. We stop when:
-	//   - no ready+unclaimed todos remain (nothing to dispatch this pass)
-	//   - AND no in_progress cards remain (nothing to wait on)
-	//   - AND (no auto-promote, OR no chain-blocker in_review cards remain)
-	hasReadyTodo := false
-	hasInProgress := false
-	hasChainReview := false
-	for _, c := range cards {
-		if c.Status == sqlitestore.CardStatusTodo && c.Ready && c.ClaimedBy == "" {
-			hasReadyTodo = true
-		}
-		if c.Status == sqlitestore.CardStatusInProgress {
-			hasInProgress = true
-		}
-		if c.Status == sqlitestore.CardStatusInReview && hasOpenBlockee(c, cards) {
-			hasChainReview = true
-		}
-	}
-	if hasReadyTodo || hasInProgress {
-		return true
-	}
-	if d.autoPromote && hasChainReview {
-		return true
-	}
 	return false
 }
 
+func (d *drainer) recordTickErr(msg string) {
+	d.mu.Lock()
+	d.lastErr = msg
+	d.lastTickAt = time.Now()
+	d.failures++
+	d.mu.Unlock()
+}
+
 // hasOpenBlockee is true when this card is a blocker for at least one
-// other card that's still in a non-terminal state. Used by
-// auto-promote to avoid clobbering legitimate review queues.
+// other card that's still in a non-terminal state. Used by auto-promote
+// to avoid clobbering legitimate review queues.
 func hasOpenBlockee(c *sqlitestore.Card, all []*sqlitestore.Card) bool {
 	if len(c.BlockeeIDs) == 0 {
 		return false
@@ -358,3 +461,98 @@ func hasOpenBlockee(c *sqlitestore.Card, all []*sqlitestore.Card) bool {
 	return false
 }
 
+// reapOrphanedRuns runs once at peer-web boot. Walks card_runs in
+// status='running' for self_host and finalizes them based on pid
+// liveness. The "die with parent" rule (Phase 1 plan §12 Q1) means
+// children don't usually survive a peer-web restart on Linux when
+// run under systemd's KillMode=mixed; on macOS they may survive but
+// we no longer hold the cmd.Wait handle, so we treat them as lost.
+//
+// Logic per row:
+//
+//	pid==0 OR kill(pid,0) returns ESRCH → mark 'lost', exit_code=-1.
+//	pid alive                            → also mark 'lost' (we lost
+//	                                       the wait handle on restart).
+//	                                       The orphan keeps running
+//	                                       until self-exit; output goes
+//	                                       to its log file unmonitored.
+//
+// This is the pragmatic answer over re-adopting via os.FindProcess +
+// poll-loop: the orphan can no longer post run_complete events with an
+// exit code, so claiming we "still know" what it's doing would be a
+// lie. Reaping to 'lost' is honest.
+func (s *Server) reapOrphanedRuns(ctx context.Context) (int, error) {
+	st, err := storeOpen(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer st.Close()
+
+	rows, err := st.ListRunningCardRuns(ctx, sqlitestore.SelfHost())
+	if err != nil {
+		return 0, err
+	}
+	reaped := 0
+	for _, r := range rows {
+		if r.PID > 0 && pidAlive(r.PID) {
+			fmt.Fprintf(os.Stderr,
+				"reaper: run=%d card=%d pid=%d still alive but unmonitored — marking lost\n",
+				r.ID, r.CardID, r.PID)
+		}
+		if err := st.FinishCardRun(ctx, r.ID, sqlitestore.CardRunStatusLost, -1); err != nil {
+			fmt.Fprintf(os.Stderr, "reaper: FinishCardRun run=%d: %v\n", r.ID, err)
+			continue
+		}
+		// Append a run_complete event so the timeline reflects reality.
+		_, _ = st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+			CardID: r.CardID, Kind: sqlitestore.CardEventRunComplete,
+			Author: "system",
+			Body:   fmt.Sprintf("run %d reaped on peer-web boot (was pid %d)", r.ID, r.PID),
+			Meta:   `{"status":"lost","reason":"peer_web_restart"}`,
+		})
+		reaped++
+	}
+	return reaped, nil
+}
+
+// pidAlive returns true when kill(pid, 0) doesn't return ESRCH.
+// Cross-platform; Go's syscall.Kill works on darwin + linux.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, syscall.ESRCH)
+}
+
+// reconstructAutoDrainBoards is the boot-time companion to the reaper.
+// Reads board_settings WHERE auto_drain=1 and starts a drainer for each.
+func (s *Server) reconstructAutoDrainBoards(ctx context.Context) (int, error) {
+	st, err := storeOpen(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer st.Close()
+	rows, err := st.ListBoardSettingsAutoDrain(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, b := range rows {
+		s.ensureDrainer(b.PairKey, b)
+	}
+	return len(rows), nil
+}
+
+// pairKeyFromBoardPath extracts {pair_key} from /api/boards/{pair_key}{suffix}.
+// Returns "" if the suffix isn't matched or pair_key is empty.
+func pairKeyFromBoardPath(path, suffix string) string {
+	rest := strings.TrimPrefix(path, "/api/boards/")
+	pk := strings.TrimSuffix(rest, suffix)
+	if pk == rest || pk == "" || strings.Contains(pk, "/") {
+		return ""
+	}
+	return pk
+}

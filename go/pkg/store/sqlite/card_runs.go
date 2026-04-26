@@ -111,6 +111,14 @@ func (s *SQLiteLocal) UpdateCardRunPID(ctx context.Context, id int64, pid int) e
 	return nil
 }
 
+// UpdateCardRunLogPath sets log_path on a row. Called once the spawn
+// is committed and we know where the file lives.
+func (s *SQLiteLocal) UpdateCardRunLogPath(ctx context.Context, id int64, logPath string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE card_runs SET log_path=? WHERE id=?`, nullableString(logPath), id)
+	return err
+}
+
 // FinishCardRun marks a card_run terminal — sets ended_at, status,
 // exit_code, and clears pid. Idempotent in the sense that re-finishing
 // an already-finished row is a no-op (the WHERE clause filters).
