@@ -7,7 +7,59 @@ Commit SHAs reference the `agent-collaboration` repo.
 
 ---
 
-## Unreleased — 2026-04-23 … 2026-04-25
+## Unreleased — 2026-04-23 … 2026-04-26
+
+### Added (2026-04-26 — v3.11 cards Phase 1: standing drainer + durable runs)
+- **Async drain.** Drainer flips from a one-shot wave to a per-board
+  standing goroutine. Setting `auto_drain=true` on a board causes
+  peer-web to dispatch ready+unclaimed cards continuously, capped at
+  `max_concurrent`. Newly-ready cards are picked up on the next tick
+  (default 5s) without a fresh Start click. (`b3e3af4`)
+- **Durable runs.** Migration `0011_card_runs_and_board_settings.sql`
+  (`GooseVersionRequired` 10 → 11) adds two tables and one column.
+  - `card_runs` — one row per worker dispatch with `pid`,
+    `started_at`, `host`, `worker_label`, `trigger`
+    (`manual|drainer|matchmaker`), `log_path`, terminal `status`
+    (`completed|failed|cancelled|lost`), `exit_code`, `ended_at`.
+    Source of truth for "what is running now".
+  - `board_settings` — per-`pair_key` durable drainer config:
+    `auto_drain`, `max_concurrent`, `auto_promote`,
+    `poll_interval_secs`. Replaces in-memory `Server.drainers` map.
+  - `cards.promotion_due_at` — reserved column for Phase 3 deferred
+    auto-promote (Phase 1 leaves it NULL).
+  - Schema reservations for Phases 2-6 (worker registration,
+    role-based assignment, federation) land in this migration so
+    later phases are pure additions. (`293f912`, `b12c858`)
+- **Reaper on peer-web boot.** Walks `card_runs WHERE status='running'
+  AND host=self` and marks every row `lost` — orphaned PIDs from a
+  prior peer-web no longer masquerade as live runs. Boot also
+  reconstructs a drainer goroutine for every board with
+  `auto_drain=1`, and a 3s sweep ensures DB writes from any shell
+  (e.g. `peer-inbox board-set` from a separate terminal) activate
+  drainers without a peer-web restart. (`b3e3af4`)
+- **Settings endpoint.** `GET/POST /api/boards/{pair_key}/settings`
+  returns and mutates the four `board_settings` knobs. POST
+  immediately mutates the in-memory drainers map (start / stop) so
+  UI changes take effect without waiting for the sweep. (`b3e3af4`)
+- **CLI + MCP verbs.** `peer-inbox board-set --pair-key K
+  [--auto-drain on|off] [--max-concurrent N] [--auto-promote on|off]
+  [--poll-interval-secs N]` and `peer-inbox card-runs --card N`,
+  matching `board_set` and `card_runs` MCP tools in
+  `scripts/peer-inbox-channel.py`. (`9a6a939`)
+- **Settings popover UI.** Gear button in the kanban header opens a
+  modal exposing all four `board_settings` knobs (auto_drain,
+  auto_promote, max_concurrent, poll_interval_secs). Replaces the
+  inline auto-promote checkbox; Start/Stop remain as one-click
+  shortcuts for `auto_drain` on/off. (`42daae0`)
+- **Phase 1 end-to-end harness** (`tests/cards-phase1-drainer.sh`)
+  drives an isolated peer-web on `:18799` with
+  `AGENT_COLLAB_WORKER_CMD` swapping `claude` for a fast shell-script
+  fake worker. 7 scenarios pass: cap enforcement, reap-on-kill, late
+  arrival, cap=1 invariant, live cap change, manual trigger, role
+  ignored. The `AGENT_COLLAB_WORKER_CMD` env override ships in
+  production (whitespace-split argv, no shell interpolation). (`57c6ded`)
+
+### Added
 
 ### Added
 - **v3.9 kanban medium — durable, addressed work artifact.** New
