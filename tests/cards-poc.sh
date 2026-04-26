@@ -51,7 +51,7 @@ SQL
   || fail "schema migrate"
 
 version="$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")"
-[ "$version" = "9" ] || fail "goose version $version, expected 9"
+[ "$version" = "10" ] || fail "goose version $version, expected 10"
 
 PK="cards-poc-$$"
 
