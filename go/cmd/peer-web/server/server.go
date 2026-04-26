@@ -107,6 +107,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	bootCancel()
 
+	// Periodic sweep so out-of-band auto_drain flips (e.g. CLI
+	// peer-inbox board-set in another shell) take effect within one
+	// sweep interval without requiring an HTTP roundtrip or a restart.
+	go s.runDrainerSweep(ctx)
+
 	select {
 	case <-ctx.Done():
 		return nil

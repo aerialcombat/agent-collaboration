@@ -546,6 +546,59 @@ func (s *Server) reconstructAutoDrainBoards(ctx context.Context) (int, error) {
 	return len(rows), nil
 }
 
+// drainerSweepInterval is how often runDrainerSweep polls for new
+// auto_drain boards added out-of-band (e.g. via the CLI board-set verb
+// running in another shell). 3s feels live enough that CLI-driven
+// workflows don't feel sticky, while keeping the read load to
+// "20/min" — one indexed query against board_settings.
+const drainerSweepInterval = 3 * time.Second
+
+// runDrainerSweep ticks every drainerSweepInterval, ensuring a goroutine
+// exists for every board with auto_drain=1. The sweep is what makes the
+// CLI (peer-inbox board-set --auto-drain on) "just work" without
+// requiring an HTTP roundtrip — operators who write to the DB directly
+// see drainers spin up within one sweep interval.
+//
+// The sweep does NOT stop drainers — auto_drain=0 detection is the
+// drainer's own per-tick responsibility (it observes settings.AutoDrain
+// flipping false and exits).
+func (s *Server) runDrainerSweep(ctx context.Context) {
+	tick := time.NewTicker(drainerSweepInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		s.sweepAutoDrainOnce(ctx)
+	}
+}
+
+func (s *Server) sweepAutoDrainOnce(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drainer sweep: open store: %v\n", err)
+		return
+	}
+	defer st.Close()
+	rows, err := st.ListBoardSettingsAutoDrain(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "drainer sweep: list: %v\n", err)
+		return
+	}
+	for _, b := range rows {
+		s.drainersMu.Lock()
+		_, present := s.drainers[b.PairKey]
+		s.drainersMu.Unlock()
+		if !present {
+			s.ensureDrainer(b.PairKey, b)
+		}
+	}
+}
+
 // pairKeyFromBoardPath extracts {pair_key} from /api/boards/{pair_key}{suffix}.
 // Returns "" if the suffix isn't matched or pair_key is empty.
 func pairKeyFromBoardPath(path, suffix string) string {

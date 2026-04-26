@@ -296,17 +296,33 @@ func monitorWorker(runID, cardID int64, label string, cmd *exec.Cmd, logFile *os
 	}
 }
 
-// spawnWorker launches `claude -p` non-blocking, redirecting stdout +
-// stderr to logFile. Returns the *exec.Cmd so the caller can attach a
-// monitor goroutine. Children inherit our process group, so they receive
-// SIGTERM when peer-web shuts down (the "die with parent" rule from the
-// Phase 1 plan §12).
+// spawnWorker launches the worker process non-blocking, redirecting
+// stdout + stderr to logFile. Returns the *exec.Cmd so the caller can
+// attach a monitor goroutine. Children inherit our process group, so
+// they receive SIGTERM when peer-web shuts down (the "die with parent"
+// rule from the Phase 1 plan §12).
+//
+// Default command: `claude -p --permission-mode=bypassPermissions
+// --max-turns=40` with the prompt piped on stdin.
+//
+// Override: AGENT_COLLAB_WORKER_CMD lets test harnesses or alt-LLM
+// experiments swap the binary. The env value is split on whitespace
+// and treated as the full argv (no shell interpolation). The prompt
+// is still piped on stdin. Example:
+//
+//	AGENT_COLLAB_WORKER_CMD="sh -c 'cat >/dev/null; sleep 1'"
+//
+// Above won't work as one expects because of the quote split — keep it
+// simple: AGENT_COLLAB_WORKER_CMD="/path/to/fake-worker.sh".
 func spawnWorker(prompt string, logFile *os.File) (*exec.Cmd, error) {
-	cmd := exec.Command("claude",
-		"-p",
-		"--permission-mode=bypassPermissions",
-		"--max-turns=40",
-	)
+	argv := defaultWorkerArgv
+	if override := os.Getenv("AGENT_COLLAB_WORKER_CMD"); override != "" {
+		argv = strings.Fields(override)
+	}
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("spawnWorker: empty argv (AGENT_COLLAB_WORKER_CMD parsed to nothing)")
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -314,6 +330,13 @@ func spawnWorker(prompt string, logFile *os.File) (*exec.Cmd, error) {
 		return nil, err
 	}
 	return cmd, nil
+}
+
+var defaultWorkerArgv = []string{
+	"claude",
+	"-p",
+	"--permission-mode=bypassPermissions",
+	"--max-turns=40",
 }
 
 // buildWorkerPrompt composes the prompt headless `claude -p` receives
