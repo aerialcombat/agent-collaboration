@@ -372,6 +372,89 @@ CARD_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "agent_create",
+        "description": (
+            "Register a new agent in the global registry (v3.12). An "
+            "agent is a config row, not a running process — pool members "
+            "reference it. label is unique; runtime is 'claude' or 'pi'. "
+            "Optional: role (matches cards.needs_role for auto-select), "
+            "worker_cmd (argv override), model_config (JSON blob)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "minLength": 1},
+                "runtime": {"type": "string", "enum": ["claude", "pi"]},
+                "role": {"type": "string"},
+                "worker_cmd": {"type": "string"},
+                "model_config": {"type": "string", "description": "JSON blob; pass already-stringified."},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["label", "runtime"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_list",
+        "description": "List all registered agents. enabled_only=true filters to enabled agents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enabled_only": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_get",
+        "description": "Fetch one agent by label or id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "minLength": 1},
+                "id": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_update",
+        "description": (
+            "Update an existing agent's mutable fields. Identify by label "
+            "or id. Absent fields stay unchanged; pass empty string to "
+            "clear role / worker_cmd / model_config."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "minLength": 1},
+                "id": {"type": "integer", "minimum": 1},
+                "runtime": {"type": "string", "enum": ["claude", "pi"]},
+                "role": {"type": "string"},
+                "worker_cmd": {"type": "string"},
+                "model_config": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_delete",
+        "description": (
+            "Delete an agent by label or id. Cascades to pool_members; "
+            "cards.assigned_to_agent_id and card_runs.agent_id are set "
+            "NULL on referenced rows."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "minLength": 1},
+                "id": {"type": "integer", "minimum": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 _stdout_lock = threading.Lock()
@@ -1035,6 +1118,127 @@ def _board_set(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _agent_create(req_id, arguments: dict) -> None:
+    label = arguments.get("label")
+    runtime = arguments.get("runtime")
+    if not isinstance(label, str) or not label:
+        _tool_error(req_id, "error: `label` required (non-empty string)")
+        return
+    if runtime not in ("claude", "pi"):
+        _tool_error(req_id, "error: `runtime` must be 'claude' or 'pi'")
+        return
+    args = ["--label", label, "--runtime", runtime, "--format", "json"]
+    if "role" in arguments:
+        if not isinstance(arguments["role"], str):
+            _tool_error(req_id, "error: `role` must be string")
+            return
+        args += ["--role", arguments["role"]]
+    if "worker_cmd" in arguments:
+        if not isinstance(arguments["worker_cmd"], str):
+            _tool_error(req_id, "error: `worker_cmd` must be string")
+            return
+        args += ["--worker-cmd", arguments["worker_cmd"]]
+    if "model_config" in arguments:
+        if not isinstance(arguments["model_config"], str):
+            _tool_error(req_id, "error: `model_config` must be string (JSON blob)")
+            return
+        args += ["--config", arguments["model_config"]]
+    if "enabled" in arguments:
+        args += ["--enabled", "on" if arguments["enabled"] else "off"]
+    ok, msg, parsed = _shell_card_verb("agent-create", args)
+    if not ok:
+        _tool_error(req_id, f"agent_create: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _agent_list(req_id, arguments: dict) -> None:
+    args = ["--format", "json"]
+    if arguments.get("enabled_only"):
+        args.append("--enabled-only")
+    ok, msg, parsed = _shell_card_verb("agent-list", args)
+    if not ok:
+        _tool_error(req_id, f"agent_list: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else [])
+
+
+def _agent_get(req_id, arguments: dict) -> None:
+    label = arguments.get("label")
+    aid = arguments.get("id")
+    if not (isinstance(label, str) and label) and not (isinstance(aid, int) and aid > 0):
+        _tool_error(req_id, "error: `label` or `id` required")
+        return
+    args = ["--format", "json"]
+    if isinstance(label, str) and label:
+        args += ["--label", label]
+    elif isinstance(aid, int):
+        args += ["--id", str(aid)]
+    ok, msg, parsed = _shell_card_verb("agent-get", args)
+    if not ok:
+        _tool_error(req_id, f"agent_get: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _agent_update(req_id, arguments: dict) -> None:
+    label = arguments.get("label")
+    aid = arguments.get("id")
+    if not (isinstance(label, str) and label) and not (isinstance(aid, int) and aid > 0):
+        _tool_error(req_id, "error: `label` or `id` required")
+        return
+    args = ["--format", "json"]
+    if isinstance(label, str) and label:
+        args += ["--label", label]
+    elif isinstance(aid, int):
+        args += ["--id", str(aid)]
+    if "runtime" in arguments:
+        if arguments["runtime"] not in ("claude", "pi"):
+            _tool_error(req_id, "error: `runtime` must be 'claude' or 'pi'")
+            return
+        args += ["--runtime", arguments["runtime"]]
+    if "role" in arguments:
+        if not isinstance(arguments["role"], str):
+            _tool_error(req_id, "error: `role` must be string")
+            return
+        args += ["--role", arguments["role"]]
+    if "worker_cmd" in arguments:
+        if not isinstance(arguments["worker_cmd"], str):
+            _tool_error(req_id, "error: `worker_cmd` must be string")
+            return
+        args += ["--worker-cmd", arguments["worker_cmd"]]
+    if "model_config" in arguments:
+        if not isinstance(arguments["model_config"], str):
+            _tool_error(req_id, "error: `model_config` must be string")
+            return
+        args += ["--config", arguments["model_config"]]
+    if "enabled" in arguments:
+        args += ["--enabled", "on" if arguments["enabled"] else "off"]
+    ok, msg, parsed = _shell_card_verb("agent-update", args)
+    if not ok:
+        _tool_error(req_id, f"agent_update: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _agent_delete(req_id, arguments: dict) -> None:
+    label = arguments.get("label")
+    aid = arguments.get("id")
+    if not (isinstance(label, str) and label) and not (isinstance(aid, int) and aid > 0):
+        _tool_error(req_id, "error: `label` or `id` required")
+        return
+    args = ["--format", "json"]
+    if isinstance(label, str) and label:
+        args += ["--label", label]
+    elif isinstance(aid, int):
+        args += ["--id", str(aid)]
+    ok, msg, parsed = _shell_card_verb("agent-delete", args)
+    if not ok:
+        _tool_error(req_id, f"agent_delete: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 CARD_TOOL_HANDLERS = {
     "card_create": _card_create,
     "card_list": _card_list,
@@ -1047,6 +1251,11 @@ CARD_TOOL_HANDLERS = {
     "card_remove_dependency": _card_remove_dependency,
     "card_runs": _card_runs,
     "board_set": _board_set,
+    "agent_create": _agent_create,
+    "agent_list": _agent_list,
+    "agent_get": _agent_get,
+    "agent_update": _agent_update,
+    "agent_delete": _agent_delete,
 }
 
 

@@ -131,6 +131,16 @@ func run(args []string) int {
 		return runCardRuns(rest)
 	case "board-set":
 		return runBoardSet(rest)
+	case "agent-create":
+		return runAgentCreate(rest)
+	case "agent-list":
+		return runAgentList(rest)
+	case "agent-get":
+		return runAgentGet(rest)
+	case "agent-update":
+		return runAgentUpdate(rest)
+	case "agent-delete":
+		return runAgentDelete(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
