@@ -54,8 +54,12 @@ const (
 	// activity monitoring; the hook binary writes these on every prompt.
 	// Bumped 9 → 10 for v3.10's 0010 migration that adds the
 	// card_events table backing the per-card timeline (Linear/GitHub
-	// style activity + comments stream).
-	GooseVersionRequired = 10
+	// style activity + comments stream). Bumped 10 → 12 for v3.12's
+	// 0012 migration (agents + pool_members + cards.assigned_to_agent_id
+	// + card_runs.agent_id) which subsumes the missed v3.11 Phase 1 bump
+	// (0011: card_runs + board_settings); the agents store layer reads
+	// the new columns, so pre-0012 DBs must fail the schema check first.
+	GooseVersionRequired = 12
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

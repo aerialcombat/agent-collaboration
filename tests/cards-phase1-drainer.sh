@@ -143,8 +143,8 @@ SQL
 
 "$MIG_BIN" -driver sqlite -dsn "$DB" -dir "$MIG_DIR" up >/dev/null 2>&1 \
   || fail "schema migrate"
-[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "11" ] \
-  || fail "goose version != 11"
+[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "12" ] \
+  || fail "goose version != 12"
 
 # --- D1: standing dispatch -------------------------------------------------
 PK1="phase1-d1-$$"
