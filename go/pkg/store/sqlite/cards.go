@@ -423,6 +423,8 @@ const (
 	CardEventBodyUpdate   = "body_update"
 	CardEventRunDispatch  = "run_dispatch"
 	CardEventRunComplete  = "run_complete"
+	CardEventAssigned     = "assigned"   // v3.12.4 — designated agent set
+	CardEventUnassigned   = "unassigned" // v3.12.4 — designation cleared
 )
 
 // CardEvent — one row in the per-card timeline.
@@ -479,10 +481,10 @@ func (s *SQLiteLocal) AssignCardToAgent(ctx context.Context, cardID, agentID int
 	}
 
 	// Audit event.
-	kind := "assigned"
+	kind := CardEventAssigned
 	body := ""
 	if agentID == 0 {
-		kind = "unassigned"
+		kind = CardEventUnassigned
 	} else {
 		// Look up label for human-readable body.
 		if a, err := s.GetAgent(ctx, agentID); err == nil {

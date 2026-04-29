@@ -159,6 +159,9 @@ func cardToJSON(c *sqlitestore.Card) map[string]any {
 	if c.CompletedAt != "" {
 		m["completed_at"] = c.CompletedAt
 	}
+	if c.AssignedToAgentID != 0 {
+		m["assigned_to_agent_id"] = c.AssignedToAgentID
+	}
 	return m
 }
 
@@ -383,9 +386,112 @@ func (s *Server) handleCardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleCardEvents(w, r, id)
 	case "comment":
 		s.handleCardComment(w, r, id)
+	case "assign":
+		s.handleCardAssign(w, r, id)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown card verb")
 	}
+}
+
+// handleCardAssign — POST/DELETE /api/cards/{id}/assign
+//
+//	POST   body: {"agent": "<label>"} → set assigned_to_agent_id
+//	DELETE                            → clear assigned_to_agent_id
+//
+// Logged on the card's activity timeline as an "assigned"/"unassigned"
+// event so the audit trail is queryable from the drawer.
+func (s *Server) handleCardAssign(w http.ResponseWriter, r *http.Request, id int64) {
+	switch r.Method {
+	case http.MethodPost:
+		s.handleCardAssignSet(w, r, id)
+	case http.MethodDelete:
+		s.handleCardAssignClear(w, r, id)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+type cardAssignBody struct {
+	Agent  string  `json:"agent"`
+	Author *string `json:"author"`
+}
+
+func (s *Server) handleCardAssignSet(w http.ResponseWriter, r *http.Request, id int64) {
+	var body cardAssignBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if body.Agent == "" {
+		writeJSONError(w, http.StatusBadRequest, "agent label required")
+		return
+	}
+	author := "system"
+	if body.Author != nil && *body.Author != "" {
+		author = *body.Author
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer st.Close()
+
+	a, err := st.GetAgentByLabel(ctx, body.Agent)
+	if err != nil {
+		if errors.Is(err, sqlitestore.ErrAgentNotFound) {
+			writeJSONError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	saved, err := st.AssignCardToAgent(ctx, id, a.ID, author)
+	if err != nil {
+		if errors.Is(err, sqlitestore.ErrCardNotFound) {
+			writeJSONError(w, http.StatusNotFound, "card not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"card_id":              saved.ID,
+		"assigned_to_agent_id": saved.AssignedToAgentID,
+		"agent_label":          a.Label,
+	})
+}
+
+func (s *Server) handleCardAssignClear(w http.ResponseWriter, r *http.Request, id int64) {
+	author := r.URL.Query().Get("author")
+	if author == "" {
+		author = "system"
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer st.Close()
+
+	saved, err := st.AssignCardToAgent(ctx, id, 0, author)
+	if err != nil {
+		if errors.Is(err, sqlitestore.ErrCardNotFound) {
+			writeJSONError(w, http.StatusNotFound, "card not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"card_id":              saved.ID,
+		"assigned_to_agent_id": nil,
+	})
 }
 
 // handleCardEvents — GET /api/cards/{id}/events

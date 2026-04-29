@@ -59,7 +59,11 @@ const (
 	// + card_runs.agent_id) which subsumes the missed v3.11 Phase 1 bump
 	// (0011: card_runs + board_settings); the agents store layer reads
 	// the new columns, so pre-0012 DBs must fail the schema check first.
-	GooseVersionRequired = 12
+	// Bumped 12 → 13 for v3.12.4 D3's 0013 migration that extends the
+	// card_events.kind CHECK to allow 'assigned' / 'unassigned' kinds
+	// emitted by AssignCardToAgent — pre-0013 DBs would reject the audit
+	// event insert with a constraint error.
+	GooseVersionRequired = 13
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

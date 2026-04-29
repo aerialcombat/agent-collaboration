@@ -515,6 +515,36 @@ CARD_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "card_assign",
+        "description": (
+            "Pin a specific agent to a card (v3.12.4). Designation "
+            "wins over auto-select in the drainer; if the agent is "
+            "disabled or deleted later, the drainer falls back to "
+            "auto-select rather than deadlocking the card."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "card_id": {"type": "integer", "minimum": 1},
+                "agent": {"type": "string", "minLength": 1},
+            },
+            "required": ["card_id", "agent"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "card_unassign",
+        "description": "Clear a card's designated agent. Drainer reverts to auto-select.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "card_id": {"type": "integer", "minimum": 1},
+            },
+            "required": ["card_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 _stdout_lock = threading.Lock()
@@ -1387,6 +1417,42 @@ def _pool_update(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_assign(req_id, arguments: dict) -> None:
+    cid = arguments.get("card_id")
+    agent = arguments.get("agent")
+    if not (isinstance(cid, int) and cid > 0):
+        _tool_error(req_id, "error: `card_id` required (positive integer)")
+        return
+    if not (isinstance(agent, str) and agent):
+        _tool_error(req_id, "error: `agent` required (non-empty string)")
+        return
+    args = ["--card", str(cid), "--agent", agent, "--format", "json"]
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if label:
+        args += ["--as", label]
+    ok, msg, parsed = _shell_card_verb("card-assign", args)
+    if not ok:
+        _tool_error(req_id, f"card_assign: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _card_unassign(req_id, arguments: dict) -> None:
+    cid = arguments.get("card_id")
+    if not (isinstance(cid, int) and cid > 0):
+        _tool_error(req_id, "error: `card_id` required (positive integer)")
+        return
+    args = ["--card", str(cid), "--format", "json"]
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if label:
+        args += ["--as", label]
+    ok, msg, parsed = _shell_card_verb("card-unassign", args)
+    if not ok:
+        _tool_error(req_id, f"card_unassign: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 CARD_TOOL_HANDLERS = {
     "card_create": _card_create,
     "card_list": _card_list,
@@ -1408,6 +1474,8 @@ CARD_TOOL_HANDLERS = {
     "pool_remove": _pool_remove,
     "pool_list": _pool_list,
     "pool_update": _pool_update,
+    "card_assign": _card_assign,
+    "card_unassign": _card_unassign,
 }
 
 

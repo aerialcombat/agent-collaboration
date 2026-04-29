@@ -149,6 +149,10 @@ func run(args []string) int {
 		return runPoolList(rest)
 	case "pool-update":
 		return runPoolUpdate(rest)
+	case "card-assign":
+		return runCardAssign(rest)
+	case "card-unassign":
+		return runCardUnassign(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK

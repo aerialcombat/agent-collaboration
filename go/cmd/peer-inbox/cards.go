@@ -561,6 +561,9 @@ func cardAsMap(c *sqlitestore.Card) map[string]any {
 	if c.CompletedAt != "" {
 		m["completed_at"] = c.CompletedAt
 	}
+	if c.AssignedToAgentID != 0 {
+		m["assigned_to_agent_id"] = c.AssignedToAgentID
+	}
 	return m
 }
 
