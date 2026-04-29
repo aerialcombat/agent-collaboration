@@ -115,7 +115,28 @@ func dispatchWorkerForCard(
 	if err != nil {
 		return nil, fmt.Errorf("random: %w", err)
 	}
+
+	// v3.12.4 — pool-aware dispatch. If a pool member matches (by
+	// designation, role, capacity), use its worker_cmd + tag the run.
+	// Empty pool / no match → label = "runner-{id}-{suffix}" + worker
+	// argv comes from AGENT_COLLAB_WORKER_CMD (Phase 1 fallback).
+	chosen, err := st.PickAgentForCard(ctx, card)
+	if err != nil {
+		return nil, fmt.Errorf("pick agent: %w", err)
+	}
+
 	label := fmt.Sprintf("runner-%d-%s", card.ID, suffix)
+	var agentID int64
+	var agentArgv []string
+	if chosen != nil {
+		label = fmt.Sprintf("%s-%d-%s", chosen.Label, card.ID, suffix)
+		agentID = chosen.ID
+		if chosen.WorkerCmd != "" {
+			agentArgv = strings.Fields(chosen.WorkerCmd)
+		} else {
+			agentArgv = defaultArgvForRuntime(chosen.Runtime)
+		}
+	}
 
 	// Insert the run row first so the reaper has something to find if we
 	// crash mid-dispatch. log_path is filled later (we don't know it
@@ -125,6 +146,7 @@ func dispatchWorkerForCard(
 		PairKey:     card.PairKey,
 		WorkerLabel: label,
 		Trigger:     trigger,
+		AgentID:     agentID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create card_run: %w", err)
@@ -170,7 +192,7 @@ func dispatchWorkerForCard(
 		return nil, fmt.Errorf("log file: %w", err)
 	}
 
-	cmd, err := spawnWorker(prompt, logFile)
+	cmd, err := spawnWorker(prompt, logFile, agentArgv)
 	if err != nil {
 		_ = logFile.Close()
 		_ = st.FinishCardRun(ctx, run.ID, sqlitestore.CardRunStatusFailed, -1)
@@ -192,14 +214,20 @@ func dispatchWorkerForCard(
 
 	// Append run_dispatch event with the run_id so the timeline can
 	// link to the runs tab without a JOIN.
-	dispatchMeta, _ := json.Marshal(map[string]any{
+	dispatchMetaMap := map[string]any{
 		"run_id":       run.ID,
 		"worker_label": label,
 		"pid":          pid,
 		"log_path":     logPath,
 		"prompt_bytes": len(prompt),
 		"trigger":      trigger,
-	})
+	}
+	if chosen != nil {
+		dispatchMetaMap["agent_id"] = chosen.ID
+		dispatchMetaMap["agent_label"] = chosen.Label
+		dispatchMetaMap["agent_runtime"] = chosen.Runtime
+	}
+	dispatchMeta, _ := json.Marshal(dispatchMetaMap)
 	if _, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
 		CardID: card.ID, Kind: sqlitestore.CardEventRunDispatch,
 		Author: "system",
@@ -214,14 +242,19 @@ func dispatchWorkerForCard(
 	// tick) can return immediately.
 	go monitorWorker(run.ID, card.ID, label, cmd, logFile)
 
-	return map[string]any{
+	resp := map[string]any{
 		"card_id":      card.ID,
 		"run_id":       run.ID,
 		"worker_label": label,
 		"pid":          pid,
 		"log_path":     logPath,
 		"prompt_bytes": len(prompt),
-	}, nil
+	}
+	if chosen != nil {
+		resp["agent_id"] = chosen.ID
+		resp["agent_label"] = chosen.Label
+	}
+	return resp, nil
 }
 
 // setCardRunLogPath patches log_path on a running row. Separate helper
@@ -302,25 +335,28 @@ func monitorWorker(runID, cardID int64, label string, cmd *exec.Cmd, logFile *os
 // they receive SIGTERM when peer-web shuts down (the "die with parent"
 // rule from the Phase 1 plan §12).
 //
-// Default command: `claude -p --permission-mode=bypassPermissions
-// --max-turns=40` with the prompt piped on stdin.
+// Argv resolution priority (v3.12.4):
 //
-// Override: AGENT_COLLAB_WORKER_CMD lets test harnesses or alt-LLM
-// experiments swap the binary. The env value is split on whitespace
-// and treated as the full argv (no shell interpolation). The prompt
-// is still piped on stdin. Example:
+//  1. perAgentArgv if non-nil — chosen pool member's worker_cmd or
+//     defaultArgvForRuntime(agent.runtime). Pool routing wins.
+//  2. AGENT_COLLAB_WORKER_CMD env (whitespace-split, no shell expansion)
+//     — test harnesses, ad-hoc overrides.
+//  3. Phase 1 default: claude -p --permission-mode=bypassPermissions
+//     --max-turns=40.
 //
-//	AGENT_COLLAB_WORKER_CMD="sh -c 'cat >/dev/null; sleep 1'"
-//
-// Above won't work as one expects because of the quote split — keep it
-// simple: AGENT_COLLAB_WORKER_CMD="/path/to/fake-worker.sh".
-func spawnWorker(prompt string, logFile *os.File) (*exec.Cmd, error) {
-	argv := defaultWorkerArgv
-	if override := os.Getenv("AGENT_COLLAB_WORKER_CMD"); override != "" {
-		argv = strings.Fields(override)
+// The prompt is piped on stdin in every case.
+func spawnWorker(prompt string, logFile *os.File, perAgentArgv []string) (*exec.Cmd, error) {
+	argv := perAgentArgv
+	if len(argv) == 0 {
+		if override := os.Getenv("AGENT_COLLAB_WORKER_CMD"); override != "" {
+			argv = strings.Fields(override)
+		}
 	}
 	if len(argv) == 0 {
-		return nil, fmt.Errorf("spawnWorker: empty argv (AGENT_COLLAB_WORKER_CMD parsed to nothing)")
+		argv = defaultWorkerArgv
+	}
+	if len(argv) == 0 {
+		return nil, fmt.Errorf("spawnWorker: empty argv")
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin = strings.NewReader(prompt)
@@ -337,6 +373,24 @@ var defaultWorkerArgv = []string{
 	"-p",
 	"--permission-mode=bypassPermissions",
 	"--max-turns=40",
+}
+
+// defaultArgvForRuntime returns the runtime-specific default argv for
+// a pool-routed dispatch when the agent's worker_cmd field is empty.
+// Pool members can opt-in to runtime defaults by leaving worker_cmd
+// blank; explicit worker_cmd always wins.
+func defaultArgvForRuntime(runtime string) []string {
+	switch runtime {
+	case sqlitestore.AgentRuntimeClaude:
+		return defaultWorkerArgv
+	case sqlitestore.AgentRuntimePi:
+		// pi headless one-shot — reads prompt on stdin, exits when done.
+		// The exact flag inventory varies across pi versions; keep this
+		// minimal and let operators override via worker_cmd when their
+		// pi build needs different switches.
+		return []string{"pi", "--once"}
+	}
+	return defaultWorkerArgv
 }
 
 // buildWorkerPrompt composes the prompt headless `claude -p` receives

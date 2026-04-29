@@ -207,6 +207,9 @@ func cardRunAsMap(r *sqlitestore.CardRun) map[string]any {
 	if r.LogPath != "" {
 		m["log_path"] = r.LogPath
 	}
+	if r.AgentID != 0 {
+		m["agent_id"] = r.AgentID
+	}
 	return m
 }
 

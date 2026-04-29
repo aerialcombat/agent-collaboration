@@ -44,6 +44,10 @@ type CardRun struct {
 	ExitCode    int    // ignored when Status='running'
 	LogPath     string // nullable; nulled by retention sweep
 	Trigger     string
+
+	// v3.12 — FK to the agent that ran this dispatch, when one was
+	// chosen from the pool. 0 = legacy / fallback dispatch.
+	AgentID int64
 }
 
 // CreateCardRunParams — explicit struct for inserting a new run.
@@ -54,6 +58,7 @@ type CreateCardRunParams struct {
 	WorkerLabel string
 	Trigger     string // defaults to 'manual' when empty
 	LogPath     string // optional; can be set later via UpdateCardRun
+	AgentID     int64  // v3.12 — 0 = legacy / fallback dispatch
 }
 
 // CreateCardRun inserts a new card_run row in status='running' with
@@ -71,11 +76,15 @@ func (s *SQLiteLocal) CreateCardRun(ctx context.Context, p CreateCardRunParams) 
 	}
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
+	var agentArg any
+	if p.AgentID != 0 {
+		agentArg = p.AgentID
+	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO card_runs (
-		  card_id, pair_key, host, worker_label, started_at, status, log_path, trigger
-		) VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
-	`, p.CardID, p.PairKey, p.Host, p.WorkerLabel, now, nullableString(p.LogPath), p.Trigger)
+		  card_id, pair_key, host, worker_label, started_at, status, log_path, trigger, agent_id
+		) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+	`, p.CardID, p.PairKey, p.Host, p.WorkerLabel, now, nullableString(p.LogPath), p.Trigger, agentArg)
 	if err != nil {
 		return nil, fmt.Errorf("insert card_runs: %w", err)
 	}
@@ -93,6 +102,7 @@ func (s *SQLiteLocal) CreateCardRun(ctx context.Context, p CreateCardRunParams) 
 		Status:      CardRunStatusRunning,
 		LogPath:     p.LogPath,
 		Trigger:     p.Trigger,
+		AgentID:     p.AgentID,
 	}, nil
 }
 
@@ -233,7 +243,8 @@ func (s *SQLiteLocal) HasRunningRunForCard(ctx context.Context, cardID int64) (b
 const cardRunSelectCols = `
 SELECT id, card_id, pair_key, host, worker_label,
        COALESCE(pid, 0), started_at, COALESCE(ended_at, ''),
-       status, COALESCE(exit_code, 0), COALESCE(log_path, ''), trigger
+       status, COALESCE(exit_code, 0), COALESCE(log_path, ''), trigger,
+       COALESCE(agent_id, 0)
   FROM card_runs`
 
 func scanCardRun(r rowScanner) (*CardRun, error) {
@@ -241,7 +252,7 @@ func scanCardRun(r rowScanner) (*CardRun, error) {
 	if err := r.Scan(
 		&c.ID, &c.CardID, &c.PairKey, &c.Host, &c.WorkerLabel,
 		&c.PID, &c.StartedAt, &c.EndedAt,
-		&c.Status, &c.ExitCode, &c.LogPath, &c.Trigger,
+		&c.Status, &c.ExitCode, &c.LogPath, &c.Trigger, &c.AgentID,
 	); err != nil {
 		return nil, err
 	}

@@ -69,6 +69,9 @@ type webStore interface {
 	ListPoolMembers(ctx context.Context, pairKey string) ([]sqlitestore.PoolMember, error)
 	UpdatePoolMember(ctx context.Context, pairKey string, agentID int64, p sqlitestore.UpdatePoolMemberParams) error
 	RemovePoolMember(ctx context.Context, pairKey string, agentID int64) error
+	// v3.12.4 — pool-aware dispatch + designated assignment.
+	PickAgentForCard(ctx context.Context, card *sqlitestore.Card) (*sqlitestore.Agent, error)
+	AssignCardToAgent(ctx context.Context, cardID, agentID int64, author string) (*sqlitestore.Card, error)
 	Close() error
 }
 
