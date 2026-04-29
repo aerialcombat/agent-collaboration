@@ -56,6 +56,13 @@ type webStore interface {
 	GetBoardSettings(ctx context.Context, pairKey string) (sqlitestore.BoardSettings, error)
 	ListBoardSettingsAutoDrain(ctx context.Context) ([]sqlitestore.BoardSettings, error)
 	UpsertBoardSettings(ctx context.Context, b sqlitestore.BoardSettings) error
+	// v3.12.1 — agent registry CRUD.
+	CreateAgent(ctx context.Context, p sqlitestore.CreateAgentParams) (*sqlitestore.Agent, error)
+	GetAgent(ctx context.Context, id int64) (*sqlitestore.Agent, error)
+	GetAgentByLabel(ctx context.Context, label string) (*sqlitestore.Agent, error)
+	ListAgents(ctx context.Context, enabledOnly bool) ([]sqlitestore.Agent, error)
+	UpdateAgent(ctx context.Context, id int64, p sqlitestore.UpdateAgentParams) error
+	DeleteAgent(ctx context.Context, id int64) error
 	Close() error
 }
 

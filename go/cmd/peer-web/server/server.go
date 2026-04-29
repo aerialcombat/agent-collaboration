@@ -141,8 +141,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/cards/", s.handleCardSubpath)
 	s.mux.HandleFunc("/api/boards", s.handleBoards)
 	s.mux.HandleFunc("/api/boards/", s.handleBoardSubpath)
+	s.mux.HandleFunc("/api/agents", s.handleAgentsRoot)
+	s.mux.HandleFunc("/api/agents/", s.handleAgentSubpath)
 	s.mux.HandleFunc("/view", s.handleView)
 	s.mux.HandleFunc("/cards", s.handleCardsView)
+	s.mux.HandleFunc("/agents", s.handleAgentsView)
 	// Root serves the multi-room index. Anything else falls through to
 	// the embedded static FS (/ → index.html, /favicon.ico if added,
 	// etc). We intercept / explicitly so the index bypasses the file-

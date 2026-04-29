@@ -1,0 +1,638 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<title>__TITLE__</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<style>
+  :root {
+    --bg-marketing: #08090a;
+    --bg-panel: #0f1011;
+    --bg-elevated: #191a1b;
+    --bg-card: rgba(255,255,255,0.02);
+    --bg-card-hover: rgba(255,255,255,0.05);
+
+    --fg-primary: #f7f8f8;
+    --fg-secondary: #d0d6e0;
+    --fg-tertiary: #8a8f98;
+    --fg-quaternary: #62666d;
+
+    --border-subtle: rgba(255,255,255,0.05);
+    --border-standard: rgba(255,255,255,0.08);
+    --border-emphasis: rgba(255,255,255,0.12);
+
+    --accent: #7170ff;
+    --accent-hover: #5e5cf2;
+
+    --runtime-claude: #ef9a4c;
+    --runtime-pi: #4cb7af;
+    --status-enabled: #4cb782;
+    --status-disabled: #62666d;
+
+    --shadow-dialog: 0 18px 60px -12px rgba(0,0,0,0.7);
+  }
+
+  * { box-sizing: border-box }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg-marketing); color: var(--fg-secondary);
+    font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont,
+      'SF Pro Display', system-ui, sans-serif;
+    font-size: 13px; line-height: 1.5;
+    font-feature-settings: "cv01", "ss03";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky; top: 0;
+    background: var(--bg-panel);
+    z-index: 10;
+    backdrop-filter: blur(8px);
+  }
+  header .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px rgba(113,112,255,0.6);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .4 } }
+  header h1 {
+    margin: 0;
+    font-size: 13px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+  }
+  header .sub {
+    color: var(--fg-quaternary);
+    font-size: 12px; font-weight: 510;
+    margin-left: auto;
+    letter-spacing: -0.13px;
+  }
+  header a {
+    color: var(--fg-secondary);
+    font-size: 12px; font-weight: 510;
+    text-decoration: none;
+    padding: 5px 11px;
+    border-radius: 6px;
+    border: 1px solid var(--border-standard);
+    background: rgba(255,255,255,0.02);
+    transition: background .12s;
+  }
+  header a:hover { background: rgba(255,255,255,0.05); color: var(--fg-primary); }
+
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+
+  .toolbar {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 16px;
+  }
+  .toolbar .filter {
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--fg-tertiary); font-size: 12px;
+    padding: 5px 11px;
+    border-radius: 6px;
+    border: 1px solid var(--border-standard);
+    background: rgba(255,255,255,0.02);
+    cursor: pointer; user-select: none;
+  }
+  .toolbar .filter input { margin: 0; }
+  .btn-primary {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--accent); color: #fff;
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.10);
+    cursor: pointer;
+    margin-left: auto;
+    letter-spacing: -0.13px;
+    transition: background .12s;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary .plus { font-size: 14px; line-height: 1; opacity: .85; }
+
+  table {
+    width: 100%; border-collapse: collapse;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  th, td {
+    padding: 10px 14px;
+    text-align: left;
+    font-size: 12px;
+  }
+  thead th {
+    background: rgba(255,255,255,0.02);
+    color: var(--fg-quaternary);
+    font-weight: 510;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 11px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--border-subtle);
+    transition: background .12s;
+  }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--bg-card-hover); }
+  td.label code {
+    color: var(--fg-primary);
+    font-family: ui-monospace, SF Mono, Menlo, monospace;
+    font-size: 12px;
+  }
+  td.runtime span {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px; font-weight: 510;
+    text-transform: lowercase;
+  }
+  td.runtime span.claude {
+    background: rgba(239,154,76,0.10);
+    border: 1px solid rgba(239,154,76,0.30);
+    color: var(--runtime-claude);
+  }
+  td.runtime span.pi {
+    background: rgba(76,183,175,0.10);
+    border: 1px solid rgba(76,183,175,0.30);
+    color: var(--runtime-pi);
+  }
+  td.role { color: var(--fg-tertiary); font-style: italic; }
+  td.role.empty { color: var(--fg-quaternary); }
+  td.state span {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 510;
+  }
+  td.state span::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+  td.state .enabled  { color: var(--status-enabled); }
+  td.state .disabled { color: var(--status-disabled); }
+  td.actions {
+    text-align: right; white-space: nowrap;
+  }
+  .row-btn {
+    background: none; border: none;
+    color: var(--fg-tertiary);
+    font-family: inherit;
+    font-size: 11px; font-weight: 510;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    transition: color .12s, background .12s;
+  }
+  .row-btn:hover { color: var(--fg-primary); background: rgba(255,255,255,0.05); }
+  .row-btn.danger:hover { color: #ef6f6f; }
+
+  .empty-state {
+    padding: 64px 16px;
+    text-align: center;
+    color: var(--fg-quaternary);
+    font-size: 13px;
+  }
+
+  /* Modal — same shape as cards.html for visual consistency */
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.85);
+    display: none;
+    z-index: 70;
+    backdrop-filter: blur(2px);
+  }
+  .modal-backdrop.open { display: block; }
+  .modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(540px, 92vw);
+    max-height: 86vh;
+    overflow: hidden;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-standard);
+    border-radius: 12px;
+    box-shadow: var(--shadow-dialog);
+    display: none;
+    flex-direction: column;
+    z-index: 80;
+  }
+  .modal.open { display: flex; }
+  .modal .mh {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .modal .mh .title {
+    font-size: 14px; font-weight: 510;
+    color: var(--fg-primary);
+    letter-spacing: -0.13px;
+  }
+  .modal .mh .close {
+    margin-left: auto;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-tertiary);
+    font-size: 18px; line-height: 1;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .modal .mh .close:hover { color: var(--fg-primary); }
+  .modal .mb {
+    padding: 16px 18px 18px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .modal label {
+    display: block;
+    font-size: 11px; font-weight: 510;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-quaternary);
+    margin-bottom: 4px;
+  }
+  .modal input, .modal select, .modal textarea {
+    width: 100%;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .modal textarea { resize: vertical; min-height: 70px; max-height: 240px; font-family: ui-monospace, SF Mono, Menlo, monospace; }
+  .modal input:focus, .modal select:focus, .modal textarea:focus {
+    outline: none; border-color: var(--accent);
+    background: rgba(0,0,0,0.45);
+  }
+  .modal .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .modal .actions {
+    display: flex; gap: 8px; justify-content: flex-end;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border-subtle);
+    background: rgba(0,0,0,0.20);
+  }
+  .modal .btn {
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    letter-spacing: -0.13px;
+  }
+  .modal .btn.ghost {
+    background: rgba(255,255,255,0.02);
+    color: var(--fg-secondary);
+    border: 1px solid var(--border-standard);
+  }
+  .modal .btn.ghost:hover {
+    color: var(--fg-primary);
+    background: rgba(255,255,255,0.05);
+  }
+  .modal .btn.primary {
+    background: var(--accent);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.12);
+  }
+  .modal .btn.primary:hover { background: var(--accent-hover); }
+  .modal .btn.primary:disabled { opacity: .5; cursor: not-allowed; }
+  .modal .err {
+    color: #ef6f6f;
+    font-size: 12px;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(239,111,111,0.08);
+    border: 1px solid rgba(239,111,111,0.30);
+    display: none;
+  }
+  .modal .err.show { display: block; }
+
+  .toast {
+    position: fixed;
+    right: 24px; bottom: 24px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-standard);
+    color: var(--fg-primary);
+    font-size: 12px; font-weight: 510;
+    padding: 8px 14px;
+    border-radius: 6px;
+    box-shadow: var(--shadow-dialog);
+    opacity: 0;
+    transition: opacity .18s;
+    z-index: 90;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { border-color: rgba(239,111,111,0.55); color: #ef6f6f; }
+</style>
+
+<header>
+  <span class=dot></span>
+  <h1>__CWD__</h1>
+  <span class=sub id=count></span>
+  <button class=btn-primary id=btn-new><span class=plus>+</span>New agent</button>
+  <a href=/cards>boards</a>
+  <a href=/>rooms</a>
+</header>
+
+<main>
+  <div class=toolbar>
+    <label class=filter>
+      <input type=checkbox id=filter-enabled-only>
+      enabled only
+    </label>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Label</th>
+        <th>Runtime</th>
+        <th>Role</th>
+        <th>State</th>
+        <th>Updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id=rows></tbody>
+  </table>
+  <div class=empty-state id=empty style="display:none">No agents yet — click <strong>+ New agent</strong> to register one.</div>
+</main>
+
+<div class="modal-backdrop" id=modal-backdrop></div>
+<aside class="modal" id=agent-modal aria-hidden=true role=dialog aria-labelledby=agent-modal-title>
+  <div class=mh>
+    <span class=title id=agent-modal-title>New agent</span>
+    <button class=close id=agent-modal-close aria-label=close>×</button>
+  </div>
+  <form class=mb id=agent-form>
+    <input type=hidden id=af-id>
+    <div class=row2>
+      <div>
+        <label for=af-label>Label</label>
+        <input id=af-label required pattern="^[a-zA-Z0-9._:-]+$" placeholder="claude-impl-1">
+      </div>
+      <div>
+        <label for=af-runtime>Runtime</label>
+        <select id=af-runtime required>
+          <option value="claude">claude</option>
+          <option value="pi">pi</option>
+        </select>
+      </div>
+    </div>
+    <div class=row2>
+      <div>
+        <label for=af-role>Role <span style="text-transform:none;color:var(--fg-quaternary)">(optional)</span></label>
+        <input id=af-role placeholder="impl, review, qa, …">
+      </div>
+      <div>
+        <label for=af-enabled>State</label>
+        <select id=af-enabled>
+          <option value="true">enabled</option>
+          <option value="false">disabled</option>
+        </select>
+      </div>
+    </div>
+    <div>
+      <label for=af-worker-cmd>Worker cmd <span style="text-transform:none;color:var(--fg-quaternary)">(optional argv override)</span></label>
+      <input id=af-worker-cmd placeholder="claude -p --permission-mode=bypassPermissions --max-turns=40">
+    </div>
+    <div>
+      <label for=af-config>Model config <span style="text-transform:none;color:var(--fg-quaternary)">(optional JSON)</span></label>
+      <textarea id=af-config placeholder='{"model":"claude-opus-4-7","max_turns":40}'></textarea>
+    </div>
+    <div class=err id=af-err></div>
+  </form>
+  <div class=actions>
+    <button type=button class="btn ghost" id=af-cancel>Cancel</button>
+    <button type=submit class="btn primary" id=af-submit form=agent-form>Save</button>
+  </div>
+</aside>
+
+<div class=toast id=toast role=status aria-live=polite></div>
+
+<script>
+(() => {
+  const rowsEl    = document.getElementById('rows');
+  const emptyEl   = document.getElementById('empty');
+  const countEl   = document.getElementById('count');
+  const filterEl  = document.getElementById('filter-enabled-only');
+  const newBtn    = document.getElementById('btn-new');
+
+  const modal     = document.getElementById('agent-modal');
+  const backdrop  = document.getElementById('modal-backdrop');
+  const form      = document.getElementById('agent-form');
+  const errEl     = document.getElementById('af-err');
+  const submitBtn = document.getElementById('af-submit');
+
+  const fLabel    = document.getElementById('af-label');
+  const fRuntime  = document.getElementById('af-runtime');
+  const fRole     = document.getElementById('af-role');
+  const fEnabled  = document.getElementById('af-enabled');
+  const fWorker   = document.getElementById('af-worker-cmd');
+  const fConfig   = document.getElementById('af-config');
+  const fId       = document.getElementById('af-id');
+  const titleEl   = document.getElementById('agent-modal-title');
+
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+  function toast(msg, kind) {
+    toastEl.textContent = msg;
+    toastEl.classList.toggle('error', kind === 'error');
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2400);
+  }
+
+  function fmtUpdated(s) {
+    if (!s) return '—';
+    try {
+      const d = new Date(s);
+      const diff = (Date.now() - d.getTime()) / 1000;
+      if (diff < 60) return 'just now';
+      if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+      if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+      return d.toLocaleDateString();
+    } catch { return s; }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;" }[c]));
+  }
+
+  async function refresh() {
+    const url = '/api/agents' + (filterEl.checked ? '?enabled_only=1' : '');
+    let data;
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      data = await r.json();
+    } catch (err) {
+      toast('Load failed: ' + err.message, 'error');
+      return;
+    }
+    const agents = data.agents || [];
+    countEl.textContent = agents.length + ' ' + (agents.length === 1 ? 'agent' : 'agents');
+    if (agents.length === 0) {
+      rowsEl.innerHTML = '';
+      emptyEl.style.display = '';
+      return;
+    }
+    emptyEl.style.display = 'none';
+    rowsEl.innerHTML = agents.map(a => `
+      <tr data-id="${a.id}">
+        <td class=label><code>${escapeHtml(a.label)}</code></td>
+        <td class=runtime><span class="${escapeHtml(a.runtime)}">${escapeHtml(a.runtime)}</span></td>
+        <td class="role${a.role ? '' : ' empty'}">${a.role ? escapeHtml(a.role) : '—'}</td>
+        <td class=state><span class="${a.enabled ? 'enabled' : 'disabled'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
+        <td>${escapeHtml(fmtUpdated(a.updated_at))}</td>
+        <td class=actions>
+          <button class=row-btn data-action=edit data-id="${a.id}">edit</button>
+          <button class="row-btn danger" data-action=delete data-id="${a.id}" data-label="${escapeHtml(a.label)}">delete</button>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  function openCreate() {
+    titleEl.textContent = 'New agent';
+    fId.value = '';
+    fLabel.value = '';
+    fLabel.removeAttribute('readonly');
+    fRuntime.value = 'claude';
+    fRole.value = '';
+    fEnabled.value = 'true';
+    fWorker.value = '';
+    fConfig.value = '';
+    errEl.classList.remove('show');
+    errEl.textContent = '';
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    backdrop.classList.add('open');
+    setTimeout(() => fLabel.focus(), 30);
+  }
+
+  async function openEdit(id) {
+    let a;
+    try {
+      const r = await fetch('/api/agents/' + id, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      a = await r.json();
+    } catch (err) {
+      toast('Load failed: ' + err.message, 'error');
+      return;
+    }
+    titleEl.textContent = 'Edit agent — ' + a.label;
+    fId.value = a.id;
+    fLabel.value = a.label;
+    fLabel.setAttribute('readonly', 'readonly'); // label is the natural key; not editable
+    fRuntime.value = a.runtime;
+    fRole.value = a.role || '';
+    fEnabled.value = a.enabled ? 'true' : 'false';
+    fWorker.value = a.worker_cmd || '';
+    fConfig.value = a.model_config || '';
+    errEl.classList.remove('show');
+    errEl.textContent = '';
+    modal.classList.add('open');
+    modal.setAttribute('aria-hidden', 'false');
+    backdrop.classList.add('open');
+    setTimeout(() => fRuntime.focus(), 30);
+  }
+
+  function closeModal() {
+    modal.classList.remove('open');
+    modal.setAttribute('aria-hidden', 'true');
+    backdrop.classList.remove('open');
+  }
+
+  newBtn.addEventListener('click', openCreate);
+  document.getElementById('agent-modal-close').addEventListener('click', closeModal);
+  document.getElementById('af-cancel').addEventListener('click', closeModal);
+  backdrop.addEventListener('click', closeModal);
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal.classList.contains('open')) closeModal();
+  });
+
+  filterEl.addEventListener('change', refresh);
+
+  rowsEl.addEventListener('click', async e => {
+    const btn = e.target.closest('.row-btn');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    const action = btn.dataset.action;
+    if (action === 'edit') return openEdit(id);
+    if (action === 'delete') {
+      const label = btn.dataset.label;
+      if (!confirm(`Delete agent "${label}"? This cascades to pool memberships.`)) return;
+      btn.disabled = true;
+      try {
+        const r = await fetch('/api/agents/' + id, { method: 'DELETE' });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.error || ('HTTP ' + r.status));
+        }
+        toast(`Deleted ${label}`);
+        refresh();
+      } catch (err) {
+        toast('Delete failed: ' + err.message, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  });
+
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    errEl.classList.remove('show');
+    submitBtn.disabled = true;
+
+    const editing = !!fId.value;
+    const body = {
+      runtime:      fRuntime.value,
+      role:         fRole.value,
+      worker_cmd:   fWorker.value,
+      model_config: fConfig.value,
+      enabled:      fEnabled.value === 'true',
+    };
+    if (!editing) body.label = fLabel.value.trim();
+
+    try {
+      const url = editing ? '/api/agents/' + fId.value : '/api/agents';
+      const method = editing ? 'PATCH' : 'POST';
+      const r = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      const saved = await r.json();
+      closeModal();
+      toast(editing ? `Updated ${saved.label}` : `Created ${saved.label}`);
+      refresh();
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.classList.add('show');
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
+})();
+</script>

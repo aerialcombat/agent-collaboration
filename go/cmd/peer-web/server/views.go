@@ -42,6 +42,19 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 	s.serveStatic(w, r, "view.html", titleVars(title, banner))
 }
 
+// handleAgentsView serves the agent registry SPA at /agents (v3.12.1).
+// Pure client-side; the page fetches /api/agents on load and on every
+// CRUD action. Title banner is stamped server-side for consistency
+// with the cards views.
+func (s *Server) handleAgentsView(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/agents" {
+		http.NotFound(w, r)
+		return
+	}
+	title := "peer-inbox — agent registry"
+	s.serveStatic(w, r, "agents.html", titleVars(title, "Agent registry"))
+}
+
 // handleCardsView serves the kanban surface at /cards.
 //
 //   - With ?pair_key=K → kanban board SPA (cards.html), fetches /api/cards.
