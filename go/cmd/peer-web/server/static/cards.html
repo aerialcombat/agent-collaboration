@@ -719,6 +719,120 @@
     display: none;
   }
   .modal .err.show { display: block; }
+  .tab-nav {
+    display: flex; gap: 4px;
+    padding: 0 18px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .tab-btn {
+    background: none; border: none;
+    color: var(--fg-tertiary);
+    font-family: inherit;
+    font-size: 12px; font-weight: 510;
+    padding: 8px 14px;
+    border-radius: 6px 6px 0 0;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    letter-spacing: -0.13px;
+    transition: color .12s, border-color .12s;
+  }
+  .tab-btn:hover { color: var(--fg-primary); }
+  .tab-btn.active {
+    color: var(--fg-primary);
+    border-bottom-color: var(--accent);
+  }
+  .pool-list {
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .pool-row {
+    display: grid;
+    grid-template-columns: 1fr 80px 80px 60px;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    background: rgba(255,255,255,0.02);
+    font-size: 12px;
+  }
+  .pool-row .agent {
+    display: flex; align-items: center; gap: 6px;
+    overflow: hidden;
+  }
+  .pool-row .agent code {
+    color: var(--fg-primary);
+    font-family: ui-monospace, SF Mono, Menlo, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pool-row .runtime-pill {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px; font-weight: 510;
+    text-transform: lowercase;
+    flex-shrink: 0;
+  }
+  .pool-row .runtime-pill.claude {
+    background: rgba(239,154,76,0.10);
+    border: 1px solid rgba(239,154,76,0.30);
+    color: #ef9a4c;
+  }
+  .pool-row .runtime-pill.pi {
+    background: rgba(76,183,175,0.10);
+    border: 1px solid rgba(76,183,175,0.30);
+    color: #4cb7af;
+  }
+  .pool-row input[type=number] {
+    width: 100%;
+    padding: 4px 6px;
+    font-size: 12px;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 4px;
+  }
+  .pool-row input[type=number]:focus {
+    outline: none; border-color: var(--accent);
+  }
+  .pool-row .row-remove {
+    background: none; border: none;
+    color: var(--fg-quaternary);
+    font-family: inherit;
+    font-size: 11px; font-weight: 510;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 4px;
+    transition: color .12s, background .12s;
+  }
+  .pool-row .row-remove:hover { color: #ef6f6f; background: rgba(239,111,111,0.08); }
+  .pool-empty {
+    color: var(--fg-quaternary);
+    font-size: 12px;
+    padding: 16px;
+    text-align: center;
+    border: 1px dashed var(--border-subtle);
+    border-radius: 6px;
+  }
+  .pool-add-row {
+    display: grid;
+    grid-template-columns: 1fr 80px 80px auto;
+    gap: 8px;
+    align-items: center;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .pool-add-row select, .pool-add-row input {
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 12px;
+    background: rgba(0,0,0,0.30);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-standard);
+    border-radius: 4px;
+    font-family: inherit;
+  }
+  .pool-add-row .btn { padding: 6px 12px; font-size: 12px; }
 
   /* Inline body edit affordance in the drawer */
   .drawer .body-edit-wrap {
@@ -1201,10 +1315,14 @@
 
 <aside class="modal" id=settings-modal aria-hidden=true role=dialog aria-labelledby=settings-modal-title>
   <div class=mh>
-    <span class=title id=settings-modal-title>Board settings — <code style="color:var(--accent);font-family:ui-monospace,SF Mono,Menlo,monospace" id=sf-pair-key-display></code></span>
+    <span class=title id=settings-modal-title>Board — <code style="color:var(--accent);font-family:ui-monospace,SF Mono,Menlo,monospace" id=sf-pair-key-display></code></span>
     <button class=close id=settings-modal-close aria-label="close">×</button>
   </div>
-  <form class=mb id=settings-form>
+  <div class=tab-nav>
+    <button type=button class="tab-btn active" data-tab=settings>Settings</button>
+    <button type=button class=tab-btn data-tab=pool>Pool</button>
+  </div>
+  <form class="mb tab-panel" id=settings-form data-tab-panel=settings>
     <div>
       <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-weight:400;color:var(--fg-secondary);margin-bottom:0;cursor:pointer">
         <input type=checkbox id=sf-auto-drain style="width:auto;margin:0">
@@ -1229,9 +1347,23 @@
     </div>
     <div class=err id=sf-err></div>
   </form>
-  <div class=actions>
-    <button type=button class="btn ghost" id=sf-cancel>Cancel</button>
-    <button type=submit class="btn primary" id=sf-submit form=settings-form>Save</button>
+  <div class="mb tab-panel" id=pool-panel data-tab-panel=pool style="display:none">
+    <div id=pool-list class=pool-list></div>
+    <div id=pool-empty class=pool-empty style="display:none">
+      No agents in this board's pool yet. Drainer falls back to <code>AGENT_COLLAB_WORKER_CMD</code>.
+      <a href=/agents target=_blank style="color:var(--accent);text-decoration:none">Manage agents →</a>
+    </div>
+    <div class=pool-add-row>
+      <select id=pool-add-agent></select>
+      <input type=number id=pool-add-count   value=1 min=1 step=1 placeholder="count" title="parallel slots">
+      <input type=number id=pool-add-priority value=0 step=1 placeholder="priority" title="auto-select tiebreak">
+      <button type=button class="btn primary" id=pool-add-btn>Add</button>
+    </div>
+    <div class=err id=pool-err></div>
+  </div>
+  <div class="actions" id=settings-actions>
+    <button type=button class="btn ghost" id=sf-cancel>Close</button>
+    <button type=submit class="btn primary" id=sf-submit form=settings-form>Save settings</button>
   </div>
 </aside>
 
@@ -1850,6 +1982,169 @@
       settingsSubmit.disabled = false;
     }
   });
+
+  // --- Pool tab inside the settings modal --------------------------------
+  const poolListEl  = document.getElementById('pool-list');
+  const poolEmptyEl = document.getElementById('pool-empty');
+  const poolErrEl   = document.getElementById('pool-err');
+  const poolAddSel  = document.getElementById('pool-add-agent');
+  const poolAddCount = document.getElementById('pool-add-count');
+  const poolAddPriority = document.getElementById('pool-add-priority');
+  const poolAddBtn  = document.getElementById('pool-add-btn');
+  const tabBtns     = settingsModal.querySelectorAll('.tab-btn');
+  const settingsActions = document.getElementById('settings-actions');
+  const settingsPanel = settingsModal.querySelector('[data-tab-panel=settings]');
+  const poolPanel     = settingsModal.querySelector('[data-tab-panel=pool]');
+
+  function setActiveTab(name) {
+    tabBtns.forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
+    settingsPanel.style.display = name === 'settings' ? '' : 'none';
+    poolPanel.style.display     = name === 'pool'     ? '' : 'none';
+    settingsSubmit.style.display = name === 'settings' ? '' : 'none';
+    if (name === 'pool') refreshPool();
+  }
+  tabBtns.forEach(btn => btn.addEventListener('click', () => setActiveTab(btn.dataset.tab)));
+
+  function escHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]));
+  }
+
+  async function refreshPool() {
+    poolErrEl.classList.remove('show');
+    poolErrEl.textContent = '';
+
+    let agents = [];
+    let members = [];
+    try {
+      const [agRes, poolRes] = await Promise.all([
+        fetch('/api/agents?enabled_only=1', { cache: 'no-store' }),
+        fetch(`/api/boards/${encodeURIComponent(pairKey)}/pool`, { cache: 'no-store' }),
+      ]);
+      if (!agRes.ok)   throw new Error('agents HTTP ' + agRes.status);
+      if (!poolRes.ok) throw new Error('pool HTTP ' + poolRes.status);
+      agents  = (await agRes.json()).agents || [];
+      members = (await poolRes.json()).members || [];
+    } catch (err) {
+      poolErrEl.textContent = `Load failed: ${err.message}`;
+      poolErrEl.classList.add('show');
+      return;
+    }
+
+    // Render existing members
+    if (members.length === 0) {
+      poolListEl.innerHTML = '';
+      poolEmptyEl.style.display = '';
+    } else {
+      poolEmptyEl.style.display = 'none';
+      poolListEl.innerHTML = members.map(m => `
+        <div class=pool-row data-agent="${escHtml(m.agent_label)}">
+          <div class=agent>
+            <code>${escHtml(m.agent_label)}</code>
+            <span class="runtime-pill ${escHtml(m.agent_runtime)}">${escHtml(m.agent_runtime)}</span>
+            ${m.agent_role ? `<span style="color:var(--fg-quaternary);font-size:11px">${escHtml(m.agent_role)}</span>` : ''}
+          </div>
+          <input type=number min=1 step=1 value="${m.count}"    class=pool-count>
+          <input type=number step=1       value="${m.priority}" class=pool-priority>
+          <button type=button class=row-remove>remove</button>
+        </div>
+      `).join('');
+      poolListEl.querySelectorAll('.pool-row').forEach(row => {
+        const agent = row.dataset.agent;
+        const cnt = row.querySelector('.pool-count');
+        const pri = row.querySelector('.pool-priority');
+        const updateRow = async () => {
+          await poolPatch(agent, {
+            count: parseInt(cnt.value, 10),
+            priority: parseInt(pri.value, 10),
+          });
+        };
+        cnt.addEventListener('change', updateRow);
+        pri.addEventListener('change', updateRow);
+        row.querySelector('.row-remove').addEventListener('click', () => poolDelete(agent));
+      });
+    }
+
+    // Populate add-agent picker with agents NOT already in pool
+    const inPool = new Set(members.map(m => m.agent_label));
+    const choices = agents.filter(a => !inPool.has(a.label));
+    if (choices.length === 0) {
+      poolAddSel.innerHTML = '<option value="">— no enabled agents available —</option>';
+      poolAddBtn.disabled = true;
+    } else {
+      poolAddSel.innerHTML = choices.map(a =>
+        `<option value="${escHtml(a.label)}">${escHtml(a.label)} (${escHtml(a.runtime)}${a.role ? ', ' + escHtml(a.role) : ''})</option>`
+      ).join('');
+      poolAddBtn.disabled = false;
+    }
+  }
+
+  async function poolPatch(agentLabel, body) {
+    try {
+      const r = await fetch(
+        `/api/boards/${encodeURIComponent(pairKey)}/pool/${encodeURIComponent(agentLabel)}`,
+        { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      showToast(`Updated ${agentLabel}`, 'ok');
+    } catch (err) {
+      showToast(`Update failed: ${err.message}`, 'error');
+      refreshPool();
+    }
+  }
+
+  async function poolDelete(agentLabel) {
+    if (!confirm(`Remove ${agentLabel} from this board's pool?`)) return;
+    try {
+      const r = await fetch(
+        `/api/boards/${encodeURIComponent(pairKey)}/pool/${encodeURIComponent(agentLabel)}`,
+        { method: 'DELETE' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      showToast(`Removed ${agentLabel}`, 'ok');
+      refreshPool();
+    } catch (err) {
+      showToast(`Remove failed: ${err.message}`, 'error');
+    }
+  }
+
+  poolAddBtn.addEventListener('click', async () => {
+    const agent = poolAddSel.value;
+    if (!agent) return;
+    poolAddBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/boards/${encodeURIComponent(pairKey)}/pool`, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          agent,
+          count: parseInt(poolAddCount.value, 10) || 1,
+          priority: parseInt(poolAddPriority.value, 10) || 0,
+        }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      showToast(`Added ${agent}`, 'ok');
+      poolAddCount.value = 1;
+      poolAddPriority.value = 0;
+      refreshPool();
+    } catch (err) {
+      poolErrEl.textContent = err.message;
+      poolErrEl.classList.add('show');
+    } finally {
+      poolAddBtn.disabled = false;
+    }
+  });
+
+  // Reset to Settings tab whenever the modal opens. The original
+  // openSettingsModal is invoked by the gear button's click handler;
+  // we just append the tab reset afterwards via a sibling listener.
+  settingsBtn.addEventListener('click', () => setActiveTab('settings'));
 
   // --- New-card modal ----------------------------------------------------
   const createModal = document.getElementById('create-modal');
