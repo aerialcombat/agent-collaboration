@@ -96,7 +96,10 @@ func Open(ctx context.Context) (*SQLiteLocal, error) {
 	// reads inside a write tx can't deadlock with another writer
 	// promoting from snapshot to write (SQLITE_BUSY_SNAPSHOT).
 	// journal_mode=WAL lets readers run while a writer holds the lock.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_txlock=immediate", path)
+	// foreign_keys(on) enables CASCADE / SET NULL clauses; SQLite has
+	// FK enforcement off by default per-connection. v3.12 pool_members
+	// + assigned_to_agent_id + card_runs.agent_id depend on it.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(15000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_txlock=immediate", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
