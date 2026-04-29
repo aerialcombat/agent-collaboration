@@ -221,3 +221,130 @@ func isSQLiteFKErr(err error) bool {
 	return strings.Contains(msg, "FOREIGN KEY constraint failed") ||
 		strings.Contains(msg, "constraint failed: FOREIGN KEY")
 }
+
+// PickAgentForCard chooses which agent should drain a card (v3.12.4).
+//
+// Selection rules:
+//
+//  1. If card.assigned_to_agent_id is set and the agent is enabled,
+//     return that agent (designated wins). If the designated agent
+//     is disabled or deleted, fall through to auto-selection so the
+//     card isn't deadlocked on a missing agent.
+//  2. Otherwise consider enabled pool members of the card's pair_key.
+//     A member is eligible iff:
+//        - card.needs_role == "" (any agent matches), OR
+//        - agent.role == card.needs_role, OR
+//        - agent.role == "*" (declared willing-to-work-on-anything).
+//  3. Among eligible members, rank by:
+//        - running_count_for_agent ASC  (least-busy first; respects count slots)
+//        - priority DESC                (operator tiebreak)
+//        - agent_id ASC                 (deterministic last resort)
+//     Members where running_count >= count (slot-saturated) are dropped.
+//  4. If no eligible member remains, return (nil, nil) — caller falls
+//     back to AGENT_COLLAB_WORKER_CMD (Phase 1 behavior preserved).
+//
+// running_count is computed from card_runs WHERE status='running' AND
+// agent_id matches; null agent_id (legacy / fallback rows) is ignored.
+func (s *SQLiteLocal) PickAgentForCard(ctx context.Context, card *Card) (*Agent, error) {
+	if card == nil {
+		return nil, fmt.Errorf("PickAgentForCard: card required")
+	}
+
+	// 1. Designated assignment wins when present + enabled.
+	if card.AssignedToAgentID != 0 {
+		a, err := s.GetAgent(ctx, card.AssignedToAgentID)
+		if err != nil {
+			if errors.Is(err, ErrAgentNotFound) {
+				// Fall through to auto-select.
+			} else {
+				return nil, err
+			}
+		} else if a.Enabled {
+			return a, nil
+		}
+		// Disabled or missing → fall through.
+	}
+
+	// 2-4. Auto-select from pool.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.id, a.label, a.runtime,
+		       COALESCE(a.worker_cmd, ''), COALESCE(a.role, ''),
+		       COALESCE(a.model_config, ''), a.enabled,
+		       a.created_at, a.updated_at,
+		       pm.count, pm.priority,
+		       (SELECT COUNT(*) FROM card_runs cr
+		         WHERE cr.agent_id = a.id AND cr.status = 'running')
+		         AS running_count
+		  FROM pool_members pm
+		  JOIN agents a ON a.id = pm.agent_id
+		 WHERE pm.pair_key = ?
+		   AND a.enabled = 1
+		   AND (
+		     ? = '' OR a.role IS NULL OR a.role = '' OR a.role = ? OR a.role = '*'
+		   )
+	`, card.PairKey, card.NeedsRole, card.NeedsRole)
+	if err != nil {
+		return nil, fmt.Errorf("PickAgentForCard: query pool: %w", err)
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		agent        Agent
+		count        int
+		priority     int
+		runningCount int
+	}
+	var pool []candidate
+	for rows.Next() {
+		var (
+			c          candidate
+			workerCmd  string
+			role       string
+			modelCfg   string
+			enabledInt int
+		)
+		if err := rows.Scan(
+			&c.agent.ID, &c.agent.Label, &c.agent.Runtime,
+			&workerCmd, &role, &modelCfg, &enabledInt,
+			&c.agent.CreatedAt, &c.agent.UpdatedAt,
+			&c.count, &c.priority, &c.runningCount,
+		); err != nil {
+			return nil, err
+		}
+		c.agent.WorkerCmd = workerCmd
+		c.agent.Role = role
+		c.agent.ModelConfig = modelCfg
+		c.agent.Enabled = enabledInt != 0
+		// Drop slot-saturated agents.
+		if c.runningCount >= c.count {
+			continue
+		}
+		// Filter NULL-role members when needs_role is set: NULL/"" role
+		// matches *any* card. The SQL OR-clause already lets them through;
+		// keep the matching strict to avoid surprising the operator.
+		if card.NeedsRole != "" && c.agent.Role != "" && c.agent.Role != "*" && c.agent.Role != card.NeedsRole {
+			continue
+		}
+		pool = append(pool, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(pool) == 0 {
+		return nil, nil
+	}
+
+	// Rank and pick the head.
+	best := pool[0]
+	for _, c := range pool[1:] {
+		switch {
+		case c.runningCount < best.runningCount:
+			best = c
+		case c.runningCount == best.runningCount && c.priority > best.priority:
+			best = c
+		case c.runningCount == best.runningCount && c.priority == best.priority && c.agent.ID < best.agent.ID:
+			best = c
+		}
+	}
+	return &best.agent, nil
+}

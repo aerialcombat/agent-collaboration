@@ -76,6 +76,9 @@ type Card struct {
 	BlockerIDs   []int64 // cards that must reach done/cancelled before this is ready
 	BlockeeIDs   []int64 // cards waiting on this one
 	Ready        bool    // status=todo AND no unresolved blockers
+
+	// v3.12 — designated agent assignment. 0 = use auto-select.
+	AssignedToAgentID int64
 }
 
 // CardListFilter is the predicate set for list queries. Zero-value
@@ -146,7 +149,8 @@ func (s *SQLiteLocal) GetCard(ctx context.Context, id int64) (*Card, error) {
 		SELECT id, pair_key, home_host, title, body, status,
 		       needs_role, claimed_by, created_by, priority,
 		       tags, context_refs,
-		       created_at, updated_at, claimed_at, completed_at
+		       created_at, updated_at, claimed_at, completed_at,
+		       assigned_to_agent_id
 		FROM cards WHERE id = ?`, id)
 	c, err := scanCard(row)
 	if err == sql.ErrNoRows {
@@ -211,7 +215,8 @@ func (s *SQLiteLocal) ListCards(ctx context.Context, f CardListFilter) ([]*Card,
 	q := `SELECT id, pair_key, home_host, title, body, status,
 	             needs_role, claimed_by, created_by, priority,
 	             tags, context_refs,
-	             created_at, updated_at, claimed_at, completed_at
+	             created_at, updated_at, claimed_at, completed_at,
+	             assigned_to_agent_id
 	      FROM cards`
 	if len(conds) > 0 {
 		q += " WHERE " + strings.Join(conds, " AND ")
@@ -429,6 +434,66 @@ type CardEvent struct {
 	Body      string
 	Meta      string // raw JSON; renderer parses per-kind
 	CreatedAt string
+}
+
+// AssignCardToAgent sets cards.assigned_to_agent_id to the given
+// agent's id and records an "assignment" event. agentID=0 clears the
+// designation. Returns the updated card.
+//
+// Used by v3.12.4's drainer when the operator wants to force a
+// specific agent regardless of role / load. The store doesn't validate
+// that the agent is in the board's pool — designation can override
+// pool scope.
+func (s *SQLiteLocal) AssignCardToAgent(ctx context.Context, cardID, agentID int64, author string) (*Card, error) {
+	if author == "" {
+		author = "system"
+	}
+	prior, err := s.GetCard(ctx, cardID)
+	if err != nil {
+		return nil, err
+	}
+	if prior.AssignedToAgentID == agentID {
+		return prior, nil // no-op
+	}
+
+	var res sql.Result
+	if agentID == 0 {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE cards SET assigned_to_agent_id = NULL, updated_at = ? WHERE id = ?`,
+			time.Now().UTC().Format("2006-01-02T15:04:05Z"), cardID)
+	} else {
+		// Verify the agent exists; FK would catch it, but a clean error
+		// is friendlier than a generic constraint violation.
+		if _, err := s.GetAgent(ctx, agentID); err != nil {
+			return nil, err
+		}
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE cards SET assigned_to_agent_id = ?, updated_at = ? WHERE id = ?`,
+			agentID, time.Now().UTC().Format("2006-01-02T15:04:05Z"), cardID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("AssignCardToAgent: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrCardNotFound
+	}
+
+	// Audit event.
+	kind := "assigned"
+	body := ""
+	if agentID == 0 {
+		kind = "unassigned"
+	} else {
+		// Look up label for human-readable body.
+		if a, err := s.GetAgent(ctx, agentID); err == nil {
+			body = "agent=" + a.Label
+		}
+	}
+	s.recordEvent(ctx, AppendCardEventParams{
+		CardID: cardID, Kind: kind, Author: author, Body: body,
+	})
+
+	return s.GetCard(ctx, cardID)
 }
 
 // AppendCardEventParams collects insert fields. Meta is raw JSON so
@@ -836,7 +901,8 @@ func (s *SQLiteLocal) listCardsRaw(ctx context.Context, whereAndOrder string, ar
 	q := `SELECT id, pair_key, home_host, title, body, status,
 	             needs_role, claimed_by, created_by, priority,
 	             tags, context_refs,
-	             created_at, updated_at, claimed_at, completed_at
+	             created_at, updated_at, claimed_at, completed_at,
+	             assigned_to_agent_id
 	      FROM cards ` + whereAndOrder
 	rs, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -896,12 +962,14 @@ func scanCard(r rowScanner) (*Card, error) {
 		claimedBy, tags          sql.NullString
 		ctxRefs, claimedAt       sql.NullString
 		completedAt              sql.NullString
+		assignedAgentID          sql.NullInt64
 	)
 	if err := r.Scan(
 		&c.ID, &c.PairKey, &c.HomeHost, &c.Title, &body, &c.Status,
 		&needsRole, &claimedBy, &c.CreatedBy, &c.Priority,
 		&tags, &ctxRefs,
 		&c.CreatedAt, &c.UpdatedAt, &claimedAt, &completedAt,
+		&assignedAgentID,
 	); err != nil {
 		return nil, err
 	}
@@ -912,6 +980,9 @@ func scanCard(r rowScanner) (*Card, error) {
 	c.ContextRefs = nullString(ctxRefs)
 	c.ClaimedAt = nullString(claimedAt)
 	c.CompletedAt = nullString(completedAt)
+	if assignedAgentID.Valid {
+		c.AssignedToAgentID = assignedAgentID.Int64
+	}
 	return &c, nil
 }
 
