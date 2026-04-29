@@ -455,6 +455,66 @@ CARD_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "pool_add",
+        "description": (
+            "Add an agent to a board's pool (v3.12.2). count > 1 lets "
+            "one agent definition fill N parallel slots; priority breaks "
+            "auto-select ties (higher first). Same (pair_key, agent) "
+            "duplicate returns 409 — use pool_update instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "minLength": 1},
+                "agent": {"type": "string", "minLength": 1, "description": "agent label"},
+                "count": {"type": "integer", "minimum": 1},
+                "priority": {"type": "integer"},
+            },
+            "required": ["pair_key", "agent"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "pool_remove",
+        "description": "Remove an agent from a board's pool.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "minLength": 1},
+                "agent": {"type": "string", "minLength": 1},
+            },
+            "required": ["pair_key", "agent"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "pool_list",
+        "description": "List the pool members on a board, joined with each agent's runtime/role/enabled.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "minLength": 1},
+            },
+            "required": ["pair_key"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "pool_update",
+        "description": "Update count and/or priority on an existing pool member.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pair_key": {"type": "string", "minLength": 1},
+                "agent": {"type": "string", "minLength": 1},
+                "count": {"type": "integer", "minimum": 1},
+                "priority": {"type": "integer"},
+            },
+            "required": ["pair_key", "agent"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 _stdout_lock = threading.Lock()
@@ -1239,6 +1299,94 @@ def _agent_delete(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _pool_add(req_id, arguments: dict) -> None:
+    pair_key = arguments.get("pair_key")
+    agent = arguments.get("agent")
+    if not (isinstance(pair_key, str) and pair_key) or not (isinstance(agent, str) and agent):
+        _tool_error(req_id, "error: `pair_key` and `agent` required")
+        return
+    args = ["--pair-key", pair_key, "--agent", agent, "--format", "json"]
+    if "count" in arguments:
+        c = arguments["count"]
+        if not isinstance(c, int) or c < 1:
+            _tool_error(req_id, "error: `count` must be integer >= 1")
+            return
+        args += ["--count", str(c)]
+    if "priority" in arguments:
+        p = arguments["priority"]
+        if not isinstance(p, int):
+            _tool_error(req_id, "error: `priority` must be integer")
+            return
+        args += ["--priority", str(p)]
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if label:
+        args += ["--as", label]
+    ok, msg, parsed = _shell_card_verb("pool-add", args)
+    if not ok:
+        _tool_error(req_id, f"pool_add: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _pool_remove(req_id, arguments: dict) -> None:
+    pair_key = arguments.get("pair_key")
+    agent = arguments.get("agent")
+    if not (isinstance(pair_key, str) and pair_key) or not (isinstance(agent, str) and agent):
+        _tool_error(req_id, "error: `pair_key` and `agent` required")
+        return
+    ok, msg, parsed = _shell_card_verb(
+        "pool-remove",
+        ["--pair-key", pair_key, "--agent", agent, "--format", "json"],
+    )
+    if not ok:
+        _tool_error(req_id, f"pool_remove: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
+def _pool_list(req_id, arguments: dict) -> None:
+    pair_key = arguments.get("pair_key")
+    if not (isinstance(pair_key, str) and pair_key):
+        _tool_error(req_id, "error: `pair_key` required")
+        return
+    ok, msg, parsed = _shell_card_verb(
+        "pool-list", ["--pair-key", pair_key, "--format", "json"],
+    )
+    if not ok:
+        _tool_error(req_id, f"pool_list: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else [])
+
+
+def _pool_update(req_id, arguments: dict) -> None:
+    pair_key = arguments.get("pair_key")
+    agent = arguments.get("agent")
+    if not (isinstance(pair_key, str) and pair_key) or not (isinstance(agent, str) and agent):
+        _tool_error(req_id, "error: `pair_key` and `agent` required")
+        return
+    args = ["--pair-key", pair_key, "--agent", agent, "--format", "json"]
+    if "count" in arguments:
+        c = arguments["count"]
+        if not isinstance(c, int) or c < 1:
+            _tool_error(req_id, "error: `count` must be integer >= 1")
+            return
+        args += ["--count", str(c)]
+    if "priority" in arguments:
+        p = arguments["priority"]
+        if not isinstance(p, int):
+            _tool_error(req_id, "error: `priority` must be integer")
+            return
+        args += ["--priority", str(p)]
+    if not any(k in arguments for k in ("count", "priority")):
+        _tool_error(req_id, "error: pass `count` and/or `priority`")
+        return
+    ok, msg, parsed = _shell_card_verb("pool-update", args)
+    if not ok:
+        _tool_error(req_id, f"pool_update: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 CARD_TOOL_HANDLERS = {
     "card_create": _card_create,
     "card_list": _card_list,
@@ -1256,6 +1404,10 @@ CARD_TOOL_HANDLERS = {
     "agent_get": _agent_get,
     "agent_update": _agent_update,
     "agent_delete": _agent_delete,
+    "pool_add": _pool_add,
+    "pool_remove": _pool_remove,
+    "pool_list": _pool_list,
+    "pool_update": _pool_update,
 }
 
 

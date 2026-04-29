@@ -77,16 +77,23 @@ func (d *drainer) snapshot() map[string]any {
 	return out
 }
 
-// handleBoardSubpath demuxes /api/boards/{pair_key}/{verb}.
-// Supported verbs: start, stop, status, settings.
+// handleBoardSubpath demuxes /api/boards/{pair_key}/{verb}[/{member}].
+// Supported verbs: start, stop, status, settings, pool.
+//
+// Pool routes:
+//
+//	GET    /api/boards/{pk}/pool                → list members
+//	POST   /api/boards/{pk}/pool                → add  (body: {agent, count?, priority?})
+//	PATCH  /api/boards/{pk}/pool/{agent_label}  → update count/priority
+//	DELETE /api/boards/{pk}/pool/{agent_label}  → remove
 func (s *Server) handleBoardSubpath(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/boards/")
-	idx := strings.LastIndex(rest, "/")
-	if idx <= 0 || idx == len(rest)-1 {
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
 		writeJSONError(w, http.StatusNotFound, "expected /api/boards/{pair_key}/{verb}")
 		return
 	}
-	verb := rest[idx+1:]
+	verb := parts[1]
 	switch verb {
 	case "start":
 		s.handleBoardStart(w, r)
@@ -96,6 +103,8 @@ func (s *Server) handleBoardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleBoardStatus(w, r)
 	case "settings":
 		s.handleBoardSettings(w, r)
+	case "pool":
+		s.handleBoardPool(w, r)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown board verb: "+verb)
 	}

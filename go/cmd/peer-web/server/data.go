@@ -63,6 +63,12 @@ type webStore interface {
 	ListAgents(ctx context.Context, enabledOnly bool) ([]sqlitestore.Agent, error)
 	UpdateAgent(ctx context.Context, id int64, p sqlitestore.UpdateAgentParams) error
 	DeleteAgent(ctx context.Context, id int64) error
+	// v3.12.2 — per-board pool composition.
+	AddPoolMember(ctx context.Context, p sqlitestore.AddPoolMemberParams) (*sqlitestore.PoolMember, error)
+	GetPoolMember(ctx context.Context, pairKey string, agentID int64) (*sqlitestore.PoolMember, error)
+	ListPoolMembers(ctx context.Context, pairKey string) ([]sqlitestore.PoolMember, error)
+	UpdatePoolMember(ctx context.Context, pairKey string, agentID int64, p sqlitestore.UpdatePoolMemberParams) error
+	RemovePoolMember(ctx context.Context, pairKey string, agentID int64) error
 	Close() error
 }
 

@@ -141,6 +141,14 @@ func run(args []string) int {
 		return runAgentUpdate(rest)
 	case "agent-delete":
 		return runAgentDelete(rest)
+	case "pool-add":
+		return runPoolAdd(rest)
+	case "pool-remove":
+		return runPoolRemove(rest)
+	case "pool-list":
+		return runPoolList(rest)
+	case "pool-update":
+		return runPoolUpdate(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK
