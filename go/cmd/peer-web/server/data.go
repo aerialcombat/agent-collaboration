@@ -75,6 +75,9 @@ type webStore interface {
 	// v3.12.4.6 — handoffs.
 	RecordCardHandoff(ctx context.Context, cardID int64, body, author string) (*sqlitestore.CardEvent, error)
 	LatestHandoffEvent(ctx context.Context, cardID int64) (*sqlitestore.CardEvent, error)
+	// v3.12.4.7 — operator panic button.
+	CancelLatestRun(ctx context.Context, cardID int64) (*sqlitestore.CancelLatestRunResult, error)
+	ReleaseCardClaim(ctx context.Context, cardID int64, author string) (*sqlitestore.Card, error)
 	Close() error
 }
 

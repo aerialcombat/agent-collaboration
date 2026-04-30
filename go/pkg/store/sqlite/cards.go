@@ -905,6 +905,77 @@ func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCa
 	return s.GetCard(ctx, id)
 }
 
+// ReleaseCardClaim clears claimed_by + claimed_at and, if the card is
+// in_progress, flips status back to todo. Idempotent — already-released
+// cards are no-ops.
+//
+// Used by card-cancel-run (operator panic button) and is the same
+// shape as the in-band release inside RecordCardHandoff (Q-B). Kept as
+// a standalone helper so future verbs can reuse it.
+func (s *SQLiteLocal) ReleaseCardClaim(ctx context.Context, cardID int64, author string) (*Card, error) {
+	if author == "" {
+		author = "system"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ReleaseCardClaim begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		curStatus  string
+		curClaimer sql.NullString
+	)
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, claimed_by FROM cards WHERE id = ?`, cardID,
+	).Scan(&curStatus, &curClaimer); err == sql.ErrNoRows {
+		return nil, ErrCardNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("ReleaseCardClaim probe: %w", err)
+	}
+	if !curClaimer.Valid && curStatus != CardStatusInProgress {
+		// Nothing to release.
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return s.GetCard(ctx, cardID)
+	}
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	newStatus := curStatus
+	if curStatus == CardStatusInProgress {
+		newStatus = CardStatusTodo
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE cards SET status=?, claimed_by=NULL, claimed_at=NULL, updated_at=? WHERE id=?`,
+		newStatus, now, cardID,
+	); err != nil {
+		return nil, fmt.Errorf("ReleaseCardClaim update: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ReleaseCardClaim commit: %w", err)
+	}
+
+	if curStatus == CardStatusInProgress {
+		priorClaim := ""
+		if curClaimer.Valid {
+			priorClaim = curClaimer.String
+		}
+		meta, _ := jsonObject(map[string]any{
+			"old_status":  CardStatusInProgress,
+			"new_status":  CardStatusTodo,
+			"prior_claim": priorClaim,
+			"trigger":     "release",
+		})
+		s.recordEvent(ctx, AppendCardEventParams{
+			CardID: cardID, Kind: CardEventStatusChange,
+			Author: author,
+			Body:   "claim released — status in_progress → todo",
+			Meta:   meta,
+		})
+	}
+	return s.GetCard(ctx, cardID)
+}
+
 // AddCardDependency adds an edge blocker -> blockee after validating
 // (a) neither endpoint equals the other, (b) both cards exist,
 // (c) the new edge doesn't create a cycle. The cycle check walks the

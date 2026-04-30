@@ -129,6 +129,78 @@ func (s *SQLiteLocal) UpdateCardRunLogPath(ctx context.Context, id int64, logPat
 	return err
 }
 
+// ErrNoRunningRun — the requested cancel/probe target has no card_run
+// row in status='running'. Cancellation is a no-op in that case.
+var ErrNoRunningRun = errors.New("store: no running card_run for this card")
+
+// CancelLatestRunResult is what CancelLatestRun returns to the caller
+// so it can signal the worker process. Pid is the pre-cancel value
+// (after cancel, the row is cleared).
+type CancelLatestRunResult struct {
+	RunID       int64
+	PID         int
+	WorkerLabel string
+	Host        string // for cross-host signalling, when we get there
+}
+
+// CancelLatestRun marks the most recent status='running' run for cardID
+// as cancelled and returns the run's pid + label so the caller can send
+// SIGTERM. Returns ErrNoRunningRun when there's nothing to cancel.
+//
+// The DB write captures operator intent; the actual kill happens in the
+// caller (CLI / HTTP) since signal sending is a process-local effect
+// outside the store's responsibility.
+//
+// Race with monitorWorker: monitor's FinishCardRun is gated on
+// status='running'. After this call the row is 'cancelled' so monitor's
+// finalize is a no-op. Monitor still writes its own run_complete event
+// reporting the worker's local exit status — that's harmless extra
+// audit, not a correctness issue (the card_runs row remains the truth).
+func (s *SQLiteLocal) CancelLatestRun(ctx context.Context, cardID int64) (*CancelLatestRunResult, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("CancelLatestRun begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		runID    int64
+		pid      sql.NullInt64
+		label    string
+		host     string
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT id, pid, worker_label, host
+		  FROM card_runs
+		 WHERE card_id = ? AND status = 'running'
+		 ORDER BY id DESC
+		 LIMIT 1`, cardID,
+	).Scan(&runID, &pid, &label, &host)
+	if err == sql.ErrNoRows {
+		return nil, ErrNoRunningRun
+	}
+	if err != nil {
+		return nil, fmt.Errorf("CancelLatestRun probe: %w", err)
+	}
+
+	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE card_runs
+		   SET ended_at=?, status='cancelled', exit_code=-1, pid=NULL
+		 WHERE id=? AND status='running'
+	`, now, runID); err != nil {
+		return nil, fmt.Errorf("CancelLatestRun mark: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("CancelLatestRun commit: %w", err)
+	}
+	out := &CancelLatestRunResult{RunID: runID, WorkerLabel: label, Host: host}
+	if pid.Valid {
+		out.PID = int(pid.Int64)
+	}
+	return out, nil
+}
+
 // FinishCardRun marks a card_run terminal — sets ended_at, status,
 // exit_code, and clears pid. Idempotent in the sense that re-finishing
 // an already-finished row is a no-op (the WHERE clause filters).

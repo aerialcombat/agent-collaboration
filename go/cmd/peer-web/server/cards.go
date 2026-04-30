@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
@@ -417,9 +419,99 @@ func (s *Server) handleCardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleCardAssign(w, r, id)
 	case "handoff":
 		s.handleCardHandoff(w, r, id)
+	case "cancel-run":
+		s.handleCardCancelRun(w, r, id)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown card verb")
 	}
+}
+
+// handleCardCancelRun — POST /api/cards/{id}/cancel-run
+//
+//	body: {"author": "<label>", "no_release": false}
+//
+// Operator panic button. Marks the latest 'running' run cancelled,
+// sends SIGTERM to the worker pid (when known + on this host), records
+// an audit comment, and (unless no_release) releases the claim.
+//
+// Returns 404 when no running run exists.
+//
+// Cross-host: if the run's host != this peer-web's self_host, the row
+// is marked cancelled but the SIGTERM is skipped (no signal across
+// hosts). Remote reaper picks it up eventually.
+func (s *Server) handleCardCancelRun(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Author    string `json:"author"`
+		NoRelease bool   `json:"no_release"`
+	}
+	// Empty body is fine — defaults below.
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Author == "" {
+		body.Author = "operator"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	res, err := st.CancelLatestRun(ctx, id)
+	if errors.Is(err, sqlitestore.ErrNoRunningRun) {
+		writeJSONError(w, http.StatusNotFound, "no running run for this card")
+		return
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	signalled := false
+	signalErr := ""
+	if res.PID > 0 && (res.Host == "" || res.Host == sqlitestore.SelfHost()) {
+		if err := syscall.Kill(res.PID, syscall.SIGTERM); err == nil {
+			signalled = true
+		} else if !errors.Is(err, syscall.ESRCH) {
+			signalErr = err.Error()
+		}
+	}
+
+	_, _ = st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+		CardID: id, Kind: sqlitestore.CardEventComment, Author: body.Author,
+		Body: fmt.Sprintf("operator cancelled run #%d (worker %s, pid=%d, signalled=%v)",
+			res.RunID, res.WorkerLabel, res.PID, signalled),
+	})
+
+	out := map[string]any{
+		"run_id":       res.RunID,
+		"worker_label": res.WorkerLabel,
+		"pid":          res.PID,
+		"signalled":    signalled,
+	}
+	if signalErr != "" {
+		out["signal_error"] = signalErr
+	}
+	if !body.NoRelease {
+		// Brief grace for the worker to clean up before we yank the claim.
+		if signalled {
+			time.Sleep(500 * time.Millisecond)
+		}
+		card, err := st.ReleaseCardClaim(ctx, id, body.Author)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "release claim: "+err.Error())
+			return
+		}
+		out["card_status"] = card.Status
+		out["claimed_by"] = card.ClaimedBy
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleCardHandoff — POST /api/cards/{id}/handoff

@@ -340,6 +340,28 @@ CARD_TOOLS = [
         },
     },
     {
+        "name": "card_cancel_run",
+        "description": (
+            "Operator panic button: cancel the currently-running worker "
+            "for this card. Marks the latest 'running' card_run as "
+            "'cancelled', SIGTERMs the worker pid, records an audit "
+            "comment, and (unless no_release=true) releases the claim + "
+            "flips the card back to todo so the drainer can re-pick. "
+            "Use this when a worker is stuck or doing the wrong thing. "
+            "For permanent card cancellation, use card_update_status "
+            "with status='cancelled' instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "no_release": {"type": "boolean", "default": False},
+            },
+            "required": ["id"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "card_handoff",
         "description": (
             "Record a structured handoff event before exiting near a "
@@ -1203,6 +1225,24 @@ def _card_comment(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_cancel_run(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required (positive integer)")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if not label:
+        label = "operator"
+    flags = ["--card", str(cid), "--as", label, "--format", "json"]
+    if arguments.get("no_release"):
+        flags.append("--no-release")
+    ok, msg, parsed = _shell_card_verb("card-cancel-run", flags)
+    if not ok:
+        _tool_error(req_id, f"card_cancel_run: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 def _card_handoff(req_id, arguments: dict) -> None:
     cid = arguments.get("id")
     body = arguments.get("body")
@@ -1566,6 +1606,7 @@ CARD_TOOL_HANDLERS = {
     "card_update": _card_update,
     "card_comment": _card_comment,
     "card_handoff": _card_handoff,
+    "card_cancel_run": _card_cancel_run,
     "card_add_dependency": _card_add_dependency,
     "card_remove_dependency": _card_remove_dependency,
     "card_runs": _card_runs,
