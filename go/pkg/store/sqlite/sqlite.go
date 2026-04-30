@@ -62,8 +62,14 @@ const (
 	// Bumped 12 → 13 for v3.12.4 D3's 0013 migration that extends the
 	// card_events.kind CHECK to allow 'assigned' / 'unassigned' kinds
 	// emitted by AssignCardToAgent — pre-0013 DBs would reject the audit
-	// event insert with a constraint error.
-	GooseVersionRequired = 13
+	// event insert with a constraint error. Bumped 13 → 14 for
+	// v3.12.4.5/.6's 0014 migration that adds cards.kind / cards.splittable /
+	// cards.track_handoffs columns and extends card_events.kind CHECK with
+	// 'split' / 'handoff'; the drainer reads kind/splittable to choose the
+	// decomposer prompt path and to append the split addendum, and emits
+	// 'split'/'handoff' events — pre-0014 DBs would either ignore the new
+	// columns (silent default behavior) or reject the new event kinds.
+	GooseVersionRequired = 14
 
 	sessionsDirRel = ".agent-collab/sessions"
 )
