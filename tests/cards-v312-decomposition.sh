@@ -233,6 +233,14 @@ n_blockers=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_dependencies WHERE blockee
 n_split_comments=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_events WHERE card_id=$PARENT AND kind='comment' AND body LIKE 'split:%';")
 [ "$n_split_comments" = "1" ] || fail "F2 expected 1 split-rationale comment, got $n_split_comments"
 
+# Track 1 fix #4: → todo from in_progress must release the claim. Without
+# this, the parent stays claimed forever and the drainer can never re-pick
+# it after children clear (the linkboard dogfood observation).
+parent_claim=$(sqlite3 "$DB" "SELECT COALESCE(claimed_by,'') FROM cards WHERE id=$PARENT;")
+[ -z "$parent_claim" ] || fail "F2 parent claim should be cleared after split (status flip in_progress→todo), got '$parent_claim'"
+n_release_events=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_events WHERE card_id=$PARENT AND kind='status_change' AND meta LIKE '%\"trigger\":\"release\"%';")
+[ "$n_release_events" -ge 1 ] || fail "F2 expected status_change with trigger=release, got $n_release_events"
+
 # Drainer must NOT re-dispatch the parent until children clear.
 n_runs=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_runs WHERE card_id=$PARENT;")
 "$PI_BIN" board-set --pair-key "$PK2" --auto-drain off --as f2 >/dev/null

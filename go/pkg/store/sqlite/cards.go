@@ -402,23 +402,32 @@ func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status, au
 	}
 
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	var completedSet string
+
+	// Build the SET clause incrementally so we can express three orthogonal
+	// concerns clearly: completed_at on terminal status, claim release on
+	// → todo (Q-B-aligned semantic: "todo means waiting to be claimed, so
+	// nobody can be holding it"), and the always-stamped updated_at.
+	sets := []string{"status = ?", "updated_at = ?"}
+	args := []any{status, now}
 	if status == CardStatusDone || status == CardStatusCancelled {
-		completedSet = ", completed_at = COALESCE(completed_at, ?)"
+		sets = append(sets, "completed_at = COALESCE(completed_at, ?)")
+		args = append(args, now)
+	}
+	// → todo means "back in the queue" — release any claim held against
+	// this card. This aligns the implementation with the split-discipline
+	// prompt's existing wording ("call card-update-status --status=todo
+	// to release your claim") and matches Q-B's claim-release semantic
+	// for handoffs. Without this, mid-session split silently strands
+	// cards (linkboard dogfood observation #4).
+	releaseClaim := status == CardStatusTodo &&
+		(prior.ClaimedBy != "" || prior.ClaimedAt != "")
+	if releaseClaim {
+		sets = append(sets, "claimed_by = NULL", "claimed_at = NULL")
 	}
 
-	var res sql.Result
-	if completedSet != "" {
-		res, err = s.db.ExecContext(ctx,
-			`UPDATE cards SET status = ?, updated_at = ?`+completedSet+` WHERE id = ?`,
-			status, now, now, id,
-		)
-	} else {
-		res, err = s.db.ExecContext(ctx,
-			`UPDATE cards SET status = ?, updated_at = ? WHERE id = ?`,
-			status, now, id,
-		)
-	}
+	q := "UPDATE cards SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+	args = append(args, id)
+	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("UpdateCardStatus: %w", err)
 	}
@@ -431,14 +440,23 @@ func (s *SQLiteLocal) UpdateCardStatus(ctx context.Context, id int64, status, au
 	}
 
 	// Auto-record the transition. Failures don't bubble (recordEvent logs to stderr).
-	meta, _ := jsonObject(map[string]any{
+	metaMap := map[string]any{
 		"old_status": prior.Status,
 		"new_status": status,
-	})
+	}
+	if releaseClaim {
+		metaMap["prior_claim"] = prior.ClaimedBy
+		metaMap["trigger"] = "release"
+	}
+	meta, _ := jsonObject(metaMap)
+	body := fmt.Sprintf("%s → %s", prior.Status, status)
+	if releaseClaim {
+		body += " (claim released)"
+	}
 	s.recordEvent(ctx, AppendCardEventParams{
 		CardID: id, Kind: CardEventStatusChange,
 		Author: author,
-		Body:   fmt.Sprintf("%s → %s", prior.Status, status),
+		Body:   body,
 		Meta:   meta,
 	})
 
