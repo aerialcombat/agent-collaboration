@@ -29,6 +29,17 @@ var ValidCardStatuses = []string{
 	CardStatusDone, CardStatusCancelled,
 }
 
+// Card kinds (v3.12.4.5). 'task' is the default. 'epic' triggers the
+// decomposer prompt path in the drainer instead of a regular worker.
+// The schema CHECK constraint also enforces this enum at the DB layer.
+const (
+	CardKindTask = "task"
+	CardKindEpic = "epic"
+)
+
+// ValidCardKinds — used by CLI flag validation.
+var ValidCardKinds = []string{CardKindTask, CardKindEpic}
+
 var (
 	// ErrCardNotFound — card_id lookup missed.
 	ErrCardNotFound = errors.New("store: card not found")
@@ -79,6 +90,23 @@ type Card struct {
 
 	// v3.12 — designated agent assignment. 0 = use auto-select.
 	AssignedToAgentID int64
+
+	// v3.12.4.5 — card decomposition.
+	//   Kind        — "task" (default) or "epic". Epics get the
+	//                 decomposer prompt path in the drainer instead of
+	//                 a regular worker.
+	//   Splittable  — true → worker prompt gains the mid-session split
+	//                 addendum. Defaults false for human-authored cards;
+	//                 decomposer-emitted children default true.
+	//
+	// v3.12.4.6 — handoff tracking.
+	//   TrackHandoffs — true → worker prompt gains the handoff-discipline
+	//                   addendum and buildWorkerPrompt prepends the latest
+	//                   handoff event so the next dispatch resumes from
+	//                   where the prior session left off.
+	Kind          string
+	Splittable    bool
+	TrackHandoffs bool
 }
 
 // CardListFilter is the predicate set for list queries. Zero-value
@@ -106,6 +134,11 @@ type CreateCardParams struct {
 	Priority    int
 	Tags        string // JSON (pre-marshaled by caller) or ""
 	ContextRefs string // JSON or ""
+
+	// v3.12.4.5 — decomposition flags. Zero values give the v3.12.4
+	// default behavior ('task' / not splittable).
+	Kind       string // "" → "task"; "task" or "epic"
+	Splittable bool
 }
 
 // CreateCard inserts a new card in state=todo and returns the row
@@ -119,17 +152,25 @@ func (s *SQLiteLocal) CreateCard(ctx context.Context, p CreateCardParams) (*Card
 	if p.HomeHost == "" {
 		p.HomeHost = SelfHost()
 	}
+	if p.Kind == "" {
+		p.Kind = CardKindTask
+	}
+	if p.Kind != CardKindTask && p.Kind != CardKindEpic {
+		return nil, fmt.Errorf("CreateCard: invalid kind %q (want 'task' or 'epic')", p.Kind)
+	}
 	now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO cards
 		  (pair_key, home_host, title, body, status, needs_role,
 		   created_by, priority, tags, context_refs,
+		   kind, splittable,
 		   created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.PairKey, p.HomeHost, p.Title, nullable(p.Body),
 		nullable(p.NeedsRole), p.CreatedBy, p.Priority,
 		nullable(p.Tags), nullable(p.ContextRefs),
+		p.Kind, boolToInt(p.Splittable),
 		now, now,
 	)
 	if err != nil {
@@ -150,7 +191,8 @@ func (s *SQLiteLocal) GetCard(ctx context.Context, id int64) (*Card, error) {
 		       needs_role, claimed_by, created_by, priority,
 		       tags, context_refs,
 		       created_at, updated_at, claimed_at, completed_at,
-		       assigned_to_agent_id
+		       assigned_to_agent_id,
+		       kind, splittable, track_handoffs
 		FROM cards WHERE id = ?`, id)
 	c, err := scanCard(row)
 	if err == sql.ErrNoRows {
@@ -216,7 +258,8 @@ func (s *SQLiteLocal) ListCards(ctx context.Context, f CardListFilter) ([]*Card,
 	             needs_role, claimed_by, created_by, priority,
 	             tags, context_refs,
 	             created_at, updated_at, claimed_at, completed_at,
-	             assigned_to_agent_id
+	             assigned_to_agent_id,
+	             kind, splittable, track_handoffs
 	      FROM cards`
 	if len(conds) > 0 {
 		q += " WHERE " + strings.Join(conds, " AND ")
@@ -425,6 +468,8 @@ const (
 	CardEventRunComplete  = "run_complete"
 	CardEventAssigned     = "assigned"   // v3.12.4 — designated agent set
 	CardEventUnassigned   = "unassigned" // v3.12.4 — designation cleared
+	CardEventSplit        = "split"      // v3.12.4.5 — mid-session decomposition rationale
+	CardEventHandoff      = "handoff"    // v3.12.4.6 — structured continuity record
 )
 
 // CardEvent — one row in the per-card timeline.
@@ -636,6 +681,15 @@ type UpdateCardFieldsParams struct {
 	Priority    *int
 	Tags        *string // raw JSON
 	ContextRefs *string // raw JSON
+
+	// v3.12.4.5/.6 — decomposition + handoff flags. Operator can flip
+	// these mid-life (e.g. promote a task to splittable after the worker
+	// signals scope creep, or self-promote track_handoffs after a
+	// turn-budget exhaustion). Kind is included for completeness; CHECK
+	// constraint enforces 'task'|'epic' at the DB layer.
+	Kind          *string
+	Splittable    *bool
+	TrackHandoffs *bool
 }
 
 // UpdateCardFields mutates non-status fields on a card and stamps
@@ -676,6 +730,24 @@ func (s *SQLiteLocal) UpdateCardFields(ctx context.Context, id int64, p UpdateCa
 		sets = append(sets, "context_refs = ?")
 		args = append(args, *p.ContextRefs)
 		changed = append(changed, "context_refs")
+	}
+	if p.Kind != nil {
+		if *p.Kind != CardKindTask && *p.Kind != CardKindEpic {
+			return nil, fmt.Errorf("UpdateCardFields: invalid kind %q (want 'task' or 'epic')", *p.Kind)
+		}
+		sets = append(sets, "kind = ?")
+		args = append(args, *p.Kind)
+		changed = append(changed, "kind")
+	}
+	if p.Splittable != nil {
+		sets = append(sets, "splittable = ?")
+		args = append(args, boolToInt(*p.Splittable))
+		changed = append(changed, "splittable")
+	}
+	if p.TrackHandoffs != nil {
+		sets = append(sets, "track_handoffs = ?")
+		args = append(args, boolToInt(*p.TrackHandoffs))
+		changed = append(changed, "track_handoffs")
 	}
 	if len(sets) == 0 {
 		return s.GetCard(ctx, id)
@@ -904,7 +976,8 @@ func (s *SQLiteLocal) listCardsRaw(ctx context.Context, whereAndOrder string, ar
 	             needs_role, claimed_by, created_by, priority,
 	             tags, context_refs,
 	             created_at, updated_at, claimed_at, completed_at,
-	             assigned_to_agent_id
+	             assigned_to_agent_id,
+	             kind, splittable, track_handoffs
 	      FROM cards ` + whereAndOrder
 	rs, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -959,12 +1032,13 @@ type rowScanner interface {
 
 func scanCard(r rowScanner) (*Card, error) {
 	var (
-		c                        Card
-		body, needsRole          sql.NullString
-		claimedBy, tags          sql.NullString
-		ctxRefs, claimedAt       sql.NullString
-		completedAt              sql.NullString
-		assignedAgentID          sql.NullInt64
+		c                            Card
+		body, needsRole              sql.NullString
+		claimedBy, tags              sql.NullString
+		ctxRefs, claimedAt           sql.NullString
+		completedAt                  sql.NullString
+		assignedAgentID              sql.NullInt64
+		splittableI, trackHandoffsI  int
 	)
 	if err := r.Scan(
 		&c.ID, &c.PairKey, &c.HomeHost, &c.Title, &body, &c.Status,
@@ -972,6 +1046,7 @@ func scanCard(r rowScanner) (*Card, error) {
 		&tags, &ctxRefs,
 		&c.CreatedAt, &c.UpdatedAt, &claimedAt, &completedAt,
 		&assignedAgentID,
+		&c.Kind, &splittableI, &trackHandoffsI,
 	); err != nil {
 		return nil, err
 	}
@@ -985,6 +1060,8 @@ func scanCard(r rowScanner) (*Card, error) {
 	if assignedAgentID.Valid {
 		c.AssignedToAgentID = assignedAgentID.Int64
 	}
+	c.Splittable = splittableI != 0
+	c.TrackHandoffs = trackHandoffsI != 0
 	return &c, nil
 }
 
