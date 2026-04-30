@@ -459,6 +459,26 @@
   .drawer .chip.dep.done::before {
     background: var(--status-done);
   }
+  .drawer .chip-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    font-weight: 510;
+    padding: 2px 10px;
+    border-radius: 9999px;
+    border: 1px solid var(--border-standard);
+    background: transparent;
+    color: var(--fg-tertiary);
+    margin: 3px 4px 0 0;
+    letter-spacing: -0.06px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s, color .12s;
+    font-family: inherit;
+  }
+  .drawer .chip-toggle:hover { border-color: var(--border-emphasis); background: rgba(255,255,255,0.04); }
+  .drawer .chip-toggle.on { color: var(--accent); border-color: var(--accent); }
+  .drawer .chip-toggle.on:hover { background: rgba(255,255,255,0.06); }
 
   .drawer .empty {
     color: var(--fg-quaternary);
@@ -1139,6 +1159,27 @@
   .activity-row.handoff .glyph { color: var(--status-in-review); }
   .activity-row .meta-children { color: var(--fg-secondary); margin-left: 4px; }
   .activity-row .meta-children .card-link { color: var(--accent); text-decoration: none; }
+  .activity-row .handoff-details { display: inline; }
+  .activity-row .handoff-details > summary {
+    cursor: pointer;
+    color: var(--fg-secondary);
+    font-style: italic;
+    list-style: none;
+  }
+  .activity-row .handoff-details[open] > summary { color: var(--fg-primary); }
+  .activity-row .handoff-body {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: rgba(0,0,0,0.30);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    font-family: ui-monospace, SF Mono, Menlo, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+    color: var(--fg-secondary);
+    max-height: 320px;
+    overflow: auto;
+  }
   .activity-row .who {
     color: var(--fg-secondary); font-weight: 510;
     letter-spacing: -0.06px;
@@ -1581,6 +1622,25 @@
             <div class="label">completed</div>
             <div class="value mono">${esc(fmtTs(c.completed_at))}</div>
           </div>` : ''}
+        </div>
+
+        <div class="field">
+          <div class="label">flags</div>
+          <div class="value">
+            ${c.kind === 'epic'
+              ? '<span class="chip" title="Epic — dispatched workers run the decomposer prompt">Epic</span>'
+              : ''}
+            <button class="chip-toggle ${c.splittable ? 'on' : 'off'}"
+              data-action="toggle-splittable"
+              title="Splittable — workers may split this card mid-session if scope is wrong">
+              ${c.splittable ? '✂ splittable' : '✂ splittable (off)'}
+            </button>
+            <button class="chip-toggle ${c.track_handoffs ? 'on' : 'off'}"
+              data-action="toggle-track-handoffs"
+              title="Track handoffs — workers get the handoff discipline + prior handoff prepended on the next dispatch">
+              ${c.track_handoffs ? '📜 track handoffs' : '📜 track handoffs (off)'}
+            </button>
+          </div>
         </div>
 
         <div class="field">
@@ -2288,6 +2348,16 @@
       ).join(', ');
       body += ` <span class="meta-children">→ ${links}</span>`;
     }
+    // Handoffs carry a structured body (potentially multi-KB). Render
+    // collapsed by default with a one-line teaser; click to expand.
+    if (e.kind === 'handoff') {
+      const raw = e.body || '';
+      const teaser = raw.split('\n').find(l => l.trim().length > 0) || '(empty handoff)';
+      body = `<details class="handoff-details">
+        <summary>${esc(teaser.slice(0, 120))}${teaser.length > 120 ? '…' : ''}</summary>
+        <pre class="handoff-body">${esc(raw)}</pre>
+      </details>`;
+    }
     return `<div class="activity-row ${e.kind}">
       <span class="glyph">${glyph}</span>
       <span class="who">${esc(e.author)}</span>
@@ -2555,6 +2625,33 @@
       }
       return;
     }
+    const toggleFlag = e.target.closest('[data-action="toggle-splittable"], [data-action="toggle-track-handoffs"]');
+    if (toggleFlag && openCardId !== null) {
+      const which = toggleFlag.dataset.action === 'toggle-splittable' ? 'splittable' : 'track_handoffs';
+      const cur = (lastData.cards || []).find(c => c.id === openCardId);
+      if (!cur) return;
+      const next = !cur[which];
+      toggleFlag.disabled = true;
+      try {
+        const resp = await fetch(`/api/cards/${openCardId}/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ [which]: next }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.error || ('HTTP ' + resp.status));
+        }
+        showToast(`#${openCardId} ${which} → ${next ? 'on' : 'off'}`, 'ok');
+        await refresh();
+      } catch (err) {
+        showToast(`toggle failed: ${err.message}`, 'error');
+      } finally {
+        toggleFlag.disabled = false;
+      }
+      return;
+    }
+
     const save = e.target.closest('[data-action="save-body"]');
     if (save && openCardId !== null) {
       const ta = drawer.querySelector('#drawer-body-edit');
