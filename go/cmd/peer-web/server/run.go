@@ -225,7 +225,15 @@ func dispatchWorkerForCard(
 		}
 		agentArgv = tuneArgvForHandoffs(agentArgv)
 	}
-	cmd, err := spawnWorker(prompt, logFile, agentArgv)
+	// Track 1 #1: per-board project root → cmd.Dir so workers land in
+	// the right project tree. Empty/unset → inherit peer-web cwd
+	// (prior behavior). Look up settings once per dispatch (cheap;
+	// indexed by pair_key).
+	cwd := ""
+	if bs, err := st.GetBoardSettings(ctx, card.PairKey); err == nil && bs.ProjectRoot != "" {
+		cwd = bs.ProjectRoot
+	}
+	cmd, err := spawnWorker(prompt, logFile, agentArgv, cwd)
 	if err != nil {
 		_ = logFile.Close()
 		_ = st.FinishCardRun(ctx, run.ID, sqlitestore.CardRunStatusFailed, -1)
@@ -477,7 +485,11 @@ func finalizeDecomposerExit(ctx context.Context, st webStore, cardID int64, labe
 //     --max-turns=40.
 //
 // The prompt is piped on stdin in every case.
-func spawnWorker(prompt string, logFile *os.File, perAgentArgv []string) (*exec.Cmd, error) {
+//
+// cwd: when non-empty, sets cmd.Dir so the worker lands in that directory
+// instead of inheriting peer-web's cwd. Track 1 #1 per-board
+// project_root binding. Empty preserves prior behavior.
+func spawnWorker(prompt string, logFile *os.File, perAgentArgv []string, cwd string) (*exec.Cmd, error) {
 	argv := perAgentArgv
 	if len(argv) == 0 {
 		if override := os.Getenv("AGENT_COLLAB_WORKER_CMD"); override != "" {
@@ -494,6 +506,9 @@ func spawnWorker(prompt string, logFile *os.File, perAgentArgv []string) (*exec.
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

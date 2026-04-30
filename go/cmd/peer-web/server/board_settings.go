@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
@@ -61,6 +62,7 @@ type boardSettingsBody struct {
 	AutoPromote      *bool   `json:"auto_promote"`
 	PollIntervalSecs *int    `json:"poll_interval_secs"`
 	UpdatedBy        *string `json:"updated_by"`
+	ProjectRoot      *string `json:"project_root"` // Track 1 #1 — empty clears
 }
 
 func (s *Server) handleBoardSettingsPost(w http.ResponseWriter, r *http.Request, pairKey string) {
@@ -97,6 +99,15 @@ func (s *Server) handleBoardSettingsPost(w http.ResponseWriter, r *http.Request,
 	if body.PollIntervalSecs != nil {
 		cur.PollIntervalSecs = *body.PollIntervalSecs
 	}
+	if body.ProjectRoot != nil {
+		v := *body.ProjectRoot
+		if v != "" && !strings.HasPrefix(v, "/") {
+			writeJSONError(w, http.StatusBadRequest,
+				"project_root must be an absolute path or empty")
+			return
+		}
+		cur.ProjectRoot = v
+	}
 	if body.UpdatedBy != nil && *body.UpdatedBy != "" {
 		cur.UpdatedBy = *body.UpdatedBy
 	} else if cur.UpdatedBy == "" {
@@ -127,7 +138,7 @@ func (s *Server) handleBoardSettingsPost(w http.ResponseWriter, r *http.Request,
 }
 
 func boardSettingsToJSON(b sqlitestore.BoardSettings) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"pair_key":           b.PairKey,
 		"auto_drain":         b.AutoDrain,
 		"max_concurrent":     b.MaxConcurrent,
@@ -136,4 +147,8 @@ func boardSettingsToJSON(b sqlitestore.BoardSettings) map[string]any {
 		"updated_at":         orNull(b.UpdatedAt),
 		"updated_by":         orNull(b.UpdatedBy),
 	}
+	if b.ProjectRoot != "" {
+		m["project_root"] = b.ProjectRoot
+	}
+	return m
 }

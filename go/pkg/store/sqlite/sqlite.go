@@ -69,7 +69,11 @@ const (
 	// decomposer prompt path and to append the split addendum, and emits
 	// 'split'/'handoff' events — pre-0014 DBs would either ignore the new
 	// columns (silent default behavior) or reject the new event kinds.
-	GooseVersionRequired = 14
+	// Bumped 14 → 15 for Track 1 #1's 0015 migration that adds
+	// board_settings.project_root for the per-board cwd binding
+	// spawnWorker reads — pre-0015 DBs would silently ignore project_root
+	// and inherit peer-web's cwd (the linkboard dogfood failure mode).
+	GooseVersionRequired = 15
 
 	sessionsDirRel = ".agent-collab/sessions"
 )

@@ -61,8 +61,8 @@ SQL
 
 "$MIG_BIN" -driver sqlite -dsn "$DB" -dir "$MIG_DIR" up >/dev/null 2>&1 \
   || fail "schema migrate"
-[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "14" ] \
-  || fail "goose version != 14"
+[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "15" ] \
+  || fail "goose version != 15"
 
 # --- A1: create both runtimes + list --------------------------------------
 out_claude=$("$PI_BIN" agent-create --label test-claude --runtime claude --role impl \

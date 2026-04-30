@@ -164,8 +164,8 @@ SQL
 
 "$MIG_BIN" -driver sqlite -dsn "$DB" -dir "$MIG_DIR" up >/dev/null 2>&1 \
   || fail "schema migrate"
-[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "14" ] \
-  || fail "goose version != 14"
+[ "$(sqlite3 "$DB" "SELECT MAX(version_id) FROM goose_db_version WHERE is_applied=1")" = "15" ] \
+  || fail "goose version != 15"
 
 # Single stub agent backing the fake decomposer/worker. Pool-routed so
 # the dispatch path stamps card_runs.agent_id and exercises the v3.12.4

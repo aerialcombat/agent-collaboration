@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	sqlitestore "agent-collaboration/go/pkg/store/sqlite"
 )
@@ -36,6 +37,7 @@ func runBoardSet(args []string) int {
 	maxConcurrent := fs.Int("max-concurrent", 0, "max concurrent runs per board (>=1)")
 	autoPromote := fs.String("auto-promote", "", "on|off — auto-promote in_review→done when downstream blockees")
 	pollSecs := fs.Int("poll-interval-secs", 0, "drainer tick interval (>=1)")
+	projectRoot := fs.String("project-root", "", "absolute path used as cwd for spawned workers (empty = inherit peer-web cwd)")
 	as := fs.String("as", "", "author label written to board_settings.updated_by")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
@@ -95,6 +97,16 @@ func runBoardSet(args []string) int {
 		}
 		cur.PollIntervalSecs = *pollSecs
 	}
+	if visited["project-root"] {
+		// Empty string clears the binding (back to peer-web cwd).
+		// Non-empty must be absolute — relative paths would resolve
+		// against peer-web's cwd, which is the bug we're fixing.
+		if *projectRoot != "" && !strings.HasPrefix(*projectRoot, "/") {
+			fmt.Fprintln(os.Stderr, "board-set: --project-root must be an absolute path or empty")
+			return exitUsage
+		}
+		cur.ProjectRoot = *projectRoot
+	}
 	if *as != "" {
 		cur.UpdatedBy = *as
 	}
@@ -150,9 +162,13 @@ func emitBoardSettings(b sqlitestore.BoardSettings, format string) int {
 	if format == "json" {
 		return emitJSON(boardSettingsAsMap(b))
 	}
-	fmt.Printf("%s  auto_drain=%v  max=%d  auto_promote=%v  poll=%ds  updated_by=%s\n",
+	root := b.ProjectRoot
+	if root == "" {
+		root = "(inherit cwd)"
+	}
+	fmt.Printf("%s  auto_drain=%v  max=%d  auto_promote=%v  poll=%ds  project_root=%s  updated_by=%s\n",
 		b.PairKey, b.AutoDrain, b.MaxConcurrent, b.AutoPromote,
-		b.PollIntervalSecs, b.UpdatedBy)
+		b.PollIntervalSecs, root, b.UpdatedBy)
 	return exitOK
 }
 
@@ -175,7 +191,7 @@ func emitCardRuns(runs []*sqlitestore.CardRun, format string) int {
 }
 
 func boardSettingsAsMap(b sqlitestore.BoardSettings) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"pair_key":           b.PairKey,
 		"auto_drain":         b.AutoDrain,
 		"max_concurrent":     b.MaxConcurrent,
@@ -184,6 +200,10 @@ func boardSettingsAsMap(b sqlitestore.BoardSettings) map[string]any {
 		"updated_at":         b.UpdatedAt,
 		"updated_by":         b.UpdatedBy,
 	}
+	if b.ProjectRoot != "" {
+		m["project_root"] = b.ProjectRoot
+	}
+	return m
 }
 
 func cardRunAsMap(r *sqlitestore.CardRun) map[string]any {

@@ -342,6 +342,13 @@ type BoardSettings struct {
 	PollIntervalSecs int
 	UpdatedAt        string
 	UpdatedBy        string
+
+	// Track 1 #1 (linkboard dogfood obs #1): per-board cwd for spawned
+	// workers. When non-empty, peer-web sets cmd.Dir = ProjectRoot so
+	// dispatched workers land in the right project tree instead of
+	// inheriting peer-web's own cwd. Empty/unset preserves prior
+	// behavior (inherit cwd).
+	ProjectRoot string
 }
 
 // DefaultBoardSettings returns the row a board has when no row has been
@@ -360,13 +367,14 @@ func DefaultBoardSettings() BoardSettings {
 func (s *SQLiteLocal) GetBoardSettings(ctx context.Context, pairKey string) (BoardSettings, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT pair_key, auto_drain, max_concurrent, auto_promote,
-		       poll_interval_secs, updated_at, updated_by
+		       poll_interval_secs, updated_at, updated_by, project_root
 		  FROM board_settings WHERE pair_key=?
 	`, pairKey)
 	var b BoardSettings
 	var ad, ap int
+	var projectRoot sql.NullString
 	err := row.Scan(&b.PairKey, &ad, &b.MaxConcurrent, &ap,
-		&b.PollIntervalSecs, &b.UpdatedAt, &b.UpdatedBy)
+		&b.PollIntervalSecs, &b.UpdatedAt, &b.UpdatedBy, &projectRoot)
 	if errors.Is(err, sql.ErrNoRows) {
 		def := DefaultBoardSettings()
 		def.PairKey = pairKey
@@ -377,6 +385,9 @@ func (s *SQLiteLocal) GetBoardSettings(ctx context.Context, pairKey string) (Boa
 	}
 	b.AutoDrain = ad != 0
 	b.AutoPromote = ap != 0
+	if projectRoot.Valid {
+		b.ProjectRoot = projectRoot.String
+	}
 	return b, nil
 }
 
@@ -385,7 +396,7 @@ func (s *SQLiteLocal) GetBoardSettings(ctx context.Context, pairKey string) (Boa
 func (s *SQLiteLocal) ListBoardSettingsAutoDrain(ctx context.Context) ([]BoardSettings, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT pair_key, auto_drain, max_concurrent, auto_promote,
-		       poll_interval_secs, updated_at, updated_by
+		       poll_interval_secs, updated_at, updated_by, project_root
 		  FROM board_settings WHERE auto_drain=1 ORDER BY pair_key
 	`)
 	if err != nil {
@@ -396,12 +407,16 @@ func (s *SQLiteLocal) ListBoardSettingsAutoDrain(ctx context.Context) ([]BoardSe
 	for rows.Next() {
 		var b BoardSettings
 		var ad, ap int
+		var projectRoot sql.NullString
 		if err := rows.Scan(&b.PairKey, &ad, &b.MaxConcurrent, &ap,
-			&b.PollIntervalSecs, &b.UpdatedAt, &b.UpdatedBy); err != nil {
+			&b.PollIntervalSecs, &b.UpdatedAt, &b.UpdatedBy, &projectRoot); err != nil {
 			return nil, err
 		}
 		b.AutoDrain = ad != 0
 		b.AutoPromote = ap != 0
+		if projectRoot.Valid {
+			b.ProjectRoot = projectRoot.String
+		}
 		out = append(out, b)
 	}
 	return out, rows.Err()
@@ -427,18 +442,20 @@ func (s *SQLiteLocal) UpsertBoardSettings(ctx context.Context, b BoardSettings) 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO board_settings (
 		  pair_key, auto_drain, max_concurrent, auto_promote,
-		  poll_interval_secs, updated_at, updated_by
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		  poll_interval_secs, updated_at, updated_by, project_root
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(pair_key) DO UPDATE SET
 		  auto_drain=excluded.auto_drain,
 		  max_concurrent=excluded.max_concurrent,
 		  auto_promote=excluded.auto_promote,
 		  poll_interval_secs=excluded.poll_interval_secs,
 		  updated_at=excluded.updated_at,
-		  updated_by=excluded.updated_by
+		  updated_by=excluded.updated_by,
+		  project_root=excluded.project_root
 	`,
 		b.PairKey, boolToInt(b.AutoDrain), b.MaxConcurrent,
 		boolToInt(b.AutoPromote), b.PollIntervalSecs, now, b.UpdatedBy,
+		nullableString(b.ProjectRoot),
 	)
 	return err
 }
