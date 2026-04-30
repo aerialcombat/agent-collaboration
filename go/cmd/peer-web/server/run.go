@@ -362,6 +362,54 @@ func monitorWorker(runID, cardID int64, label string, cmd *exec.Cmd, logFile *os
 	}
 
 	finalizeDecomposerExit(ctx, st, cardID, label, status, exitCode)
+	finalizeHandoffSelfPromotion(ctx, st, cardID, label, status)
+}
+
+// finalizeHandoffSelfPromotion sets track_handoffs=true on a card whose
+// worker exited cleanly without reaching a terminal-or-todo state — the
+// signal that the worker likely hit its turn budget mid-task. The next
+// dispatch then teaches the handoff discipline so the worker has a
+// structured way to preserve continuity.
+//
+// Skipped for epics (decomposer flow has its own finalizer) and for
+// cards already track_handoffs=true (no point re-stamping).
+//
+// Plan §8 H3 / Q11.F.
+func finalizeHandoffSelfPromotion(ctx context.Context, st webStore, cardID int64, label, runStatus string) {
+	if runStatus != sqlitestore.CardRunStatusCompleted {
+		return // worker crashed — separate failure mode, don't promote
+	}
+	card, err := st.GetCard(ctx, cardID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeHandoffSelfPromotion: GetCard %d: %v\n", cardID, err)
+		return
+	}
+	if card.Kind == sqlitestore.CardKindEpic {
+		return // decomposer path owns its own promotion logic
+	}
+	if card.TrackHandoffs {
+		return // already promoted; nothing to do
+	}
+	if card.Status != sqlitestore.CardStatusInProgress {
+		return // worker reached a terminal-or-todo state — no need
+	}
+	on := true
+	if _, err := st.UpdateCardFields(ctx, cardID,
+		sqlitestore.UpdateCardFieldsParams{TrackHandoffs: &on},
+		"drainer-self-promote",
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeHandoffSelfPromotion: promote card=%d: %v\n", cardID, err)
+		return
+	}
+	// Comment so an operator can see why track_handoffs flipped on without
+	// them touching it. body_update event is also recorded by
+	// UpdateCardFields, but it's terse — this comment names the cause.
+	if _, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+		CardID: cardID, Kind: sqlitestore.CardEventComment, Author: "system",
+		Body: fmt.Sprintf("track_handoffs auto-enabled — worker %s exited cleanly with card still in_progress (likely hit turn budget); next dispatch will include handoff discipline", label),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeHandoffSelfPromotion: comment card=%d: %v\n", cardID, err)
+	}
 }
 
 // finalizeDecomposerExit handles epic post-run housekeeping. When an
