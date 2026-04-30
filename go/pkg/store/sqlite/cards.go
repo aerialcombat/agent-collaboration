@@ -543,6 +543,58 @@ func (s *SQLiteLocal) AssignCardToAgent(ctx context.Context, cardID, agentID int
 	return s.GetCard(ctx, cardID)
 }
 
+// MaxHandoffBodyBytes caps the structured body of a single handoff
+// event. Plan §11 Q11.D: prevent unbounded growth across many sessions
+// of one long-lived card. Larger bodies are rejected with a clear error
+// so the worker can compress / split before retry.
+const MaxHandoffBodyBytes = 64 * 1024
+
+// ErrHandoffTooLarge — body exceeded MaxHandoffBodyBytes.
+var ErrHandoffTooLarge = errors.New("store: handoff body exceeds 64 KB cap")
+
+// RecordCardHandoff appends a kind=handoff event with the given body
+// (any JSON / markdown — caller-defined shape) and author. Returns the
+// inserted event row. Bodies > MaxHandoffBodyBytes are rejected.
+//
+// v3.12.4.6: workers call this near their turn-budget so the next
+// dispatch can resume from where they left off (buildWorkerPrompt
+// prepends the latest handoff event when track_handoffs=true).
+func (s *SQLiteLocal) RecordCardHandoff(ctx context.Context, cardID int64, body, author string) (*CardEvent, error) {
+	if cardID == 0 || body == "" || author == "" {
+		return nil, fmt.Errorf("RecordCardHandoff: card_id, body, author required")
+	}
+	if len(body) > MaxHandoffBodyBytes {
+		return nil, fmt.Errorf("%w: %d bytes (max %d)",
+			ErrHandoffTooLarge, len(body), MaxHandoffBodyBytes)
+	}
+	return s.AppendCardEvent(ctx, AppendCardEventParams{
+		CardID: cardID, Kind: CardEventHandoff,
+		Author: author, Body: body,
+	})
+}
+
+// LatestHandoffEvent returns the most recent kind=handoff event for the
+// given card, or (nil, nil) if there are none. Used by buildWorkerPrompt
+// to prepend continuity context when track_handoffs is set.
+func (s *SQLiteLocal) LatestHandoffEvent(ctx context.Context, cardID int64) (*CardEvent, error) {
+	e := &CardEvent{}
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, card_id, kind, author, body, meta, created_at
+		   FROM card_events
+		  WHERE card_id = ? AND kind = ?
+		  ORDER BY id DESC
+		  LIMIT 1`,
+		cardID, CardEventHandoff,
+	).Scan(&e.ID, &e.CardID, &e.Kind, &e.Author, &e.Body, &e.Meta, &e.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("LatestHandoffEvent: %w", err)
+	}
+	return e, nil
+}
+
 // AppendCardEventParams collects insert fields. Meta is raw JSON so
 // callers can stash kind-specific data without growing the schema.
 type AppendCardEventParams struct {

@@ -415,9 +415,71 @@ func (s *Server) handleCardSubpath(w http.ResponseWriter, r *http.Request) {
 		s.handleCardComment(w, r, id)
 	case "assign":
 		s.handleCardAssign(w, r, id)
+	case "handoff":
+		s.handleCardHandoff(w, r, id)
 	default:
 		writeJSONError(w, http.StatusNotFound, "unknown card verb")
 	}
+}
+
+// handleCardHandoff — POST /api/cards/{id}/handoff
+//
+//	body: {"body": "<markdown / structured text>", "author": "<label>"}
+//
+// Records a kind=handoff event. The body is opaque to the server (the
+// worker prompt instructs the structure: summary, decisions, open
+// questions, next steps, files touched, context to preserve). Server
+// enforces the 64 KB cap (Q11.D) via the store layer.
+//
+// Author defaults to "agent" so a worker that didn't pass an explicit
+// label still produces a useful audit row.
+func (s *Server) handleCardHandoff(w http.ResponseWriter, r *http.Request, id int64) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Body   string `json:"body"`
+		Author string `json:"author"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Body == "" {
+		writeJSONError(w, http.StatusBadRequest, "body is required")
+		return
+	}
+	if body.Author == "" {
+		body.Author = "agent"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	st, err := storeOpen(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "open store: "+err.Error())
+		return
+	}
+	defer st.Close()
+
+	ev, err := st.RecordCardHandoff(ctx, id, body.Body, body.Author)
+	if err != nil {
+		if errors.Is(err, sqlitestore.ErrHandoffTooLarge) {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         ev.ID,
+		"card_id":    ev.CardID,
+		"kind":       ev.Kind,
+		"author":     ev.Author,
+		"body_bytes": len(ev.Body),
+		"created_at": ev.CreatedAt,
+	})
 }
 
 // handleCardAssign — POST/DELETE /api/cards/{id}/assign

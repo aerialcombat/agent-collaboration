@@ -340,6 +340,27 @@ CARD_TOOLS = [
         },
     },
     {
+        "name": "card_handoff",
+        "description": (
+            "Record a structured handoff event before exiting near a "
+            "turn budget. The body should contain the handoff fields "
+            "the worker prompt asked for: summary, decisions, open "
+            "questions, next steps, files touched, context to preserve. "
+            "Capped at 64 KB. The next dispatch of this card will "
+            "prepend this handoff to the prompt so the next worker "
+            "resumes from where you left off."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "body": {"type": "string", "minLength": 1, "maxLength": 65536},
+            },
+            "required": ["id", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "card_add_dependency",
         "description": (
             "Add a blocker → blockee edge. Blockee can't become ready "
@@ -1182,6 +1203,31 @@ def _card_comment(req_id, arguments: dict) -> None:
     _tool_json_result(req_id, parsed if parsed is not None else {})
 
 
+def _card_handoff(req_id, arguments: dict) -> None:
+    cid = arguments.get("id")
+    body = arguments.get("body")
+    if not isinstance(cid, int) or cid < 1:
+        _tool_error(req_id, "error: `id` required (positive integer)")
+        return
+    if not isinstance(body, str) or not body.strip():
+        _tool_error(req_id, "error: `body` required (non-empty string)")
+        return
+    if len(body.encode("utf-8")) > 65536:
+        _tool_error(req_id, "error: `body` exceeds 64 KB cap — compress or split before retry")
+        return
+    label, _ = _resolve_caller_label_and_pair(arguments)
+    if not label:
+        label = "agent"
+    ok, msg, parsed = _shell_card_verb(
+        "card-handoff",
+        ["--card", str(cid), "--body", body, "--as", label, "--format", "json"],
+    )
+    if not ok:
+        _tool_error(req_id, f"card_handoff: {msg}")
+        return
+    _tool_json_result(req_id, parsed if parsed is not None else {})
+
+
 def _card_add_dependency(req_id, arguments: dict) -> None:
     blocker = arguments.get("blocker_id")
     blockee = arguments.get("blockee_id")
@@ -1519,6 +1565,7 @@ CARD_TOOL_HANDLERS = {
     "card_update_status": _card_update_status,
     "card_update": _card_update,
     "card_comment": _card_comment,
+    "card_handoff": _card_handoff,
     "card_add_dependency": _card_add_dependency,
     "card_remove_dependency": _card_remove_dependency,
     "card_runs": _card_runs,

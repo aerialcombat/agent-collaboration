@@ -153,6 +153,8 @@ func run(args []string) int {
 		return runCardAssign(rest)
 	case "card-unassign":
 		return runCardUnassign(rest)
+	case "card-handoff":
+		return runCardHandoff(rest)
 	case "-h", "--help", "help":
 		usage()
 		return exitOK

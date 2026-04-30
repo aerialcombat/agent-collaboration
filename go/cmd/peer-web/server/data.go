@@ -72,6 +72,9 @@ type webStore interface {
 	// v3.12.4 — pool-aware dispatch + designated assignment.
 	PickAgentForCard(ctx context.Context, card *sqlitestore.Card) (*sqlitestore.Agent, error)
 	AssignCardToAgent(ctx context.Context, cardID, agentID int64, author string) (*sqlitestore.Card, error)
+	// v3.12.4.6 — handoffs.
+	RecordCardHandoff(ctx context.Context, cardID int64, body, author string) (*sqlitestore.CardEvent, error)
+	LatestHandoffEvent(ctx context.Context, cardID int64) (*sqlitestore.CardEvent, error)
 	Close() error
 }
 
