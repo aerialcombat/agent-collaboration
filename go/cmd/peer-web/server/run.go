@@ -66,7 +66,11 @@ func (s *Server) handleCardRun(w http.ResponseWriter, r *http.Request, id int64)
 			fmt.Sprintf("card status is %s, expected todo", card.Status))
 		return
 	}
-	if !card.Ready {
+	// v3.12.4.5 — epics dispatch the decomposer, not real work. They're
+	// inception-level by design (children don't exist yet, so nothing to
+	// block on). Skip the ready gate so an operator can fire a fresh
+	// epic immediately even if its blocker graph is unusual.
+	if !card.Ready && card.Kind != sqlitestore.CardKindEpic {
 		writeJSONError(w, http.StatusConflict,
 			"card has open blockers — run the blockers first")
 		return
@@ -327,6 +331,57 @@ func monitorWorker(runID, cardID int64, label string, cmd *exec.Cmd, logFile *os
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "monitorWorker: run_complete event run=%d: %v\n", runID, err)
 	}
+
+	finalizeDecomposerExit(ctx, st, cardID, label, status, exitCode)
+}
+
+// finalizeDecomposerExit handles epic post-run housekeeping. When an
+// epic's decomposer exits cleanly with at least one child created
+// (BlockeeIDs non-empty), promote the epic to done. If the worker
+// exited cleanly without creating any children, leave the epic in
+// in_progress and emit an error event so an operator can review.
+//
+// Non-epic cards are no-ops.
+//
+// Errors during finalization are logged but never bubble — monitor's
+// run_complete write is the must-succeed action; this is icing.
+func finalizeDecomposerExit(ctx context.Context, st webStore, cardID int64, label, runStatus string, exitCode int) {
+	card, err := st.GetCard(ctx, cardID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeDecomposerExit: GetCard %d: %v\n", cardID, err)
+		return
+	}
+	if card.Kind != sqlitestore.CardKindEpic {
+		return
+	}
+	if runStatus != sqlitestore.CardRunStatusCompleted {
+		// Decomposer crashed — leave the epic alone. Operator can re-run.
+		return
+	}
+	if len(card.BlockeeIDs) > 0 {
+		// At least one child was created (children depend on the epic
+		// via add-dependency, so they show up as blockees). Promote.
+		if _, err := st.UpdateCardStatus(ctx, cardID, sqlitestore.CardStatusDone, "decomposer-auto-promote"); err != nil {
+			fmt.Fprintf(os.Stderr, "finalizeDecomposerExit: promote epic %d: %v\n", cardID, err)
+		}
+		return
+	}
+	// Clean exit but no children — decomposer punted. Record an error
+	// event so the operator can read the rationale (worker should have
+	// posted a comment) and either edit the body or cancel.
+	errMeta, _ := json.Marshal(map[string]any{
+		"reason":    "no_children_emitted",
+		"exit_code": exitCode,
+		"worker":    label,
+	})
+	if _, err := st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+		CardID: cardID, Kind: sqlitestore.CardEventComment,
+		Author: "system",
+		Body:   fmt.Sprintf("decomposer exited cleanly without creating children — epic needs human review (worker %s)", label),
+		Meta:   string(errMeta),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeDecomposerExit: error event %d: %v\n", cardID, err)
+	}
 }
 
 // spawnWorker launches the worker process non-blocking, redirecting
@@ -396,7 +451,18 @@ func defaultArgvForRuntime(runtime string) []string {
 // buildWorkerPrompt composes the prompt headless `claude -p` receives
 // via stdin. The structure matches the manual subagent dispatch — same
 // workflow rules, same output contract.
+//
+// v3.12.4.5: when card.Kind == "epic", returns the decomposer prompt
+// instead of a regular worker prompt. The decomposer's job is to split
+// the epic into N child cards via card_create + card_add_dependency MCP
+// calls, then exit.
+//
+// v3.12.4.5: when card.Splittable is true, appends the mid-session split
+// addendum so the worker knows it MAY split if it discovers hidden scope.
 func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string]any) string {
+	if card.Kind == sqlitestore.CardKindEpic {
+		return buildDecomposerPrompt(card, label)
+	}
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "You are a headless kanban worker spawned to drain a single card.\n")
@@ -461,6 +527,110 @@ func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string
 	fmt.Fprintf(&b, "- You have full Edit/Write/Bash. Be a good citizen — don't touch files outside "+
 		"what the card asks for.\n")
 	fmt.Fprintf(&b, "- Don't `git commit` or push. The human reviews artifacts before merging.\n")
+
+	if card.Splittable {
+		writeSplitAddendum(&b, card, label)
+	}
+
+	return b.String()
+}
+
+// MaxChildrenPerSplit caps the number of children a single mid-session
+// split may emit. Beyond this, the worker is required to write a handoff
+// describing the proposed restructuring so a human can approve. See plan
+// §3 Q-E and §11 Q11.E.
+const MaxChildrenPerSplit = 5
+
+// writeSplitAddendum appends the mid-session split discipline to the
+// regular worker prompt. Only emitted when card.Splittable is true.
+func writeSplitAddendum(b *strings.Builder, card *sqlitestore.Card, label string) {
+	fmt.Fprintf(b, "\n## You may split this card mid-session\n\n")
+	fmt.Fprintf(b, "If during work you discover this card's scope is wrong (e.g. it actually\n")
+	fmt.Fprintf(b, "requires multiple sub-pieces, or has a hidden dependency), you may split:\n\n")
+	fmt.Fprintf(b, "  1. Create child cards via the `card_create` MCP tool (max %d children).\n", MaxChildrenPerSplit)
+	fmt.Fprintf(b, "  2. Wire dependencies via `card_add_dependency` so this card waits on them.\n")
+	fmt.Fprintf(b, "  3. Call `card_comment` with a clear rationale: what you learned that\n")
+	fmt.Fprintf(b, "     made splitting necessary.\n")
+	fmt.Fprintf(b, "  4. Call `card_update_status --status todo` to release your claim:\n")
+	fmt.Fprintf(b, "     ```\n")
+	fmt.Fprintf(b, "     ~/.local/bin/peer-inbox card-update-status --card %d \\\n", card.ID)
+	fmt.Fprintf(b, "       --status todo --as %s\n", label)
+	fmt.Fprintf(b, "     ```\n")
+	fmt.Fprintf(b, "  5. Exit cleanly. The drainer will pick up the children and re-dispatch\n")
+	fmt.Fprintf(b, "     this card once they finish.\n\n")
+	fmt.Fprintf(b, "You MUST declare what changed about your understanding (the comment in\n")
+	fmt.Fprintf(b, "step 3). Splitting to avoid hard work is not allowed — the audit trail\n")
+	fmt.Fprintf(b, "is visible to operators.\n\n")
+	fmt.Fprintf(b, "If the proposed restructuring requires more than %d children, do NOT\n", MaxChildrenPerSplit)
+	fmt.Fprintf(b, "split — instead, mark BLOCKED with a clear description so a human can\n")
+	fmt.Fprintf(b, "approve the larger reorganization.\n")
+}
+
+// buildDecomposerPrompt returns the prompt for an epic card's
+// decomposer dispatch. The decomposer reads the epic body and emits
+// N child cards via card_create + card_add_dependency. When the worker
+// exits with at least one child created, monitorWorker promotes the
+// epic to done. (Plan §5.1)
+func buildDecomposerPrompt(card *sqlitestore.Card, label string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "You are a job decomposer for the agent-collaboration kanban.\n")
+	fmt.Fprintf(&b, "You are running via `claude -p` — there is NO HUMAN to ask clarifying questions.\n\n")
+
+	fmt.Fprintf(&b, "## Identity\n")
+	fmt.Fprintf(&b, "Epic card id: %d\n", card.ID)
+	fmt.Fprintf(&b, "Pair key:     %s\n", card.PairKey)
+	fmt.Fprintf(&b, "Your label:   %s\n\n", label)
+
+	fmt.Fprintf(&b, "## Job to decompose\n")
+	fmt.Fprintf(&b, "Title: %s\n", card.Title)
+	if card.NeedsRole != "" {
+		fmt.Fprintf(&b, "Hint role: %s\n", card.NeedsRole)
+	}
+	fmt.Fprintf(&b, "\nBody:\n%s\n\n", card.Body)
+
+	fmt.Fprintf(&b, "## Your task\n")
+	fmt.Fprintf(&b, "Read the job above and produce N child cards (1 ≤ N ≤ 12). Each child is\n")
+	fmt.Fprintf(&b, "30-90 minutes of focused work for one agent, with one clear acceptance\n")
+	fmt.Fprintf(&b, "criterion. If two cards share more than 50%% of their context, merge.\n")
+	fmt.Fprintf(&b, "Wire dependencies — don't fan everything out flat unless the children\n")
+	fmt.Fprintf(&b, "truly are independent.\n\n")
+
+	fmt.Fprintf(&b, "For each child, you MUST call the `card_create` MCP tool with:\n")
+	fmt.Fprintf(&b, "  pair_key:    %q\n", card.PairKey)
+	fmt.Fprintf(&b, "  title:       short imperative (e.g. \"Add JWT verification middleware\")\n")
+	fmt.Fprintf(&b, "  body:        markdown spec with acceptance criterion\n")
+	fmt.Fprintf(&b, "  needs_role:  one of {impl, review, qa, design, docs} — pick the closest\n")
+	fmt.Fprintf(&b, "  priority:    -1 | 0 | 1\n")
+	fmt.Fprintf(&b, "  splittable:  true   (decomposer's children default splittable=true so\n")
+	fmt.Fprintf(&b, "                       a worker that finds hidden scope can split again)\n\n")
+
+	fmt.Fprintf(&b, "After EACH child is created, you MUST also call `card_add_dependency`\n")
+	fmt.Fprintf(&b, "with blocker=%d (this epic's id) and blockee={child id}. This wires the\n", card.ID)
+	fmt.Fprintf(&b, "child to wait until this epic transitions to done — the drainer uses\n")
+	fmt.Fprintf(&b, "the resulting blockee count to detect that decomposition succeeded.\n\n")
+
+	fmt.Fprintf(&b, "Then, for each inter-child blocker → blockee dependency you identified,\n")
+	fmt.Fprintf(&b, "call `card_add_dependency` with the child ids.\n\n")
+
+	fmt.Fprintf(&b, "When done, exit. The drainer will mark this epic done automatically once\n")
+	fmt.Fprintf(&b, "you exit with at least one child created. If you cannot decompose the\n")
+	fmt.Fprintf(&b, "job (too vague, too small, contradictory), exit without creating children\n")
+	fmt.Fprintf(&b, "and the epic will be flagged for human review.\n\n")
+
+	fmt.Fprintf(&b, "## CLI fallback\n")
+	fmt.Fprintf(&b, "If the MCP tools are not exposed in your session, the same operations\n")
+	fmt.Fprintf(&b, "are available via the CLI:\n")
+	fmt.Fprintf(&b, "  ~/.local/bin/peer-inbox card-create --pair-key %s --title T \\\n", card.PairKey)
+	fmt.Fprintf(&b, "    --body B --needs-role R --priority P --splittable on \\\n")
+	fmt.Fprintf(&b, "    --as %s --format json\n", label)
+	fmt.Fprintf(&b, "  ~/.local/bin/peer-inbox card-add-dep --blocker %d --blockee CHILD_ID \\\n", card.ID)
+	fmt.Fprintf(&b, "    --as %s\n\n", label)
+
+	fmt.Fprintf(&b, "## Constraints\n")
+	fmt.Fprintf(&b, "- Don't do the actual work yourself — your job is decomposition only.\n")
+	fmt.Fprintf(&b, "- Don't `git commit` or push.\n")
+	fmt.Fprintf(&b, "- No clarifying questions; either decompose, or exit empty.\n")
 
 	return b.String()
 }
