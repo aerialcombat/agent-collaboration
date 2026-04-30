@@ -559,6 +559,11 @@ var ErrHandoffTooLarge = errors.New("store: handoff body exceeds 64 KB cap")
 // v3.12.4.6: workers call this near their turn-budget so the next
 // dispatch can resume from where they left off (buildWorkerPrompt
 // prepends the latest handoff event when track_handoffs=true).
+//
+// Plan §3 Q-B: emitting a handoff also releases the claim and flips
+// status back to todo so the next pool dispatch can pick it up. The
+// release happens atomically with the event insert in a single
+// transaction.
 func (s *SQLiteLocal) RecordCardHandoff(ctx context.Context, cardID int64, body, author string) (*CardEvent, error) {
 	if cardID == 0 || body == "" || author == "" {
 		return nil, fmt.Errorf("RecordCardHandoff: card_id, body, author required")
@@ -567,10 +572,78 @@ func (s *SQLiteLocal) RecordCardHandoff(ctx context.Context, cardID int64, body,
 		return nil, fmt.Errorf("%w: %d bytes (max %d)",
 			ErrHandoffTooLarge, len(body), MaxHandoffBodyBytes)
 	}
-	return s.AppendCardEvent(ctx, AppendCardEventParams{
-		CardID: cardID, Kind: CardEventHandoff,
-		Author: author, Body: body,
-	})
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("RecordCardHandoff begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Probe the card to know whether we need to release the claim.
+	var (
+		curStatus  string
+		curClaimer sql.NullString
+	)
+	if err := tx.QueryRowContext(ctx,
+		`SELECT status, claimed_by FROM cards WHERE id = ?`, cardID,
+	).Scan(&curStatus, &curClaimer); err == sql.ErrNoRows {
+		return nil, ErrCardNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("RecordCardHandoff probe: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO card_events (card_id, kind, author, body, meta) VALUES (?, ?, ?, ?, '{}')`,
+		cardID, CardEventHandoff, author, body,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("RecordCardHandoff insert: %w", err)
+	}
+	evID, err := res.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("RecordCardHandoff lastid: %w", err)
+	}
+
+	// Release claim + revert in_progress → todo (Q-B). Other statuses
+	// (already-todo, in_review, done, cancelled) are left alone — a
+	// handoff on those is a checkpoint without a release.
+	if curStatus == CardStatusInProgress {
+		now := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE cards SET status = ?, claimed_by = NULL, claimed_at = NULL, updated_at = ? WHERE id = ?`,
+			CardStatusTodo, now, cardID,
+		); err != nil {
+			return nil, fmt.Errorf("RecordCardHandoff release: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("RecordCardHandoff commit: %w", err)
+	}
+
+	// Audit the release as a status_change event AFTER commit so its
+	// ordering relative to the handoff is "right after". This is best-
+	// effort — recordEvent logs failures but doesn't bubble.
+	if curStatus == CardStatusInProgress {
+		priorClaim := ""
+		if curClaimer.Valid {
+			priorClaim = curClaimer.String
+		}
+		meta, _ := jsonObject(map[string]any{
+			"old_status":   CardStatusInProgress,
+			"new_status":   CardStatusTodo,
+			"prior_claim":  priorClaim,
+			"trigger":      "handoff",
+		})
+		s.recordEvent(ctx, AppendCardEventParams{
+			CardID: cardID, Kind: CardEventStatusChange,
+			Author: author,
+			Body:   "handoff released claim — status in_progress → todo",
+			Meta:   meta,
+		})
+	}
+
+	return s.GetCardEvent(ctx, evID)
 }
 
 // LatestHandoffEvent returns the most recent kind=handoff event for the
