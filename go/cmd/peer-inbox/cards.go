@@ -38,6 +38,8 @@ func runCardCreate(args []string) int {
 	priority := fs.Int("priority", 0, "-1 low, 0 normal, 1 high")
 	tags := fs.String("tags", "", "JSON array of tags (e.g. [\"feed-card-epic\"])")
 	ctxRefs := fs.String("context-refs", "", "JSON object {msg_ids:[], files:[], urls:[], cards:[]}")
+	kind := fs.String("kind", sqlitestore.CardKindTask, "card kind: task (default) or epic")
+	splittable := fs.Bool("splittable", false, "if true, worker prompt is given the mid-session split addendum")
 	format := fs.String("format", "plain", "plain|json")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -48,6 +50,10 @@ func runCardCreate(args []string) int {
 	}
 	if *format != "plain" && *format != "json" {
 		fmt.Fprintf(os.Stderr, "card-create: --format must be plain or json\n")
+		return exitUsage
+	}
+	if *kind != sqlitestore.CardKindTask && *kind != sqlitestore.CardKindEpic {
+		fmt.Fprintln(os.Stderr, "card-create: --kind must be 'task' or 'epic'")
 		return exitUsage
 	}
 	if *tags != "" && !isValidJSON(*tags) {
@@ -78,6 +84,8 @@ func runCardCreate(args []string) int {
 		Priority:    *priority,
 		Tags:        *tags,
 		ContextRefs: *ctxRefs,
+		Kind:        *kind,
+		Splittable:  *splittable,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "card-create: %v\n", err)
@@ -288,6 +296,9 @@ func runCardUpdate(args []string) int {
 	priority := fs.Int("priority", 0, "new priority (-1 low, 0 normal, 1 high)")
 	tags := fs.String("tags", "", "new tags JSON array")
 	ctxRefs := fs.String("context-refs", "", "new context_refs JSON object")
+	kind := fs.String("kind", "", "promote/demote kind: 'task' or 'epic'")
+	splittable := fs.Bool("splittable", false, "set splittable flag (use --splittable=false to clear)")
+	trackHandoffs := fs.Bool("track-handoffs", false, "set track_handoffs flag (use --track-handoffs=false to clear)")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
@@ -333,6 +344,19 @@ func runCardUpdate(args []string) int {
 	}
 	if visited["context-refs"] {
 		params.ContextRefs = ctxRefs
+	}
+	if visited["kind"] {
+		if *kind != sqlitestore.CardKindTask && *kind != sqlitestore.CardKindEpic {
+			fmt.Fprintln(os.Stderr, "card-update: --kind must be 'task' or 'epic'")
+			return exitUsage
+		}
+		params.Kind = kind
+	}
+	if visited["splittable"] {
+		params.Splittable = splittable
+	}
+	if visited["track-handoffs"] {
+		params.TrackHandoffs = trackHandoffs
 	}
 
 	ctx, cancel := cardCtx()
@@ -563,6 +587,16 @@ func cardAsMap(c *sqlitestore.Card) map[string]any {
 	}
 	if c.AssignedToAgentID != 0 {
 		m["assigned_to_agent_id"] = c.AssignedToAgentID
+	}
+	// v3.12.4.5/.6 — surface decomposition + handoff flags. Kind is
+	// always present (defaults 'task'); the bools only when true so the
+	// vast majority of cards keep clean output.
+	m["kind"] = c.Kind
+	if c.Splittable {
+		m["splittable"] = true
+	}
+	if c.TrackHandoffs {
+		m["track_handoffs"] = true
 	}
 	return m
 }

@@ -1133,6 +1133,12 @@
   .activity-row.body_update .glyph { color: var(--fg-tertiary); }
   .activity-row.run_dispatch .glyph { color: var(--status-in-review); }
   .activity-row.run_complete .glyph { color: var(--status-done); }
+  .activity-row.assigned .glyph { color: var(--accent); }
+  .activity-row.unassigned .glyph { color: var(--fg-tertiary); }
+  .activity-row.split .glyph { color: var(--status-in-review); }
+  .activity-row.handoff .glyph { color: var(--status-in-review); }
+  .activity-row .meta-children { color: var(--fg-secondary); margin-left: 4px; }
+  .activity-row .meta-children .card-link { color: var(--accent); text-decoration: none; }
   .activity-row .who {
     color: var(--fg-secondary); font-weight: 510;
     letter-spacing: -0.06px;
@@ -1304,6 +1310,21 @@
     <div>
       <label for=cf-created-by>Created by (optional, defaults to "owner")</label>
       <input type=text id=cf-created-by placeholder="owner">
+    </div>
+    <div class=row2>
+      <div>
+        <label for=cf-kind>Kind</label>
+        <select id=cf-kind title="Epics dispatch the decomposer instead of a regular worker. The decomposer reads the body and emits N child cards.">
+          <option value=task selected>Task</option>
+          <option value=epic>Epic — decompose into children</option>
+        </select>
+      </div>
+      <div>
+        <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13px;font-weight:400;color:var(--fg-secondary);margin-bottom:0;margin-top:22px;cursor:pointer" title="Worker is told it MAY split this card mid-session if it discovers hidden scope (max 5 children).">
+          <input type=checkbox id=cf-splittable style="width:auto;margin:0">
+          Splittable
+        </label>
+      </div>
     </div>
     <div class=err id=cf-err></div>
   </form>
@@ -2198,6 +2219,8 @@
       needs_role: document.getElementById('cf-needs-role').value.trim(),
       priority:   parseInt(document.getElementById('cf-priority').value, 10) || 0,
       created_by: document.getElementById('cf-created-by').value.trim() || 'owner',
+      kind:       document.getElementById('cf-kind').value,
+      splittable: document.getElementById('cf-splittable').checked,
     };
     try {
       const resp = await fetch('/api/cards', {
@@ -2245,6 +2268,10 @@
     body_update:   '✎',
     run_dispatch:  '▶',
     run_complete:  '✓',
+    assigned:      '👤',
+    unassigned:    '∅',
+    split:         '✂',  // v3.12.4.5: mid-session decomposition
+    handoff:       '📜', // v3.12.4.6: structured continuity record
   };
 
   function renderActivityRow(e) {
@@ -2253,6 +2280,13 @@
     // Run dispatch carries the log path in meta — surface it as a copyable hint.
     if (e.kind === 'run_dispatch' && e.meta && e.meta.log_path) {
       body += ` <span class="meta-link">tail -f ${esc(e.meta.log_path)}</span>`;
+    }
+    // Split events carry child ids in meta — surface as click-through links.
+    if (e.kind === 'split' && e.meta && Array.isArray(e.meta.child_ids) && e.meta.child_ids.length) {
+      const links = e.meta.child_ids.map(cid =>
+        `<a href="#" data-card-id="${cid}" class="card-link">#${cid}</a>`
+      ).join(', ');
+      body += ` <span class="meta-children">→ ${links}</span>`;
     }
     return `<div class="activity-row ${e.kind}">
       <span class="glyph">${glyph}</span>

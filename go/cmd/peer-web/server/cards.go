@@ -162,6 +162,17 @@ func cardToJSON(c *sqlitestore.Card) map[string]any {
 	if c.AssignedToAgentID != 0 {
 		m["assigned_to_agent_id"] = c.AssignedToAgentID
 	}
+	// v3.12.4.5/.6 — decomposition + handoff flags. Kind is always
+	// emitted (defaults 'task' so consumers always have something to
+	// switch on); the bools only when true to keep the default shape
+	// clean for the common case.
+	m["kind"] = c.Kind
+	if c.Splittable {
+		m["splittable"] = true
+	}
+	if c.TrackHandoffs {
+		m["track_handoffs"] = true
+	}
 	return m
 }
 
@@ -251,6 +262,8 @@ func (s *Server) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 		Priority    int             `json:"priority"`
 		Tags        json.RawMessage `json:"tags"`
 		ContextRefs json.RawMessage `json:"context_refs"`
+		Kind        string          `json:"kind"`       // v3.12.4.5: "" → "task"; or "epic"
+		Splittable  bool            `json:"splittable"` // v3.12.4.5
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
@@ -262,6 +275,10 @@ func (s *Server) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.CreatedBy == "" {
 		body.CreatedBy = "owner"
+	}
+	if body.Kind != "" && body.Kind != sqlitestore.CardKindTask && body.Kind != sqlitestore.CardKindEpic {
+		writeJSONError(w, http.StatusBadRequest, "kind must be 'task' or 'epic'")
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -283,6 +300,8 @@ func (s *Server) handleCreateCard(w http.ResponseWriter, r *http.Request) {
 		Priority:    body.Priority,
 		Tags:        string(body.Tags),
 		ContextRefs: string(body.ContextRefs),
+		Kind:        body.Kind,
+		Splittable:  body.Splittable,
 	})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -306,22 +325,30 @@ func (s *Server) handleUpdateCard(w http.ResponseWriter, r *http.Request, id int
 		return
 	}
 	var body struct {
-		Title       *string          `json:"title"`
-		Body        *string          `json:"body"`
-		NeedsRole   *string          `json:"needs_role"`
-		Priority    *int             `json:"priority"`
-		Tags        *json.RawMessage `json:"tags"`
-		ContextRefs *json.RawMessage `json:"context_refs"`
-		Author      string           `json:"author"`
+		Title         *string          `json:"title"`
+		Body          *string          `json:"body"`
+		NeedsRole     *string          `json:"needs_role"`
+		Priority      *int             `json:"priority"`
+		Tags          *json.RawMessage `json:"tags"`
+		ContextRefs   *json.RawMessage `json:"context_refs"`
+		Kind          *string          `json:"kind"`           // v3.12.4.5
+		Splittable    *bool            `json:"splittable"`     // v3.12.4.5
+		TrackHandoffs *bool            `json:"track_handoffs"` // v3.12.4.6
+		Author        string           `json:"author"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.Kind != nil && *body.Kind != sqlitestore.CardKindTask && *body.Kind != sqlitestore.CardKindEpic {
+		writeJSONError(w, http.StatusBadRequest, "kind must be 'task' or 'epic'")
 		return
 	}
 
 	params := sqlitestore.UpdateCardFieldsParams{
 		Title: body.Title, Body: body.Body,
 		NeedsRole: body.NeedsRole, Priority: body.Priority,
+		Kind: body.Kind, Splittable: body.Splittable, TrackHandoffs: body.TrackHandoffs,
 	}
 	if body.Tags != nil {
 		s := string(*body.Tags)

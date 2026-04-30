@@ -181,6 +181,26 @@ CARD_TOOLS = [
                     "type": "object",
                     "description": "Pointers into chat/code: {msg_ids:[], files:[], urls:[], cards:[]}.",
                 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["task", "epic"],
+                    "description": (
+                        "v3.12.4.5: 'task' (default) is regular work. "
+                        "'epic' triggers the decomposer when dispatched — "
+                        "the worker's job is to split the epic into N "
+                        "child cards via card_create + card_add_dependency, "
+                        "then exit."
+                    ),
+                },
+                "splittable": {
+                    "type": "boolean",
+                    "description": (
+                        "v3.12.4.5: when true, the regular worker prompt "
+                        "is given the mid-session split addendum, telling "
+                        "the worker it MAY split this card if it discovers "
+                        "hidden scope (max 5 children)."
+                    ),
+                },
             },
             "required": ["pair_key", "title"],
             "additionalProperties": False,
@@ -277,6 +297,23 @@ CARD_TOOLS = [
                 "priority": {"type": "integer", "minimum": -1, "maximum": 1},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "context_refs": {"type": "object"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["task", "epic"],
+                    "description": "v3.12.4.5: promote/demote between task and epic.",
+                },
+                "splittable": {
+                    "type": "boolean",
+                    "description": "v3.12.4.5: flip the splittable flag.",
+                },
+                "track_handoffs": {
+                    "type": "boolean",
+                    "description": (
+                        "v3.12.4.6: when true, future worker dispatches get the "
+                        "handoff-discipline addendum and any prior handoff event "
+                        "is prepended to the prompt."
+                    ),
+                },
             },
             "required": ["id"],
             "additionalProperties": False,
@@ -968,6 +1005,10 @@ def _card_create(req_id, arguments: dict) -> None:
         flags.extend(["--tags", json.dumps(arguments["tags"])])
     if isinstance(arguments.get("context_refs"), dict):
         flags.extend(["--context-refs", json.dumps(arguments["context_refs"])])
+    if isinstance(arguments.get("kind"), str) and arguments["kind"]:
+        flags.extend(["--kind", arguments["kind"]])
+    if isinstance(arguments.get("splittable"), bool):
+        flags.extend([f"--splittable={'true' if arguments['splittable'] else 'false'}"])
 
     ok, msg, parsed = _shell_card_verb("card-create", flags)
     if not ok:
@@ -1088,9 +1129,26 @@ def _card_update(req_id, arguments: dict) -> None:
             _tool_error(req_id, "error: `context_refs` must be an object")
             return
         flags += ["--context-refs", json.dumps(refs)]
+    if "kind" in arguments:
+        kind = arguments["kind"]
+        if kind not in ("task", "epic"):
+            _tool_error(req_id, "error: `kind` must be 'task' or 'epic'")
+            return
+        flags += ["--kind", kind]
+    if "splittable" in arguments:
+        if not isinstance(arguments["splittable"], bool):
+            _tool_error(req_id, "error: `splittable` must be a boolean")
+            return
+        flags += [f"--splittable={'true' if arguments['splittable'] else 'false'}"]
+    if "track_handoffs" in arguments:
+        if not isinstance(arguments["track_handoffs"], bool):
+            _tool_error(req_id, "error: `track_handoffs` must be a boolean")
+            return
+        flags += [f"--track-handoffs={'true' if arguments['track_handoffs'] else 'false'}"]
     if len(flags) == 2:
         _tool_error(req_id, "error: pass at least one mutable field "
-            "(title, body, needs_role, priority, tags, context_refs)")
+            "(title, body, needs_role, priority, tags, context_refs, "
+            "kind, splittable, track_handoffs)")
         return
     label, _ = _resolve_caller_label_and_pair(arguments)
     if label:
