@@ -182,7 +182,20 @@ func dispatchWorkerForCard(
 		}
 	}
 	resolved := resolveContext(ctx, st, refs)
-	prompt := buildWorkerPrompt(card, label, resolved)
+	// v3.12.4.6: fetch the prior handoff so buildWorkerPrompt can prepend
+	// it. Only meaningful when track_handoffs is true (build skips the
+	// section otherwise) but we always try the lookup — the cost is one
+	// indexed query and the function returns (nil, nil) cleanly when
+	// there's nothing to prepend.
+	var priorHandoff *sqlitestore.CardEvent
+	if card.TrackHandoffs {
+		ph, herr := st.LatestHandoffEvent(ctx, card.ID)
+		if herr != nil {
+			fmt.Fprintf(os.Stderr, "card_runs: latest handoff lookup failed card=%d: %v\n", card.ID, herr)
+		}
+		priorHandoff = ph
+	}
+	prompt := buildWorkerPrompt(card, label, resolved, priorHandoff)
 
 	if err := os.MkdirAll(runnerLogDir, 0o755); err != nil {
 		_ = st.FinishCardRun(ctx, run.ID, sqlitestore.CardRunStatusFailed, -1)
@@ -196,6 +209,22 @@ func dispatchWorkerForCard(
 		return nil, fmt.Errorf("log file: %w", err)
 	}
 
+	// v3.12.4.6: when track_handoffs is set, rewrite --max-turns to the
+	// handoff budget so the worker has explicit room to write a structured
+	// handoff before the runtime cuts it off. Resolve the fallback chain
+	// here (instead of inside spawnWorker) so the tuner sees the actual
+	// argv that will be exec'd. spawnWorker keeps its own fallback as a
+	// defensive belt-and-suspenders.
+	if card.TrackHandoffs {
+		if len(agentArgv) == 0 {
+			if override := os.Getenv("AGENT_COLLAB_WORKER_CMD"); override != "" {
+				agentArgv = strings.Fields(override)
+			} else {
+				agentArgv = append([]string(nil), defaultWorkerArgv...)
+			}
+		}
+		agentArgv = tuneArgvForHandoffs(agentArgv)
+	}
 	cmd, err := spawnWorker(prompt, logFile, agentArgv)
 	if err != nil {
 		_ = logFile.Close()
@@ -430,6 +459,25 @@ var defaultWorkerArgv = []string{
 	"--max-turns=40",
 }
 
+// tuneArgvForHandoffs rewrites --max-turns=N → --max-turns=HandoffTurnBudget
+// so a track_handoffs worker has explicit room to write a structured
+// handoff. Pass-through for argv that doesn't carry --max-turns (e.g. pi
+// runtime) — the worker prompt addendum still teaches the budget.
+//
+// Returns a fresh slice; never mutates the input.
+func tuneArgvForHandoffs(argv []string) []string {
+	out := make([]string, len(argv))
+	target := fmt.Sprintf("--max-turns=%d", HandoffTurnBudget)
+	for i, a := range argv {
+		if strings.HasPrefix(a, "--max-turns=") {
+			out[i] = target
+		} else {
+			out[i] = a
+		}
+	}
+	return out
+}
+
 // defaultArgvForRuntime returns the runtime-specific default argv for
 // a pool-routed dispatch when the agent's worker_cmd field is empty.
 // Pool members can opt-in to runtime defaults by leaving worker_cmd
@@ -459,7 +507,18 @@ func defaultArgvForRuntime(runtime string) []string {
 //
 // v3.12.4.5: when card.Splittable is true, appends the mid-session split
 // addendum so the worker knows it MAY split if it discovers hidden scope.
-func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string]any) string {
+//
+// v3.12.4.6: when card.TrackHandoffs is true, appends the handoff
+// discipline addendum so the worker knows to call card_handoff near
+// its turn budget. priorHandoff (when non-nil) is rendered as a
+// "## Previous handoff" section prepended before the body so the next
+// worker resumes from where the previous session left off.
+func buildWorkerPrompt(
+	card *sqlitestore.Card,
+	label string,
+	resolved map[string]any,
+	priorHandoff *sqlitestore.CardEvent,
+) string {
 	if card.Kind == sqlitestore.CardKindEpic {
 		return buildDecomposerPrompt(card, label)
 	}
@@ -467,6 +526,16 @@ func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string
 
 	fmt.Fprintf(&b, "You are a headless kanban worker spawned to drain a single card.\n")
 	fmt.Fprintf(&b, "You are running via `claude -p` — there is NO HUMAN to ask clarifying questions.\n\n")
+
+	// Continuity context goes BEFORE the spec so the worker reads it
+	// first and plans the rest of the session against the prior state.
+	if priorHandoff != nil && card.TrackHandoffs {
+		fmt.Fprintf(&b, "## Previous handoff (from session %s, by %s)\n\n",
+			priorHandoff.CreatedAt, priorHandoff.Author)
+		fmt.Fprintf(&b, "%s\n\n", priorHandoff.Body)
+		fmt.Fprintf(&b, "---\n\n")
+		fmt.Fprintf(&b, "(The original card body follows. Continue from where the previous session left off.)\n\n")
+	}
 
 	fmt.Fprintf(&b, "## Identity\n")
 	fmt.Fprintf(&b, "Card id: %d\n", card.ID)
@@ -531,8 +600,50 @@ func buildWorkerPrompt(card *sqlitestore.Card, label string, resolved map[string
 	if card.Splittable {
 		writeSplitAddendum(&b, card, label)
 	}
+	if card.TrackHandoffs {
+		writeHandoffDiscipline(&b, card, label)
+	}
 
 	return b.String()
+}
+
+// HandoffTurnBudget is the soft turn budget the handoff discipline
+// references in the prompt (and the cap we apply via --max-turns when
+// dispatching a track_handoffs card). Lower than the v3.12.4 default
+// (40) so a track-handoffs worker has explicit room to write a
+// structured handoff before the runtime cuts it off.
+const HandoffTurnBudget = 30
+
+// writeHandoffDiscipline appends the handoff-discipline addendum so a
+// worker on a long-lived card knows to call card_handoff near its turn
+// budget instead of crashing into the runtime ceiling. Only emitted
+// when card.TrackHandoffs is true.
+func writeHandoffDiscipline(b *strings.Builder, card *sqlitestore.Card, label string) {
+	fmt.Fprintf(b, "\n## Hand off if you can't finish\n\n")
+	fmt.Fprintf(b, "You have approximately %d turns. If by turn %d you have not finished,\n",
+		HandoffTurnBudget, HandoffTurnBudget-5)
+	fmt.Fprintf(b, "you MUST write a structured handoff and exit cleanly:\n\n")
+	fmt.Fprintf(b, "  1. Call the `card_handoff` MCP tool with `id`=%d and `body` containing:\n", card.ID)
+	fmt.Fprintf(b, "       summary:             one-paragraph status\n")
+	fmt.Fprintf(b, "       decisions:           list of choices made and why\n")
+	fmt.Fprintf(b, "       open_questions:      list of unresolved items\n")
+	fmt.Fprintf(b, "       next_steps:          ordered list for the next session\n")
+	fmt.Fprintf(b, "       files_touched:       list of paths\n")
+	fmt.Fprintf(b, "       context_to_preserve: any constraint or detail the next worker\n")
+	fmt.Fprintf(b, "                            absolutely needs to know\n\n")
+	fmt.Fprintf(b, "     The body is capped at 64 KB — compress if larger.\n\n")
+	fmt.Fprintf(b, "  2. Exit cleanly. Your claim will be released. The next dispatch will\n")
+	fmt.Fprintf(b, "     read your handoff and resume from where you left off.\n\n")
+	fmt.Fprintf(b, "## CLI fallback\n")
+	fmt.Fprintf(b, "If MCP tools aren't exposed in your session, the same operation is\n")
+	fmt.Fprintf(b, "available via the CLI:\n")
+	fmt.Fprintf(b, "  ~/.local/bin/peer-inbox card-handoff --card %d \\\n", card.ID)
+	fmt.Fprintf(b, "    --body-file - --as %s --format json\n", label)
+	fmt.Fprintf(b, "  (then write the structured body to stdin and EOF)\n\n")
+	fmt.Fprintf(b, "If a previous handoff exists, it has been prepended above as\n")
+	fmt.Fprintf(b, "\"Previous handoff\". Read it FIRST and continue from where the\n")
+	fmt.Fprintf(b, "previous session left off — don't redo work the prior session\n")
+	fmt.Fprintf(b, "already covered.\n")
 }
 
 // MaxChildrenPerSplit caps the number of children a single mid-session
