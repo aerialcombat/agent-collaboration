@@ -255,4 +255,27 @@ echo "$ns_label" | grep -q "^stub-impl-" \
   || fail "E7 worker_label should start with 'stub-impl-': got $ns_label"
 ok "E7 ok — pool-routed run's worker_label namespaced by agent: $ns_label"
 
-echo "PASS cards-v312-pool-dispatch.sh — E1-E7 7/7"
+# --- E8: needs_role with no pool match → audit warning + fallback ------
+# Track 1 #3 (linkboard dogfood obs #3): card with needs_role that no
+# pool member can satisfy must dispatch on the fallback worker AND
+# emit a system comment so the operator sees the audit gap.
+PK8="e8-rolemiss-$$"
+"$PI_BIN" pool-add --pair-key "$PK8" --agent stub-impl   --priority 5 >/dev/null
+"$PI_BIN" pool-add --pair-key "$PK8" --agent stub-review --priority 1 >/dev/null
+C8=$(mk_card "$PK8" "needs missing role" "qa")  # pool has impl + review, NOT qa
+export AGENT_COLLAB_WORKER_CMD="$FAKE"
+start_pw
+"$PI_BIN" board-set --pair-key "$PK8" --auto-drain on --max-concurrent 1 --as e8 >/dev/null
+wait_terminal "$PK8" 1 || fail "E8 fallback didn't run"
+got_agent_id=$(sqlite3 "$DB" "SELECT COALESCE(agent_id, 0) FROM card_runs WHERE card_id=$C8 LIMIT 1;")
+[ "$got_agent_id" = "0" ] || fail "E8 expected agent_id=NULL (fallback), got $got_agent_id"
+n_warn=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_events WHERE card_id=$C8 AND kind='comment' AND author='system' AND body LIKE 'no pool member matches role%'")
+[ "$n_warn" = "1" ] || fail "E8 expected 1 no-pool-match warning comment, got $n_warn"
+n_warn_meta=$(sqlite3 "$DB" "SELECT COUNT(*) FROM card_events WHERE card_id=$C8 AND meta LIKE '%\"reason\":\"no_pool_match\"%'")
+[ "$n_warn_meta" = "1" ] || fail "E8 expected meta.reason=no_pool_match in warning, got $n_warn_meta"
+"$PI_BIN" board-set --pair-key "$PK8" --auto-drain off --as e8 >/dev/null
+stop_pw
+unset AGENT_COLLAB_WORKER_CMD
+ok "E8 ok — needs_role with no pool match → fallback dispatch + audit warning"
+
+echo "PASS cards-v312-pool-dispatch.sh — E1-E8 8/8"

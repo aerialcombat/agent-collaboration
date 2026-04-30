@@ -140,6 +140,28 @@ func dispatchWorkerForCard(
 		} else {
 			agentArgv = defaultArgvForRuntime(chosen.Runtime)
 		}
+	} else if card.NeedsRole != "" {
+		// Track 1 #3 (linkboard dogfood obs #3): card asked for a
+		// specific role but no pool member matched. The dispatch will
+		// fall through to AGENT_COLLAB_WORKER_CMD or the runtime
+		// default with agent_id=NULL — which is honest in card_runs but
+		// invisible in the operator-facing timeline. Emit an audit
+		// comment so the timeline shows WHY this card is running on the
+		// fallback worker rather than the agent the card asked for.
+		//
+		// Best-effort: failure to record the comment doesn't block
+		// dispatch (the worker still runs; the audit gap is the cost).
+		warnMeta, _ := json.Marshal(map[string]any{
+			"requested_role": card.NeedsRole,
+			"reason":         "no_pool_match",
+		})
+		_, _ = st.AppendCardEvent(ctx, sqlitestore.AppendCardEventParams{
+			CardID: card.ID, Kind: sqlitestore.CardEventComment, Author: "system",
+			Body: fmt.Sprintf(
+				"no pool member matches role=%q on this board — dispatching with fallback worker (agent_id=NULL); add an agent with that role to the pool to keep the audit trail accurate",
+				card.NeedsRole),
+			Meta: string(warnMeta),
+		})
 	}
 
 	// Insert the run row first so the reaper has something to find if we
